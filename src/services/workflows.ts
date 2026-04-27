@@ -10,6 +10,8 @@ import { generateImage } from './leihuo';
 
 export interface RunOptions {
   onStatus?: (msg: string) => void;
+  /** Optional seed. If omitted, a random 31-bit seed is generated and reported via onStatus. */
+  seed?: number;
 }
 
 const TPOSE_PROMPT =
@@ -26,6 +28,11 @@ const MULTIVIEW_PROMPT =
   'Maintain perfect identity consistency across every panel. Keep the subject in a relaxed A-pose and with consistent scale and alignment between views, accurate anatomy, and clear silhouette; ensure even spacing and clean panel separation, with uniform framing and consistent head height across the full-body lineup and consistent facial scale across the portraits. ' +
   'Lighting should be consistent across all panels (same direction, intensity, and softness), with natural, controlled shadows that preserve detail without dramatic mood shifts.';
 
+/** Generate a random 31-bit positive seed (avoids JS Number sign-bit issues). */
+function randomSeed(): number {
+  return Math.floor(Math.random() * 2 ** 31);
+}
+
 /**
  * Concept → T-Pose: take the user-uploaded concept image and ask Gemini to
  * redraw the character in a clean front-facing T-pose on a white background.
@@ -35,8 +42,13 @@ export async function runConceptToTPose(
   opts: RunOptions = {}
 ): Promise<string> {
   const { onStatus } = opts;
-  onStatus?.('调用雷火 Gemini 生成 T Pose…');
-  const url = await generateImage({ prompt: TPOSE_PROMPT, images: [conceptFile] });
+  const seed = opts.seed ?? randomSeed();
+  onStatus?.(`调用雷火 Gemini 生成 T Pose（seed=${seed}）…`);
+  const url = await generateImage({
+    prompt: TPOSE_PROMPT,
+    images: [conceptFile],
+    seed,
+  });
   onStatus?.('T Pose 生成完成');
   return url;
 }
@@ -52,10 +64,12 @@ export async function runTPoseMultiView(
   opts: RunOptions = {}
 ): Promise<string> {
   const { onStatus } = opts;
-  onStatus?.('调用雷火 Gemini 生成 Multi-View…');
+  const seed = opts.seed ?? randomSeed();
+  onStatus?.(`调用雷火 Gemini 生成 Multi-View（seed=${seed}）…`);
   const url = await generateImage({
     prompt: MULTIVIEW_PROMPT,
     images: [tposeInput],
+    seed,
   });
   onStatus?.('Multi-View 生成完成');
   return url;

@@ -32,6 +32,8 @@ export interface GenerateImageOptions {
    *  data-URL / blob-URL strings. Each is sent as an `image_url` content part. */
   images?: Array<File | string>;
   model?: string;
+  /** Optional seed for reproducibility. If omitted, the API picks one. */
+  seed?: number;
   /** Abort signal for cancellation. */
   signal?: AbortSignal;
 }
@@ -102,7 +104,7 @@ export async function generateImage(opts: GenerateImageOptions): Promise<string>
     }
   }
 
-  const body = {
+  const body: Record<string, unknown> = {
     model: opts.model ?? DEFAULT_MODEL,
     messages: [
       { role: 'system', content: SYSTEM_PROMPT },
@@ -110,6 +112,7 @@ export async function generateImage(opts: GenerateImageOptions): Promise<string>
     ],
     modalities: ['text', 'image'],
   };
+  if (typeof opts.seed === 'number') body.seed = opts.seed;
 
   const res = await fetch(`${BASE}/v1/chat/completions`, {
     method: 'POST',
