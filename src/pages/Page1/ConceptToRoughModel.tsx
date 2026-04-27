@@ -6,6 +6,7 @@ import { Button } from '../../components/Button';
 import { Placeholder } from '../../components/Placeholder';
 import { ImagePreviewModal } from '../../components/ImagePreviewModal';
 import { GLBViewer } from '../../components/GLBViewer';
+import { GLBThumbnail } from '../../components/GLBThumbnail';
 import { runConceptToTPose, runTPoseMultiView } from '../../services/workflows';
 import { runImageToModel, runMultiViewToModel, TripoServiceError } from '../../services/tripo';
 import { splitMultiView } from '../../services/multiviewSplit';
@@ -722,12 +723,16 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
 
             const body: ReactNode = (
               <>
-                <Placeholder
-                  type={node.display}
-                  state={state}
-                  label={node.title}
-                  imageUrl={imageUrl}
-                />
+                {node.id === 'rough' && state === 'complete' && outputs.roughUrl ? (
+                  <GLBThumbnail url={outputs.roughUrl} height={160} />
+                ) : (
+                  <Placeholder
+                    type={node.display}
+                    state={state}
+                    label={node.title}
+                    imageUrl={imageUrl}
+                  />
+                )}
                 {errMsg && state === 'error' && (
                   <div
                     style={{
