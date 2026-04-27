@@ -4,7 +4,7 @@ import { NodeCard } from '../../components/NodeCard';
 import { NodeConnector } from '../../components/NodeConnector';
 import { Button } from '../../components/Button';
 import { Placeholder } from '../../components/Placeholder';
-import { runConceptToTPose } from '../../services/workflows';
+import { runConceptToTPose, runTPoseMultiView } from '../../services/workflows';
 
 const NODES: NodeConfig[] = [
   { id: 'concept', title: 'Concept', display: 'image', description: '上传概念设计稿' },
@@ -22,6 +22,7 @@ interface NodeOutputs {
   conceptFile: File | null;
   conceptUrl: string | null;
   tposeUrl: string | null;
+  multiviewUrl: string | null;
   errors: Record<number, string>;
 }
 
@@ -33,6 +34,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     conceptFile: null,
     conceptUrl: null,
     tposeUrl: null,
+    multiviewUrl: null,
     errors: {},
   });
 
@@ -61,10 +63,12 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     setOutputs((prev) => {
       if (prev.conceptUrl) URL.revokeObjectURL(prev.conceptUrl);
       if (prev.tposeUrl) URL.revokeObjectURL(prev.tposeUrl);
+      if (prev.multiviewUrl) URL.revokeObjectURL(prev.multiviewUrl);
       return {
         conceptFile: file,
         conceptUrl: URL.createObjectURL(file),
         tposeUrl: null,
+        multiviewUrl: null,
         errors: {},
       };
     });
@@ -82,7 +86,14 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     setOutputs((prev) => {
       if (prev.conceptUrl) URL.revokeObjectURL(prev.conceptUrl);
       if (prev.tposeUrl) URL.revokeObjectURL(prev.tposeUrl);
-      return { conceptFile: null, conceptUrl: null, tposeUrl: null, errors: {} };
+      if (prev.multiviewUrl) URL.revokeObjectURL(prev.multiviewUrl);
+      return {
+        conceptFile: null,
+        conceptUrl: null,
+        tposeUrl: null,
+        multiviewUrl: null,
+        errors: {},
+      };
     });
     setStates(['idle', 'idle', 'idle', 'idle', 'idle']);
     onStatusChange('已清除', 'info');
@@ -107,8 +118,15 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       setStates((prev) => {
         const next = [...prev];
         next[1] = 'complete';
-        if (next[2] === 'idle') next[2] = 'ready';
+        if (next[2] === 'idle' || next[2] === 'error') next[2] = 'ready';
+        // Invalidate downstream
+        for (let i = 3; i < next.length; i++) next[i] = 'idle';
         return next;
+      });
+      // Also clear stale multi-view output
+      setOutputs((prev) => {
+        if (prev.multiviewUrl) URL.revokeObjectURL(prev.multiviewUrl);
+        return { ...prev, multiviewUrl: null };
       });
       onStatusChange('T Pose 生成完成', 'success');
     } catch (err) {
@@ -120,7 +138,39 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     }
   }, [outputs.conceptFile, onStatusChange, setNodeState]);
 
-  // ---- Mock runner for nodes 2..4 -----------------------------------------
+  // ---- Multi-View node (real ComfyUI workflow) ----------------------------
+  const runMultiView = useCallback(async () => {
+    if (!outputs.tposeUrl) {
+      onStatusChange('请先生成 T Pose', 'error');
+      return;
+    }
+    setNodeState(2, 'running');
+    setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 2: '' } }));
+    try {
+      const url = await runTPoseMultiView(outputs.tposeUrl, {
+        onStatus: (msg) => onStatusChange(msg, 'info'),
+      });
+      setOutputs((prev) => {
+        if (prev.multiviewUrl) URL.revokeObjectURL(prev.multiviewUrl);
+        return { ...prev, multiviewUrl: url };
+      });
+      setStates((prev) => {
+        const next = [...prev];
+        next[2] = 'complete';
+        if (next[3] === 'idle') next[3] = 'ready';
+        return next;
+      });
+      onStatusChange('Multi-View 生成完成', 'success');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[Multi-View] failed:', err);
+      setNodeState(2, 'error');
+      setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 2: msg } }));
+      onStatusChange(`Multi-View 生成失败：${msg}`, 'error');
+    }
+  }, [outputs.tposeUrl, onStatusChange, setNodeState]);
+
+  // ---- Mock runner for nodes 3..4 (Rough Model / Rigging) -----------------
   const runMockNode = useCallback(
     (idx: number) => {
       setNodeState(idx, 'running');
@@ -144,7 +194,14 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     setOutputs((prev) => {
       if (prev.conceptUrl) URL.revokeObjectURL(prev.conceptUrl);
       if (prev.tposeUrl) URL.revokeObjectURL(prev.tposeUrl);
-      return { conceptFile: null, conceptUrl: null, tposeUrl: null, errors: {} };
+      if (prev.multiviewUrl) URL.revokeObjectURL(prev.multiviewUrl);
+      return {
+        conceptFile: null,
+        conceptUrl: null,
+        tposeUrl: null,
+        multiviewUrl: null,
+        errors: {},
+      };
     });
     setStates(['idle', 'idle', 'idle', 'idle', 'idle']);
     onStatusChange('已重置 Pipeline', 'info');
@@ -172,7 +229,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       >
         <span style={{ fontSize: 13, fontWeight: 600 }}>Pipeline · 单条流水线（5 节点固定）</span>
         <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-          T Pose 调用 ComfyUI（http://127.0.0.1:8188），其余节点为 Mock
+          T Pose / Multi-View 调用 ComfyUI（http://127.0.0.1:8188），后续节点为 Mock
         </span>
         <div style={{ flex: 1 }} />
         <Button onClick={resetAll} size="sm">重置 Pipeline</Button>
@@ -242,9 +299,11 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
               onUpload: handleUploadClick,
               onClearConcept: handleClearConcept,
               onRunTPose: runTPose,
+              onRunMultiView: runMultiView,
               onRunMock: runMockNode,
               onCancelMock: () => setNodeState(idx, 'idle'),
               conceptReady: !!outputs.conceptFile,
+              tposeReady: !!outputs.tposeUrl,
             });
 
             return (
@@ -267,6 +326,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
 function imageForNode(idx: number, outputs: NodeOutputs): string | undefined {
   if (idx === 0) return outputs.conceptUrl ?? undefined;
   if (idx === 1) return outputs.tposeUrl ?? undefined;
+  if (idx === 2) return outputs.multiviewUrl ?? undefined;
   return undefined;
 }
 
@@ -274,9 +334,11 @@ interface ActionHandlers {
   onUpload: () => void;
   onClearConcept: () => void;
   onRunTPose: () => void;
+  onRunMultiView: () => void;
   onRunMock: (idx: number) => void;
   onCancelMock: () => void;
   conceptReady: boolean;
+  tposeReady: boolean;
 }
 
 function renderActions(
@@ -318,6 +380,30 @@ function renderActions(
             size="sm"
             disabled={!h.conceptReady}
             onClick={h.onRunTPose}
+          >
+            {isComplete ? '重新生成' : '生成'}
+          </Button>
+        )}
+      </>
+    );
+  }
+
+  if (node.id === 'multiview') {
+    return (
+      <>
+        <Button size="sm" disabled={!isComplete}>导出</Button>
+        {isError ? (
+          <Button variant="primary" size="sm" onClick={h.onRunMultiView}>重试</Button>
+        ) : isRunning ? (
+          <Button variant="danger" size="sm" disabled title="ComfyUI 任务无法从前端取消">
+            生成中…
+          </Button>
+        ) : (
+          <Button
+            variant="primary"
+            size="sm"
+            disabled={!h.tposeReady}
+            onClick={h.onRunMultiView}
           >
             {isComplete ? '重新生成' : '生成'}
           </Button>
