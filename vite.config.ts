@@ -76,7 +76,10 @@ export default defineConfig(({ mode }) => {
             proxy.on('error', (err, req) => {
               // eslint-disable-next-line no-console
               console.error('[vite-proxy /qwen]', req.method, req.url, '→', err.message);
-            RELLIS.2 image-to-3D server. Long timeout — first run can take
+            });
+          },
+        },
+        // TRELLIS.2 image-to-3D server. Long timeout — first run can take
         // 1-3 minutes (model load) plus 30-60s per generation on A30.
         '/trellis': {
           target: TRELLIS2_URL,
@@ -89,9 +92,6 @@ export default defineConfig(({ mode }) => {
               // eslint-disable-next-line no-console
               console.error('[vite-proxy /trellis]', req.method, req.url, '→', err.message);
             });
-          },
-        },
-        // T});
           },
         },
         // Tripo AI — used by Rough Model node (image → GLB).

@@ -8,3 +8,7 @@ dist-ssr
 Projects/
 comfyui_history.txt
 
+# Tripo / 临时模型测试输出
+tripo_test_*.glb
+*.glb
+
