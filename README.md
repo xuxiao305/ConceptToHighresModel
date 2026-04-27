@@ -22,6 +22,10 @@ Built with **Vite + React + TypeScript**. Pure UI mockup — no AI backend, 3D v
 
 ## Develop
 
+**一键启动**（Windows）：双击 [run.bat](run.bat) 即可，自动安装依赖、启动 Vite、打开浏览器。
+
+或手动：
+
 ```powershell
 npm install
 npm run dev      # http://localhost:5173/
