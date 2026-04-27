@@ -1,113 +1,62 @@
 /**
- * Workflow runners — high-level functions that compose ComfyUI API calls
- * with a specific workflow template (loaded from /ComfyuiWorkflow/*.json).
+ * High-level workflow runners for the Concept → 3D pipeline.
+ *
+ * These call the Leihuo AI gateway directly (Gemini image-generation models)
+ * — no ComfyUI in the loop. The prompts below were ported verbatim from the
+ * original ComfyUI workflows under /ComfyuiWorkflow/.
  */
 
-import {
-  uploadImage,
-  queuePrompt,
-  pollHistory,
-  fetchOutputAsBlobURL,
-  firstOutputImage,
-  type ComfyHistoryEntry,
-} from './comfyui';
-
-import conceptToTPoseTemplate from '../../ComfyuiWorkflow/ConceptToTPose.json';
-import tposeMultiViewTemplate from '../../ComfyuiWorkflow/TPoseMultiView.api.json';
+import { generateImage } from './leihuo';
 
 export interface RunOptions {
   onStatus?: (msg: string) => void;
 }
 
-type WorkflowTemplate = Record<
-  string,
-  { inputs: Record<string, unknown>; class_type: string }
->;
+const TPOSE_PROMPT =
+  '将图中角色转换为正面TPose, 两臂完全水平张开，双腿微张; 正交视图，使用环境柔光，白色背景，白平衡5500k,美术风格保持和原图一致';
 
-/** Convert a blob URL (from a previous workflow output) back into a File for re-upload. */
-async function blobUrlToFile(url: string, filename: string): Promise<File> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`无法读取上一步输出: ${res.status}`);
-  const blob = await res.blob();
-  return new File([blob], filename, { type: blob.type || 'image/png' });
-}
+const MULTIVIEW_PROMPT =
+  'Change the character to T-Pose, arm fully stretched horizontally, and create a professional character reference sheet based strictly on the uploaded reference image. ' +
+  'Use a clean, neutral plain background and present the sheet as a technical model turnaround while matching the exact visual style of the reference (same realism level, rendering approach, texture, color treatment, and overall aesthetic). ' +
+  'Arrange the composition into two horizontal rows.\n' +
+  'Top row column 1: front view full body\n' +
+  'Top row column 2: left profile character facing left\n' +
+  'Bottom row columan 1: right profile character facing right\n' +
+  'Bottom row column 2: back view\n' +
+  'Maintain perfect identity consistency across every panel. Keep the subject in a relaxed A-pose and with consistent scale and alignment between views, accurate anatomy, and clear silhouette; ensure even spacing and clean panel separation, with uniform framing and consistent head height across the full-body lineup and consistent facial scale across the portraits. ' +
+  'Lighting should be consistent across all panels (same direction, intensity, and softness), with natural, controlled shadows that preserve detail without dramatic mood shifts.';
 
 /**
- * Concept → T Pose
- *
- * Steps:
- *   1. Upload the concept image to ComfyUI
- *   2. Clone workflow template, replace node "1".inputs.image with the uploaded filename
- *   3. Submit, poll until complete, fetch output image as blob URL
+ * Concept → T-Pose: take the user-uploaded concept image and ask Gemini to
+ * redraw the character in a clean front-facing T-pose on a white background.
  */
 export async function runConceptToTPose(
   conceptFile: File,
   opts: RunOptions = {}
 ): Promise<string> {
   const { onStatus } = opts;
-
-  onStatus?.('上传 Concept 图到 ComfyUI…');
-  const uploadedName = await uploadImage(conceptFile);
-
-  const workflow = JSON.parse(JSON.stringify(conceptToTPoseTemplate)) as WorkflowTemplate;
-  workflow['1'].inputs.image = uploadedName;
-  if (workflow['2']?.inputs && 'seed' in workflow['2'].inputs) {
-    workflow['2'].inputs.seed = Math.floor(Math.random() * 2 ** 31);
-  }
-
-  onStatus?.('提交工作流到 ComfyUI 队列…');
-  const promptId = await queuePrompt(workflow);
-
-  onStatus?.('等待 Gemini 生成 T Pose（首次较慢）…');
-  const entry: ComfyHistoryEntry = await pollHistory(promptId, {
-    onProgress: (s) => onStatus?.(`ComfyUI: ${s}`),
-  });
-
-  const outRef = firstOutputImage(entry);
-  if (!outRef) throw new Error('ComfyUI 未返回任何输出图');
-
-  onStatus?.('下载生成结果…');
-  return fetchOutputAsBlobURL(outRef);
+  onStatus?.('调用雷火 Gemini 生成 T Pose…');
+  const url = await generateImage({ prompt: TPOSE_PROMPT, images: [conceptFile] });
+  onStatus?.('T Pose 生成完成');
+  return url;
 }
 
 /**
- * T Pose → Multi-View (4-view turnaround sheet: front / left / right / back)
+ * T-Pose → Multi-View: take the T-pose image and produce a 4-panel turnaround
+ * sheet (front / left / right / back).
  *
- * Accepts either a File (rare) or a previously-generated blob URL (the typical case
- * — the upstream T Pose node stored its result as an object URL).
+ * Accepts a File or a previously-generated blob: URL.
  */
 export async function runTPoseMultiView(
   tposeInput: File | string,
   opts: RunOptions = {}
 ): Promise<string> {
   const { onStatus } = opts;
-
-  onStatus?.('准备 T Pose 输入…');
-  const file =
-    typeof tposeInput === 'string'
-      ? await blobUrlToFile(tposeInput, `tpose_${Date.now()}.png`)
-      : tposeInput;
-
-  onStatus?.('上传 T Pose 图到 ComfyUI…');
-  const uploadedName = await uploadImage(file);
-
-  const workflow = JSON.parse(JSON.stringify(tposeMultiViewTemplate)) as WorkflowTemplate;
-  workflow['3'].inputs.image = uploadedName;
-  if (workflow['2']?.inputs && 'seed' in workflow['2'].inputs) {
-    workflow['2'].inputs.seed = Math.floor(Math.random() * 2 ** 31);
-  }
-
-  onStatus?.('提交多视图工作流…');
-  const promptId = await queuePrompt(workflow);
-
-  onStatus?.('等待 Gemini 生成 Multi-View（首次较慢）…');
-  const entry = await pollHistory(promptId, {
-    onProgress: (s) => onStatus?.(`ComfyUI: ${s}`),
+  onStatus?.('调用雷火 Gemini 生成 Multi-View…');
+  const url = await generateImage({
+    prompt: MULTIVIEW_PROMPT,
+    images: [tposeInput],
   });
-
-  const outRef = firstOutputImage(entry);
-  if (!outRef) throw new Error('ComfyUI 未返回任何输出图');
-
-  onStatus?.('下载多视图结果…');
-  return fetchOutputAsBlobURL(outRef);
+  onStatus?.('Multi-View 生成完成');
+  return url;
 }

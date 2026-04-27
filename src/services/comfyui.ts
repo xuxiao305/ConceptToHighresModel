@@ -6,9 +6,13 @@
  *   2. queuePrompt(workflow)    → POST /prompt, returns prompt_id
  *   3. pollHistory(prompt_id)   → polls /history/{id} until status.completed === true
  *   4. fetchOutputAsBlobURL(filename, subfolder, type) → GET /view → object URL
+ *
+ * 注意：新版 ComfyUI 把 API 都挪到 /api/* 下，且启用了多用户后内置 API 节点
+ * （如 GeminiImage2Node）需要 Comfy-User header 才能找到对应的 comfy.org 登录态。
+ * 这里所有路径统一带 /api 前缀；Comfy-User header 由 Vite 代理注入（见 vite.config.ts）。
  */
 
-const BASE = '/comfy';
+const BASE = '/comfy/api';
 
 export interface ComfyImageRef {
   filename: string;
@@ -36,17 +40,40 @@ export async function uploadImage(file: File): Promise<string> {
 
 /** Submit a workflow (API JSON format) to the ComfyUI queue. Returns prompt_id. */
 export async function queuePrompt(workflow: unknown): Promise<string> {
-  const clientId = `mockup-${Date.now()}`;
+  // ComfyUI 多用户模式下，client_id 即用户身份；必须与 ComfyUI Web UI 使用的同一个，
+  // 否则内置 API 节点（GeminiImage2Node 等）找不到对应的 comfy.org 登录态会报 Unauthorized。
+  // 通过 .env.local 的 VITE_COMFY_CLIENT_ID 注入；未配置则退回到匿名 ID（仅适用于无登录需求的工作流）。
+  const clientId =
+    (import.meta.env.VITE_COMFY_CLIENT_ID as string | undefined) ||
+    `mockup-${Date.now()}`;
+
+  // ComfyUI 内置 API 节点（GeminiImage2Node 等）需要 comfy.org 的登录 token。
+  // 它由 ComfyUI 网页前端从 comfy.org 拿到后，**通过 prompt 提交体的 extra_data 字段**
+  // 传给 ComfyUI worker（参见 ComfyUI/execution.py SENSITIVE_EXTRA_DATA_KEYS）。
+  // 我们的工具同样必须传这个字段，否则 worker 拿不到 token，会报 Unauthorized。
+  // token 来源：在浏览器开 ComfyUI 网页（http://127.0.0.1:8188），F12 → 网络 → 点一次
+  // Queue Prompt → 找到 /api/prompt 请求 → 「负载/Payload」里 extra_data.auth_token_comfy_org。
+  const authToken = import.meta.env.VITE_COMFY_AUTH_TOKEN as string | undefined;
+  const apiKey = import.meta.env.VITE_COMFY_API_KEY as string | undefined;
+  const extraData: Record<string, unknown> = {};
+  if (authToken) extraData.auth_token_comfy_org = authToken;
+  if (apiKey) extraData.api_key_comfy_org = apiKey;
+
+  const body: Record<string, unknown> = { prompt: workflow, client_id: clientId };
+  if (Object.keys(extraData).length > 0) body.extra_data = extraData;
+
   const res = await fetch(`${BASE}/prompt`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt: workflow, client_id: clientId }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`ComfyUI queue failed: ${res.status} ${text}`);
   }
   const data = (await res.json()) as { prompt_id: string };
+  // eslint-disable-next-line no-console
+  console.log('[comfy] queuePrompt response:', data, '| auth_token:', authToken ? 'set' : '(none)');
   return data.prompt_id;
 }
 

@@ -29,7 +29,7 @@ export default function App() {
         background: 'var(--bg-app)',
       }}
     >
-      <TopNav active={page} onChange={setPage} />
+      <TopNav active={page} onChange={setPage} onProjectStatus={handleStatus} />
 
       <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
         {page === 'page1' && <ConceptToRoughModel onStatusChange={handleStatus} />}

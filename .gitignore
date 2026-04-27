@@ -5,3 +5,6 @@ dist-ssr
 .vite
 .DS_Store
 *.tsbuildinfo
+Projects/
+comfyui_history.txt
+
