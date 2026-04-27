@@ -6,6 +6,8 @@ interface PlaceholderProps {
   state: NodeState;
   label?: string;
   height?: number | string;
+  /** When provided, render this image inside the placeholder (real content). */
+  imageUrl?: string;
 }
 
 const stateLabels: Record<NodeState, string> = {
@@ -17,7 +19,7 @@ const stateLabels: Record<NodeState, string> = {
   optional: '可选 — 点击展开',
 };
 
-export function Placeholder({ type, state, label, height = 160 }: PlaceholderProps) {
+export function Placeholder({ type, state, label, height = 160, imageUrl }: PlaceholderProps) {
   const isMultiView = type === 'multiview';
   const isSplit = type === 'split3d';
 
@@ -36,6 +38,25 @@ export function Placeholder({ type, state, label, height = 160 }: PlaceholderPro
     position: 'relative',
     overflow: 'hidden',
   };
+
+  // Real image preview (Concept upload, T Pose result, etc.) takes precedence over
+  // mock placeholders, but only when the node has actually produced output.
+  if (imageUrl && (state === 'complete' || state === 'ready')) {
+    return (
+      <div style={baseStyle}>
+        <img
+          src={imageUrl}
+          alt={label ?? 'preview'}
+          style={{
+            maxWidth: '100%',
+            maxHeight: '100%',
+            objectFit: 'contain',
+            display: 'block',
+          }}
+        />
+      </div>
+    );
+  }
 
   if (state === 'running') {
     return (
