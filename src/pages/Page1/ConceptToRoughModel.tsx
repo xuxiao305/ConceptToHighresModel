@@ -254,7 +254,9 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
 
   // ---- T Pose node ----------------------------------------------------------
   const runTPose = useCallback(async (sourceFile?: File): Promise<string | null> => {
-    const file = sourceFile ?? outputsRef.current.conceptFile;
+    // 防护：直接作为 onClick 传入时 React 会传入 MouseEvent。
+    const arg = sourceFile instanceof File ? sourceFile : undefined;
+    const file = arg ?? outputsRef.current.conceptFile;
     if (!file) {
       onStatusChange('请先在 Concept 节点上传图片', 'error');
       return null;
@@ -314,7 +316,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
 
   // ---- Multi-View node (real ComfyUI workflow) ----------------------------
   const runMultiView = useCallback(async (sourceUrl?: string): Promise<string | null> => {
-    const tposeUrl = sourceUrl ?? outputsRef.current.tposeUrl;
+    const arg = typeof sourceUrl === 'string' ? sourceUrl : undefined;
+    const tposeUrl = arg ?? outputsRef.current.tposeUrl;
     if (!tposeUrl) {
       onStatusChange('请先生成 T Pose', 'error');
       return null;
@@ -367,7 +370,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
 
   // ---- Rough Model node (Tripo AI image → GLB) ---------------------------
   const runRoughModel = useCallback(async (sourceUrl?: string): Promise<string | null> => {
-    const mvUrl = sourceUrl ?? outputsRef.current.multiviewUrl;
+    const arg = typeof sourceUrl === 'string' ? sourceUrl : undefined;
+    const mvUrl = arg ?? outputsRef.current.multiviewUrl;
     if (!mvUrl) {
       onStatusChange('请先生成 Multi-View', 'error');
       return null;
