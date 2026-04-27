@@ -1,4 +1,5 @@
 import type { CSSProperties, ReactNode } from 'react';
+import { useRef } from 'react';
 import type { NodeState } from '../types';
 
 interface NodeCardProps {
@@ -13,6 +14,10 @@ interface NodeCardProps {
   optional?: boolean;
   expanded?: boolean;
   onToggleExpand?: () => void;
+  /** 单击节点正文（非按钮区域） */
+  onBodyClick?: () => void;
+  /** 双击节点正文（非按钮区域） */
+  onBodyDoubleClick?: () => void;
 }
 
 const stateBorder: Record<NodeState, string> = {
@@ -43,6 +48,8 @@ export function NodeCard({
   optional = false,
   expanded = true,
   onToggleExpand,
+  onBodyClick,
+  onBodyDoubleClick,
 }: NodeCardProps) {
   const borderStyle = optional && state === 'optional' ? 'dashed' : 'solid';
   const isCollapsed = optional && !expanded;
@@ -62,6 +69,26 @@ export function NodeCard({
   };
 
   const badge = stateBadge[state];
+
+  // 单击 / 双击 防冲突：单击延迟 220ms 触发；双击命中时取消
+  const clickTimerRef = useRef<number | null>(null);
+  const handleBodyClick = () => {
+    if (!onBodyClick) return;
+    if (clickTimerRef.current != null) {
+      window.clearTimeout(clickTimerRef.current);
+    }
+    clickTimerRef.current = window.setTimeout(() => {
+      clickTimerRef.current = null;
+      onBodyClick();
+    }, 220);
+  };
+  const handleBodyDoubleClick = () => {
+    if (clickTimerRef.current != null) {
+      window.clearTimeout(clickTimerRef.current);
+      clickTimerRef.current = null;
+    }
+    onBodyDoubleClick?.();
+  };
 
   return (
     <div style={cardStyle}>
@@ -114,7 +141,25 @@ export function NodeCard({
       {/* Body */}
       {!isCollapsed && (
         <>
-          <div style={{ padding: 10 }}>{children}</div>
+          <div
+            style={{
+              padding: 10,
+              cursor: onBodyClick || onBodyDoubleClick ? 'pointer' : 'default',
+            }}
+            onClick={onBodyClick ? handleBodyClick : undefined}
+            onDoubleClick={onBodyDoubleClick ? handleBodyDoubleClick : undefined}
+            title={
+              onBodyClick && onBodyDoubleClick
+                ? '单击：运行到此节点 / 双击：放大预览'
+                : onBodyDoubleClick
+                ? '双击：放大预览'
+                : onBodyClick
+                ? '单击：运行到此节点'
+                : undefined
+            }
+          >
+            {children}
+          </div>
           {actions && (
             <div
               style={{

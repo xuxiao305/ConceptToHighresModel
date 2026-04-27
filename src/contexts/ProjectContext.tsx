@@ -8,7 +8,9 @@ import {
 } from 'react';
 import {
   isProjectSupported,
+  listNodeHistory,
   loadLatestNodeAsset,
+  loadNodeAssetByName,
   pickAndOpenOrCreateProject,
   renameProject as renameProjectApi,
   saveNodeAsset,
@@ -37,6 +39,15 @@ interface ProjectContextValue {
   /** 读取节点最新产物（含 Blob 与 ObjectURL）；未打开 / 无数据返回 null */
   loadLatest: (
     nodeKey: string
+  ) => Promise<{ blob: Blob; url: string; version: AssetVersion } | null>;
+
+  /** 列出节点的历史版本（[0] = 最新）；未打开返回空数组 */
+  listHistory: (nodeKey: string) => Promise<AssetVersion[]>;
+
+  /** 按文件名加载节点的某个历史版本（含 Blob 与 ObjectURL） */
+  loadByName: (
+    nodeKey: string,
+    fileName: string
   ) => Promise<{ blob: Blob; url: string; version: AssetVersion } | null>;
 }
 
@@ -83,6 +94,25 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     [project]
   );
 
+  const listHistory = useCallback(
+    async (nodeKey: string) => {
+      if (!project) return [];
+      return await listNodeHistory(project, nodeKey);
+    },
+    [project]
+  );
+
+  const loadByName = useCallback(
+    async (nodeKey: string, fileName: string) => {
+      if (!project) return null;
+      const r = await loadNodeAssetByName(project, nodeKey, fileName);
+      if (!r) return null;
+      const url = URL.createObjectURL(r.blob);
+      return { blob: r.blob, url, version: r.version };
+    },
+    [project]
+  );
+
   const value = useMemo<ProjectContextValue>(
     () => ({
       project,
@@ -92,8 +122,10 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       rename,
       saveAsset,
       loadLatest,
+      listHistory,
+      loadByName,
     }),
-    [project, supported, newOrOpenProject, closeProject, rename, saveAsset, loadLatest]
+    [project, supported, newOrOpenProject, closeProject, rename, saveAsset, loadLatest, listHistory, loadByName]
   );
 
   return <ProjectContext.Provider value={value}>{children}</ProjectContext.Provider>;

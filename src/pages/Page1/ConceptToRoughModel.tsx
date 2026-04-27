@@ -4,9 +4,11 @@ import { NodeCard } from '../../components/NodeCard';
 import { NodeConnector } from '../../components/NodeConnector';
 import { Button } from '../../components/Button';
 import { Placeholder } from '../../components/Placeholder';
+import { ImagePreviewModal } from '../../components/ImagePreviewModal';
 import { runConceptToTPose, runTPoseMultiView } from '../../services/workflows';
 import { runImageToModel, TripoServiceError } from '../../services/tripo';
 import { useProject } from '../../contexts/ProjectContext';
+import type { AssetVersion } from '../../services/projectStore';
 
 const NODES: NodeConfig[] = [
   { id: 'concept', title: 'Concept', display: 'image', description: '上传概念设计稿' },
@@ -14,6 +16,15 @@ const NODES: NodeConfig[] = [
   { id: 'multiview', title: 'Multi-View', display: 'multiview', description: '生成多角度视图' },
   { id: 'rough', title: 'Rough Model', display: '3d', description: 'Tripo AI 生成 3D 粗模 (GLB)' },
   { id: 'rigging', title: 'Rough Model Rigging', display: '3d', description: '骨骼绑定' },
+];
+
+/** 节点索引 → projectStore 中的 nodeKey（用于历史读写） */
+const NODE_KEYS = [
+  'page1.concept',
+  'page1.tpose',
+  'page1.multiview',
+  'page1.rough',
+  'page1.rigging',
 ];
 
 interface Props {
@@ -33,7 +44,7 @@ interface NodeOutputs {
 }
 
 export function ConceptToRoughModel({ onStatusChange }: Props) {
-  const { project, saveAsset, loadLatest } = useProject();
+  const { project, saveAsset, loadLatest, listHistory, loadByName } = useProject();
   const [states, setStates] = useState<NodeState[]>([
     'idle', 'idle', 'idle', 'idle', 'idle',
   ]);
@@ -50,6 +61,21 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // 每个节点的历史版本列表（[0] = 最新）
+  const [histories, setHistories] = useState<Record<number, AssetVersion[]>>({});
+  // 每个节点当前选中的历史版本文件名
+  const [selectedFiles, setSelectedFiles] = useState<Record<number, string>>({});
+  // 大图预览
+  const [preview, setPreview] = useState<{ url: string; title: string } | null>(null);
+  // 链式运行中标记，避免并发
+  const chainRunningRef = useRef(false);
+
+  // 用 ref 镜像最新的 outputs/states，便于异步链式运行读取最新值
+  const outputsRef = useRef(outputs);
+  useEffect(() => { outputsRef.current = outputs; }, [outputs]);
+  const statesRef = useRef(states);
+  useEffect(() => { statesRef.current = states; }, [states]);
+
   const setNodeState = useCallback((idx: number, s: NodeState) => {
     setStates((prev) => {
       const next = [...prev];
@@ -57,6 +83,24 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       return next;
     });
   }, []);
+
+  // ---- 历史版本读取 -------------------------------------------------------
+  const refreshHistory = useCallback(async (idx: number) => {
+    if (!project) {
+      setHistories((prev) => ({ ...prev, [idx]: [] }));
+      return;
+    }
+    try {
+      const list = await listHistory(NODE_KEYS[idx]);
+      setHistories((prev) => ({ ...prev, [idx]: list }));
+    } catch (err) {
+      console.warn('[history] load failed', NODE_KEYS[idx], err);
+    }
+  }, [project, listHistory]);
+
+  const refreshAllHistories = useCallback(async () => {
+    await Promise.all(NODES.map((_, i) => refreshHistory(i)));
+  }, [refreshHistory]);
 
   // ---- Project load: 切换工程时拉取最新历史版本 ---------------------------
   useEffect(() => {
@@ -114,6 +158,16 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           : '工程为空，可从 Concept 节点开始',
         loaded.length ? 'success' : 'info'
       );
+
+      // 同步拉取全部节点的历史列表
+      await refreshAllHistories();
+      // 当前选中的版本默认是最新一个
+      const sel: Record<number, string> = {};
+      if (concept) sel[0] = concept.version.file;
+      if (tpose) sel[1] = tpose.version.file;
+      if (multiview) sel[2] = multiview.version.file;
+      if (rough) sel[3] = rough.version.file;
+      setSelectedFiles(sel);
     })().catch((err) => {
       if (cancelled) return;
       onStatusChange(`加载工程数据失败：${err instanceof Error ? err.message : String(err)}`, 'error');
@@ -166,7 +220,13 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     if (project) {
       const ext = (file.name.split('.').pop() || 'png').toLowerCase();
       saveAsset('page1.concept', file, ext, file.name).then(
-        (v) => v && onStatusChange(`已保存到工程：${v.file}`, 'success'),
+        (v) => {
+          if (v) {
+            onStatusChange(`已保存到工程：${v.file}`, 'success');
+            setSelectedFiles((prev) => ({ ...prev, 0: v.file }));
+            refreshHistory(0);
+          }
+        },
         (err) => onStatusChange(`保存到工程失败：${err.message ?? err}`, 'error')
       );
     }
@@ -193,15 +253,16 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
   };
 
   // ---- T Pose node ----------------------------------------------------------
-  const runTPose = useCallback(async () => {
-    if (!outputs.conceptFile) {
+  const runTPose = useCallback(async (sourceFile?: File): Promise<string | null> => {
+    const file = sourceFile ?? outputsRef.current.conceptFile;
+    if (!file) {
       onStatusChange('请先在 Concept 节点上传图片', 'error');
-      return;
+      return null;
     }
     setNodeState(1, 'running');
     setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 1: '' } }));
     try {
-      const url = await runConceptToTPose(outputs.conceptFile, {
+      const url = await runConceptToTPose(file, {
         onStatus: (msg) => onStatusChange(msg, 'info'),
       });
       setOutputs((prev) => {
@@ -228,7 +289,11 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         try {
           const blob = await (await fetch(url)).blob();
           const v = await saveAsset('page1.tpose', blob, 'png');
-          if (v) onStatusChange(`T Pose 已保存到工程：${v.file}`, 'success');
+          if (v) {
+            onStatusChange(`T Pose 已保存到工程：${v.file}`, 'success');
+            setSelectedFiles((prev) => ({ ...prev, 1: v.file }));
+            refreshHistory(1);
+          }
         } catch (e) {
           onStatusChange(
             `T Pose 保存失败：${e instanceof Error ? e.message : String(e)}`,
@@ -236,25 +301,28 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           );
         }
       }
+      return url;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[T Pose] failed:', err);
       setNodeState(1, 'error');
       setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 1: msg } }));
       onStatusChange(`T Pose 生成失败：${msg}`, 'error');
+      return null;
     }
-  }, [outputs.conceptFile, onStatusChange, setNodeState, project, saveAsset]);
+  }, [onStatusChange, setNodeState, project, saveAsset, refreshHistory]);
 
   // ---- Multi-View node (real ComfyUI workflow) ----------------------------
-  const runMultiView = useCallback(async () => {
-    if (!outputs.tposeUrl) {
+  const runMultiView = useCallback(async (sourceUrl?: string): Promise<string | null> => {
+    const tposeUrl = sourceUrl ?? outputsRef.current.tposeUrl;
+    if (!tposeUrl) {
       onStatusChange('请先生成 T Pose', 'error');
-      return;
+      return null;
     }
     setNodeState(2, 'running');
     setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 2: '' } }));
     try {
-      const url = await runTPoseMultiView(outputs.tposeUrl, {
+      const url = await runTPoseMultiView(tposeUrl, {
         onStatus: (msg) => onStatusChange(msg, 'info'),
       });
       setOutputs((prev) => {
@@ -274,7 +342,11 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         try {
           const blob = await (await fetch(url)).blob();
           const v = await saveAsset('page1.multiview', blob, 'png');
-          if (v) onStatusChange(`Multi-View 已保存到工程：${v.file}`, 'success');
+          if (v) {
+            onStatusChange(`Multi-View 已保存到工程：${v.file}`, 'success');
+            setSelectedFiles((prev) => ({ ...prev, 2: v.file }));
+            refreshHistory(2);
+          }
         } catch (e) {
           onStatusChange(
             `Multi-View 保存失败：${e instanceof Error ? e.message : String(e)}`,
@@ -282,20 +354,23 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           );
         }
       }
+      return url;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[Multi-View] failed:', err);
       setNodeState(2, 'error');
       setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 2: msg } }));
       onStatusChange(`Multi-View 生成失败：${msg}`, 'error');
+      return null;
     }
-  }, [outputs.tposeUrl, onStatusChange, setNodeState, project, saveAsset]);
+  }, [onStatusChange, setNodeState, project, saveAsset, refreshHistory]);
 
   // ---- Rough Model node (Tripo AI image → GLB) ---------------------------
-  const runRoughModel = useCallback(async () => {
-    if (!outputs.multiviewUrl) {
+  const runRoughModel = useCallback(async (sourceUrl?: string): Promise<string | null> => {
+    const mvUrl = sourceUrl ?? outputsRef.current.multiviewUrl;
+    if (!mvUrl) {
       onStatusChange('请先生成 Multi-View', 'error');
-      return;
+      return null;
     }
     setNodeState(3, 'running');
     setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 3: '' } }));
@@ -305,8 +380,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
 
     try {
       // 使用 Multi-View 作为 Tripo 输入（匹配流水线的连接）。
-      // 如果后续需更高质量，可改为 outputs.tposeUrl（干净正视图）。
-      const inputBlob = await (await fetch(outputs.multiviewUrl)).blob();
+      const inputBlob = await (await fetch(mvUrl)).blob();
 
       const { blob, result } = await runImageToModel(inputBlob, {
         onStatus: (msg) => onStatusChange(msg, 'info'),
@@ -327,6 +401,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           if (v) {
             savedFile = v.file;
             onStatusChange(`粗模已保存到工程：${v.file}`, 'success');
+            setSelectedFiles((prev) => ({ ...prev, 3: v.file }));
+            refreshHistory(3);
           }
         } catch (e) {
           onStatusChange(
@@ -336,11 +412,12 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         }
       }
 
+      const url = URL.createObjectURL(blob);
       setOutputs((prev) => {
         if (prev.roughUrl) URL.revokeObjectURL(prev.roughUrl);
         return {
           ...prev,
-          roughUrl: URL.createObjectURL(blob),
+          roughUrl: url,
           roughFile: savedFile,
         };
       });
@@ -351,6 +428,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         return next;
       });
       onStatusChange('Rough Model 生成完成', 'success');
+      return url;
     } catch (err) {
       const msg =
         err instanceof TripoServiceError
@@ -364,10 +442,11 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       setNodeState(3, 'error');
       setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 3: msg } }));
       onStatusChange(`Rough Model 生成失败：${msg}`, 'error');
+      return null;
     } finally {
       roughAbortRef.current = null;
     }
-  }, [outputs.multiviewUrl, onStatusChange, setNodeState, project, saveAsset]);
+  }, [onStatusChange, setNodeState, project, saveAsset, refreshHistory]);
 
   const cancelRoughModel = useCallback(() => {
     roughAbortRef.current?.abort();
@@ -376,23 +455,113 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
 
   // ---- Mock runner for nodes 3..4 (Rough Model / Rigging) -----------------
   const runMockNode = useCallback(
-    (idx: number) => {
+    (idx: number): Promise<boolean> => {
       setNodeState(idx, 'running');
       onStatusChange(`正在运行：${NODES[idx].title}（mock）`, 'info');
-      window.setTimeout(() => {
-        setStates((prev) => {
-          const next = [...prev];
-          next[idx] = 'complete';
-          if (idx + 1 < next.length && next[idx + 1] === 'idle') {
-            next[idx + 1] = 'ready';
-          }
-          return next;
-        });
-        onStatusChange(`${NODES[idx].title} 已完成（mock）`, 'success');
-      }, 2000);
+      return new Promise<boolean>((resolve) => {
+        window.setTimeout(() => {
+          setStates((prev) => {
+            const next = [...prev];
+            next[idx] = 'complete';
+            if (idx + 1 < next.length && next[idx + 1] === 'idle') {
+              next[idx + 1] = 'ready';
+            }
+            return next;
+          });
+          onStatusChange(`${NODES[idx].title} 已完成（mock）`, 'success');
+          resolve(true);
+        }, 2000);
+      });
     },
     [onStatusChange, setNodeState]
   );
+
+  // ---- 链式运行：自动跑完前面所有未完成的节点 ----------------------------
+  const runUpToNode = useCallback(async (target: number) => {
+    if (chainRunningRef.current) return;
+    if (target <= 0) return;
+    chainRunningRef.current = true;
+    try {
+      // Concept 节点不能自动运行（必须人工上传）
+      if (!outputsRef.current.conceptFile) {
+        onStatusChange('请先在 Concept 节点上传图片', 'error');
+        return;
+      }
+
+      let tposeUrl: string | null = outputsRef.current.tposeUrl;
+      let mvUrl: string | null = outputsRef.current.multiviewUrl;
+
+      if (target >= 1 && statesRef.current[1] !== 'complete') {
+        tposeUrl = await runTPose(outputsRef.current.conceptFile);
+        if (!tposeUrl) return;
+      }
+      if (target >= 2 && statesRef.current[2] !== 'complete') {
+        mvUrl = await runMultiView(tposeUrl ?? undefined);
+        if (!mvUrl) return;
+      }
+      if (target >= 3 && statesRef.current[3] !== 'complete') {
+        const ru = await runRoughModel(mvUrl ?? undefined);
+        if (!ru) return;
+      }
+      if (target >= 4 && statesRef.current[4] !== 'complete') {
+        const ok = await runMockNode(4);
+        if (!ok) return;
+      }
+    } finally {
+      chainRunningRef.current = false;
+    }
+  }, [onStatusChange, runTPose, runMultiView, runRoughModel, runMockNode]);
+
+  // ---- 切换某节点的历史版本 ------------------------------------------------
+  const handleSelectHistory = useCallback(async (idx: number, fileName: string) => {
+    if (!project) return;
+    if (!fileName) return;
+    try {
+      const r = await loadByName(NODE_KEYS[idx], fileName);
+      if (!r) {
+        onStatusChange('无法读取该历史版本', 'error');
+        return;
+      }
+      setSelectedFiles((prev) => ({ ...prev, [idx]: fileName }));
+      setOutputs((prev) => {
+        const next = { ...prev };
+        if (idx === 0) {
+          if (prev.conceptUrl) URL.revokeObjectURL(prev.conceptUrl);
+          next.conceptUrl = r.url;
+          next.conceptFile = new File([r.blob], fileName, {
+            type: r.blob.type || 'image/png',
+          });
+        } else if (idx === 1) {
+          if (prev.tposeUrl) URL.revokeObjectURL(prev.tposeUrl);
+          next.tposeUrl = r.url;
+        } else if (idx === 2) {
+          if (prev.multiviewUrl) URL.revokeObjectURL(prev.multiviewUrl);
+          next.multiviewUrl = r.url;
+        } else if (idx === 3) {
+          if (prev.roughUrl) URL.revokeObjectURL(prev.roughUrl);
+          next.roughUrl = r.url;
+          next.roughFile = fileName;
+        }
+        next.errors = { ...prev.errors, [idx]: '' };
+        return next;
+      });
+      setStates((prev) => {
+        const next = [...prev];
+        next[idx] = 'complete';
+        // 切换上游版本后下游状态保留为 ready 而不强制刷新
+        if (idx + 1 < next.length && next[idx + 1] === 'idle') {
+          next[idx + 1] = 'ready';
+        }
+        return next;
+      });
+      onStatusChange(`已切换到历史版本：${fileName}`, 'success');
+    } catch (err) {
+      onStatusChange(
+        `加载历史版本失败：${err instanceof Error ? err.message : String(err)}`,
+        'error'
+      );
+    }
+  }, [project, loadByName, onStatusChange]);
 
   const resetAll = () => {
     setOutputs((prev) => {
@@ -529,7 +698,28 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
 
             return (
               <div key={node.id} style={{ display: 'flex', alignItems: 'center' }}>
-                <NodeCard title={`${idx + 1}. ${node.title}`} state={state} actions={actions}>
+                <NodeCard
+                  title={`${idx + 1}. ${node.title}`}
+                  state={state}
+                  actions={actions}
+                  headerExtra={
+                    project && (histories[idx]?.length ?? 0) > 0 ? (
+                      <HistoryDropdown
+                        history={histories[idx] ?? []}
+                        selected={selectedFiles[idx]}
+                        onSelect={(f) => handleSelectHistory(idx, f)}
+                      />
+                    ) : undefined
+                  }
+                  onBodyClick={
+                    idx === 0 ? undefined : () => { void runUpToNode(idx); }
+                  }
+                  onBodyDoubleClick={
+                    imageUrl
+                      ? () => setPreview({ url: imageUrl, title: `${idx + 1}. ${node.title}` })
+                      : undefined
+                  }
+                >
                   {body}
                 </NodeCard>
                 {idx < NODES.length - 1 && (
@@ -540,6 +730,14 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           })}
         </div>
       </div>
+
+      {preview && (
+        <ImagePreviewModal
+          url={preview.url}
+          title={preview.title}
+          onClose={() => setPreview(null)}
+        />
+      )}
     </div>
   );
 }
@@ -559,7 +757,7 @@ interface ActionHandlers {
   onRunRoughModel: () => void;
   onCancelRoughModel: () => void;
   onDownloadRough: () => void;
-  onRunMock: (idx: number) => void;
+  onRunMock: (idx: number) => void | Promise<boolean>;
   onCancelMock: () => void;
   conceptReady: boolean;
   tposeReady: boolean;
@@ -683,4 +881,52 @@ function renderActions(
       )}
     </>
   );
+}
+
+// ---------------------------------------------------------------------------
+// 历史版本下拉
+// ---------------------------------------------------------------------------
+
+interface HistoryDropdownProps {
+  history: AssetVersion[];
+  selected?: string;
+  onSelect: (fileName: string) => void;
+}
+
+function HistoryDropdown({ history, selected, onSelect }: HistoryDropdownProps) {
+  return (
+    <select
+      value={selected ?? ''}
+      onChange={(e) => onSelect(e.target.value)}
+      onClick={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
+      title="选择历史版本"
+      style={{
+        background: 'var(--bg-surface-3)',
+        color: 'var(--text-primary)',
+        border: '1px solid var(--border-default)',
+        borderRadius: 3,
+        fontSize: 10,
+        padding: '1px 4px',
+        maxWidth: 110,
+      }}
+    >
+      {history.map((v) => (
+        <option key={v.file} value={v.file}>
+          {prettyVersionLabel(v)}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function prettyVersionLabel(v: AssetVersion): string {
+  // 时间戳形如 20260427_171530_123.png；优先用 timestamp（ISO）转成短格式
+  try {
+    const d = new Date(v.timestamp);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  } catch {
+    return v.file;
+  }
 }

@@ -264,3 +264,22 @@ export async function listNodeHistory(
   const idx = await loadIndex(nodeDir);
   return idx.history;
 }
+
+/** 按文件名读取某节点的指定历史版本 */
+export async function loadNodeAssetByName(
+  handle: ProjectHandle,
+  nodeKey: string,
+  fileName: string
+): Promise<{ blob: Blob; version: AssetVersion } | null> {
+  const nodeDir = await getNodeDir(handle, nodeKey, false);
+  if (!nodeDir) return null;
+  const idx = await loadIndex(nodeDir);
+  const version = idx.history.find((v) => v.file === fileName);
+  if (!version) return null;
+  try {
+    const blob = await readFileBlob(nodeDir, fileName);
+    return { blob, version };
+  } catch {
+    return null;
+  }
+}
