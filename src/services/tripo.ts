@@ -191,6 +191,104 @@ export async function createTask(
   return taskId;
 }
 
+// ---------------------------------------------------------------------------
+// Multi-View → 3D Model
+// ---------------------------------------------------------------------------
+
+/**
+ * Tripo 多视图建模的视图槽位。`null` 表示该槽位留空。
+ *
+ * 注意 Tripo OpenAPI 多视图任务的 `files` 数组顺序固定为：
+ *   index 0 = front
+ *   index 1 = left
+ *   index 2 = back
+ *   index 3 = right
+ */
+export interface TripoMultiViewTokens {
+  front: string | null;
+  left: string | null;
+  back: string | null;
+  right: string | null;
+}
+
+/** 提交 multiview_to_model 任务，得到 task_id。 */
+export async function createMultiViewTask(
+  tokens: TripoMultiViewTokens,
+  params: TripoGenerateParams = {}
+): Promise<string> {
+  ensureToken();
+
+  // 至少需要 front
+  if (!tokens.front) {
+    throw new TripoServiceError('多视图任务必须提供正面（front）视图');
+  }
+
+  const slot = (t: string | null) =>
+    t ? { type: 'jpg', file_token: t } : { type: 'jpg', file_token: '' };
+
+  const payload: Record<string, unknown> = {
+    type: 'multiview_to_model',
+    model_version: params.model_version ?? DEFAULT_TRIPO_MODEL_VERSION,
+    files: [slot(tokens.front), slot(tokens.left), slot(tokens.back), slot(tokens.right)],
+    texture: params.texture ?? true,
+    pbr: params.pbr ?? true,
+    texture_quality: params.texture_quality ?? 'standard',
+    texture_alignment: params.texture_alignment ?? 'original_image',
+    auto_size: params.auto_size ?? false,
+    orientation: params.orientation ?? 'default',
+    quad: params.quad ?? false,
+    smart_low_poly: params.smart_low_poly ?? false,
+    export_uv: params.export_uv ?? true,
+    enable_image_autofix: params.enable_image_autofix ?? false,
+  };
+  if (params.face_limit && params.face_limit > 0) {
+    payload.face_limit = params.face_limit;
+  }
+  if (params.model_seed !== undefined && params.model_seed >= 0) {
+    payload.model_seed = params.model_seed;
+  }
+  if (params.texture_seed !== undefined && params.texture_seed >= 0) {
+    payload.texture_seed = params.texture_seed;
+  }
+
+  console.log(
+    `[Tripo] createMultiViewTask model_version=${payload.model_version}`,
+    'slots=',
+    Object.entries(tokens)
+      .map(([k, v]) => `${k}:${v ? 'Y' : '-'}`)
+      .join(' ')
+  );
+
+  const resp = await fetch(`${BASE}/v2/openapi/task`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!resp.ok) {
+    throw new TripoServiceError(
+      `多视图任务创建失败 (HTTP ${resp.status}): ${await resp.text()}`
+    );
+  }
+
+  const json = (await resp.json()) as {
+    code?: number;
+    message?: string;
+    data?: { task_id?: string };
+  };
+  if (json.code !== 0) {
+    throw new TripoServiceError(json.message ?? '任务创建失败', json.code ?? 0);
+  }
+  const taskId = json.data?.task_id;
+  if (!taskId) throw new TripoServiceError('响应缺少 task_id');
+  console.log(`[Tripo] multiview task_id=${taskId}`);
+  return taskId;
+}
+
+
 function pickUrl(obj: unknown, key: string): string {
   if (!obj || typeof obj !== 'object') return '';
   const v = (obj as Record<string, unknown>)[key];
@@ -363,6 +461,66 @@ export async function runImageToModel(
       if (p !== lastProgress) {
         lastProgress = p;
         status(`Tripo 生成中… ${p}% (${s})`);
+      }
+    },
+  });
+
+  status('下载模型中…');
+  const blob = await downloadModel(result.model_url);
+  return { blob, result };
+}
+
+// ---------------------------------------------------------------------------
+// 高层组合：四视图 → GLB Blob
+// ---------------------------------------------------------------------------
+
+/** 四视图输入。每个槽位接收一个 Blob 或 null。front 必填。 */
+export interface MultiViewInputs {
+  front: Blob;
+  left?: Blob | null;
+  back?: Blob | null;
+  right?: Blob | null;
+}
+
+/**
+ * 一站式多视图建模：分别上传 4 张图 → 创建多视图任务 → 轮询 → 下载模型 Blob。
+ * 任意非 front 槽位若为空则跳过上传。
+ */
+export async function runMultiViewToModel(
+  inputs: MultiViewInputs,
+  opts: RunImageToModelOptions = {}
+): Promise<{ blob: Blob; result: TripoTaskResult }> {
+  const status = (m: string) => opts.onStatus?.(m);
+
+  const slots: { key: keyof MultiViewInputs; blob: Blob | null }[] = [
+    { key: 'front', blob: inputs.front },
+    { key: 'left',  blob: inputs.left  ?? null },
+    { key: 'back',  blob: inputs.back  ?? null },
+    { key: 'right', blob: inputs.right ?? null },
+  ];
+  const present = slots.filter((s) => s.blob).map((s) => s.key);
+  status(`上传 ${present.length} 张视图（${present.join('/')}）…`);
+
+  const tokens: TripoMultiViewTokens = { front: null, left: null, back: null, right: null };
+  for (const s of slots) {
+    if (!s.blob) continue;
+    const t = await uploadImage(s.blob, `${s.key}.png`);
+    tokens[s.key] = t;
+  }
+
+  status('提交多视图任务中…');
+  const taskId = await createMultiViewTask(tokens, opts.params);
+
+  status('Tripo 多视图生成中… 0%');
+  let lastProgress = -1;
+  const result = await waitForCompletion(taskId, {
+    pollInterval: opts.pollInterval,
+    timeoutMs: opts.timeoutMs,
+    signal: opts.signal,
+    onProgress: (p, s) => {
+      if (p !== lastProgress) {
+        lastProgress = p;
+        status(`Tripo 多视图生成中… ${p}% (${s})`);
       }
     },
   });

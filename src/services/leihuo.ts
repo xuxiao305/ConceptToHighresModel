@@ -28,9 +28,10 @@ const SYSTEM_PROMPT =
 
 export interface GenerateImageOptions {
   prompt: string;
-  /** Optional reference images. Accepts File objects or already-resolved
-   *  data-URL / blob-URL strings. Each is sent as an `image_url` content part. */
-  images?: Array<File | string>;
+  /** Optional reference images. Accepts File / Blob objects or already-resolved
+   *  data-URL / blob-URL / http(s) URL strings. Each is sent as an
+   *  `image_url` content part. */
+  images?: Array<File | Blob | string>;
   model?: string;
   /** Optional seed for reproducibility. If omitted, the API picks one. */
   seed?: number;
@@ -38,35 +39,59 @@ export interface GenerateImageOptions {
   signal?: AbortSignal;
 }
 
-/** Convert a File to a base64 data URL. */
-async function fileToDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(r.result as string);
-    r.onerror = () => reject(r.error ?? new Error('FileReader failed'));
-    r.readAsDataURL(file);
-  });
+/** 将 Uint8Array 编码为 base64（不依赖 FileReader，安全可重入）。 */
+function bytesToBase64(bytes: Uint8Array): string {
+  // chunk 化，避免 String.fromCharCode 一次塞太多参数
+  const CHUNK = 0x8000;
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(
+      null,
+      bytes.subarray(i, Math.min(i + CHUNK, bytes.length)) as unknown as number[],
+    );
+  }
+  return btoa(bin);
 }
 
-/** Convert a blob: URL to a base64 data URL. */
+/** 把 Blob 转成 `data:<mime>;base64,...` URL。 */
+async function blobToDataUrl(blob: Blob, fallbackMime = 'image/png'): Promise<string> {
+  const buf = new Uint8Array(await blob.arrayBuffer());
+  const mime = blob.type || fallbackMime;
+  return `data:${mime};base64,${bytesToBase64(buf)}`;
+}
+
+/** Convert a blob:/http: URL to a base64 data URL. */
 async function blobUrlToDataUrl(url: string): Promise<string> {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`无法读取图片 (${res.status}): ${url}`);
+  if (!res.ok) throw new Error(`无法读取图片 (HTTP ${res.status}): ${url}`);
   const blob = await res.blob();
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(r.result as string);
-    r.onerror = () => reject(r.error ?? new Error('FileReader failed'));
-    r.readAsDataURL(blob);
-  });
+  return blobToDataUrl(blob);
 }
 
-async function toDataUrl(input: File | string): Promise<string> {
-  if (typeof input !== 'string') return fileToDataUrl(input);
-  if (input.startsWith('data:')) return input;
-  if (input.startsWith('blob:')) return blobUrlToDataUrl(input);
-  // http(s) URL — fetch then encode
-  return blobUrlToDataUrl(input);
+async function toDataUrl(input: File | Blob | string | unknown): Promise<string> {
+  if (input == null) {
+    throw new Error('toDataUrl: 输入为空（null/undefined）');
+  }
+  if (typeof input === 'string') {
+    if (input.startsWith('data:')) return input;
+    if (input.startsWith('blob:') || input.startsWith('http:') || input.startsWith('https:')) {
+      return blobUrlToDataUrl(input);
+    }
+    throw new Error(`toDataUrl: 不支持的字符串输入（前缀未知）：${input.slice(0, 64)}…`);
+  }
+  // 鸭子类型：File/Blob 都有 arrayBuffer 方法（避免跨 HMR / iframe 边界 instanceof 失效）
+  if (typeof (input as Blob).arrayBuffer === 'function') {
+    return blobToDataUrl(input as Blob);
+  }
+  // 兜底：详细描述对象，便于诊断
+  let desc = Object.prototype.toString.call(input);
+  try {
+    const keys = Object.keys(input as object).slice(0, 8).join(',');
+    desc += ` keys=[${keys}]`;
+  } catch {
+    /* ignore */
+  }
+  throw new Error(`toDataUrl: 不支持的输入类型 ${desc}`);
 }
 
 /** Decode a `data:image/...;base64,...` URL to an object URL. */

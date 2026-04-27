@@ -57,10 +57,10 @@ export async function runConceptToTPose(
  * T-Pose → Multi-View: take the T-pose image and produce a 4-panel turnaround
  * sheet (front / left / right / back).
  *
- * Accepts a File or a previously-generated blob: URL.
+ * Accepts a File / Blob or a previously-generated blob:/http(s) URL.
  */
 export async function runTPoseMultiView(
-  tposeInput: File | string,
+  tposeInput: File | Blob | string,
   opts: RunOptions = {}
 ): Promise<string> {
   const { onStatus } = opts;

@@ -10,12 +10,16 @@ import {
   isProjectSupported,
   listNodeHistory,
   loadLatestNodeAsset,
+  loadLatestSegmentSet,
   loadNodeAssetByName,
   pickAndOpenOrCreateProject,
   renameProject as renameProjectApi,
   saveNodeAsset,
+  saveSegmentSet,
   type AssetVersion,
   type ProjectHandle,
+  type SegmentSetHandle,
+  type SegmentSetIndex,
 } from '../services/projectStore';
 
 interface ProjectContextValue {
@@ -49,6 +53,20 @@ interface ProjectContextValue {
     nodeKey: string,
     fileName: string
   ) => Promise<{ blob: Blob; url: string; version: AssetVersion } | null>;
+
+  /** 在节点目录下创建版本化子目录，写入若干文件（如 SAM3 切分输出） */
+  saveSegments: (
+    nodeKey: string,
+    baseName: string,
+    source: string,
+    files: { name: string; blob: Blob; meta?: Record<string, unknown> }[],
+  ) => Promise<SegmentSetHandle | null>;
+
+  /** 读取节点最新一版切分子目录（按 _v#### 序号取最大者） */
+  loadLatestSegments: (
+    nodeKey: string,
+    baseName?: string,
+  ) => Promise<{ dirName: string; index: SegmentSetIndex; files: Map<string, Blob> } | null>;
 }
 
 const ProjectContext = createContext<ProjectContextValue | null>(null);
@@ -113,6 +131,27 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     [project]
   );
 
+  const saveSegments = useCallback(
+    async (
+      nodeKey: string,
+      baseName: string,
+      source: string,
+      files: { name: string; blob: Blob; meta?: Record<string, unknown> }[],
+    ) => {
+      if (!project) return null;
+      return await saveSegmentSet(project, nodeKey, baseName, source, files);
+    },
+    [project],
+  );
+
+  const loadLatestSegments = useCallback(
+    async (nodeKey: string, baseName?: string) => {
+      if (!project) return null;
+      return await loadLatestSegmentSet(project, nodeKey, baseName);
+    },
+    [project],
+  );
+
   const value = useMemo<ProjectContextValue>(
     () => ({
       project,
@@ -124,8 +163,10 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       loadLatest,
       listHistory,
       loadByName,
+      saveSegments,
+      loadLatestSegments,
     }),
-    [project, supported, newOrOpenProject, closeProject, rename, saveAsset, loadLatest, listHistory, loadByName]
+    [project, supported, newOrOpenProject, closeProject, rename, saveAsset, loadLatest, listHistory, loadByName, saveSegments, loadLatestSegments]
   );
 
   return <ProjectContext.Provider value={value}>{children}</ProjectContext.Provider>;

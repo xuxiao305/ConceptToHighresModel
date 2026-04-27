@@ -283,3 +283,136 @@ export async function loadNodeAssetByName(
     return null;
   }
 }
+
+
+// ---------------------------------------------------------------------------
+// 子集 / 切分版本（例如 SAM3 输出的 multi-view 切片）
+// ---------------------------------------------------------------------------
+
+export interface SegmentSetEntry {
+  /** 在子目录中的文件名 */
+  file: string;
+  /** 元信息透传（bbox / score / mask_value 等），无要求 */
+  meta?: Record<string, unknown>;
+}
+
+export interface SegmentSetIndex {
+  /** 来源原图相对节点目录的文件名（例如 "20260427_213238_894.png"） */
+  source: string;
+  /** 子目录创建时间 */
+  createdAt: string;
+  /** 版本号（v0001, v0002…），与目录后缀一致 */
+  version: string;
+  /** 各切片元信息 */
+  entries: SegmentSetEntry[];
+}
+
+export interface SegmentSetHandle {
+  /** 子目录名（含版本后缀），例如 "20260427_213238_894_v0001" */
+  dirName: string;
+  index: SegmentSetIndex;
+}
+
+/**
+ * 在节点目录下创建一个新的「切分子目录」，命名格式为
+ *   <baseName>_v0001 / _v0002 / ...
+ * 自动找到下一个可用版本号。`baseName` 通常是来源图（如 multi-view）的文件名
+ * 去掉扩展名。所有传入的 files 都会写入该子目录，并生成 segments.json 索引。
+ *
+ * 文件名 `name` 可包含 `{v}` 占位符，会被替换为本次的版本号字符串（如 "v0001"），
+ * 例如传入 `front_{v}.png` 会生成 `front_v0001.png`。
+ */
+export async function saveSegmentSet(
+  handle: ProjectHandle,
+  nodeKey: string,
+  baseName: string,
+  source: string,
+  files: { name: string; blob: Blob; meta?: Record<string, unknown> }[],
+): Promise<SegmentSetHandle> {
+  const nodeDir = await getNodeDir(handle, nodeKey, true);
+  if (!nodeDir) throw new Error(`无法创建节点目录: ${nodeKey}`);
+
+  // 找到下一个版本号
+  const existing = new Set<string>();
+  const dirIter = (nodeDir as unknown as {
+    entries: () => AsyncIterable<[string, FileSystemHandle]>;
+  }).entries();
+  for await (const [name] of dirIter) {
+    existing.add(name);
+  }
+  let n = 1;
+  let dirName = `${baseName}_v${String(n).padStart(4, '0')}`;
+  while (existing.has(dirName)) {
+    n += 1;
+    dirName = `${baseName}_v${String(n).padStart(4, '0')}`;
+  }
+  const versionTag = `v${String(n).padStart(4, '0')}`;
+
+  const subDir = await getOrCreateDir(nodeDir, dirName);
+
+  const entries: SegmentSetEntry[] = [];
+  for (const f of files) {
+    const finalName = f.name.replace(/\{v\}/g, versionTag);
+    await writeFile(subDir, finalName, f.blob);
+    entries.push({ file: finalName, meta: f.meta });
+  }
+
+  const index: SegmentSetIndex = {
+    source,
+    createdAt: new Date().toISOString(),
+    version: versionTag,
+    entries,
+  };
+  await writeFile(subDir, 'segments.json', JSON.stringify(index, null, 2));
+  await touchProject(handle);
+
+  return { dirName, index };
+}
+
+/**
+ * 读取节点目录下"最新"的切分子目录（按目录名末尾的 `_v####` 排序，号最大者优先）。
+ * 可选 `baseName` 过滤：只匹配以 `<baseName>_v` 开头的子目录。
+ */
+export async function loadLatestSegmentSet(
+  handle: ProjectHandle,
+  nodeKey: string,
+  baseName?: string,
+): Promise<{
+  dirName: string;
+  index: SegmentSetIndex;
+  files: Map<string, Blob>;
+} | null> {
+  const nodeDir = await getNodeDir(handle, nodeKey, false);
+  if (!nodeDir) return null;
+
+  const candidates: { name: string; n: number }[] = [];
+  const iter = (nodeDir as unknown as {
+    entries: () => AsyncIterable<[string, FileSystemHandle]>;
+  }).entries();
+  for await (const [name, fh] of iter) {
+    if (fh.kind !== 'directory') continue;
+    const m = name.match(/_v(\d{4,})$/);
+    if (!m) continue;
+    if (baseName && !name.startsWith(`${baseName}_v`)) continue;
+    candidates.push({ name, n: parseInt(m[1], 10) });
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.n - a.n);
+  const latest = candidates[0].name;
+  const subDir = await nodeDir.getDirectoryHandle(latest);
+  const idx = await tryReadJson<SegmentSetIndex>(subDir, 'segments.json');
+  if (!idx) return null;
+
+  const files = new Map<string, Blob>();
+  for (const e of idx.entries) {
+    try {
+      files.set(e.file, await readFileBlob(subDir, e.file));
+    } catch {
+      // 跳过缺失的文件
+    }
+  }
+  return { dirName: latest, index: idx, files };
+}
+
+
+

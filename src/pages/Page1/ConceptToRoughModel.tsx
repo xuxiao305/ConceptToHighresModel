@@ -6,7 +6,8 @@ import { Button } from '../../components/Button';
 import { Placeholder } from '../../components/Placeholder';
 import { ImagePreviewModal } from '../../components/ImagePreviewModal';
 import { runConceptToTPose, runTPoseMultiView } from '../../services/workflows';
-import { runImageToModel, TripoServiceError } from '../../services/tripo';
+import { runImageToModel, runMultiViewToModel, TripoServiceError } from '../../services/tripo';
+import { splitMultiView } from '../../services/multiviewSplit';
 import { useProject } from '../../contexts/ProjectContext';
 import type { AssetVersion } from '../../services/projectStore';
 
@@ -44,7 +45,7 @@ interface NodeOutputs {
 }
 
 export function ConceptToRoughModel({ onStatusChange }: Props) {
-  const { project, saveAsset, loadLatest, listHistory, loadByName } = useProject();
+  const { project, saveAsset, loadLatest, listHistory, loadByName, saveSegments, loadLatestSegments } = useProject();
   const [states, setStates] = useState<NodeState[]>([
     'idle', 'idle', 'idle', 'idle', 'idle',
   ]);
@@ -254,9 +255,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
 
   // ---- T Pose node ----------------------------------------------------------
   const runTPose = useCallback(async (sourceFile?: File): Promise<string | null> => {
-    // 防护：直接作为 onClick 传入时 React 会传入 MouseEvent。
-    const arg = sourceFile instanceof File ? sourceFile : undefined;
-    const file = arg ?? outputsRef.current.conceptFile;
+    // 防御：当作为 button onClick handler 直接绑定时，会收到 SyntheticEvent 作为参数
+    const file = (sourceFile instanceof File ? sourceFile : null) ?? outputsRef.current.conceptFile;
     if (!file) {
       onStatusChange('请先在 Concept 节点上传图片', 'error');
       return null;
@@ -316,8 +316,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
 
   // ---- Multi-View node (real ComfyUI workflow) ----------------------------
   const runMultiView = useCallback(async (sourceUrl?: string): Promise<string | null> => {
-    const arg = typeof sourceUrl === 'string' ? sourceUrl : undefined;
-    const tposeUrl = arg ?? outputsRef.current.tposeUrl;
+    // 防御：当作为 button onClick handler 直接绑定时，会收到 SyntheticEvent 作为参数
+    const tposeUrl = (typeof sourceUrl === 'string' ? sourceUrl : null) ?? outputsRef.current.tposeUrl;
     if (!tposeUrl) {
       onStatusChange('请先生成 T Pose', 'error');
       return null;
@@ -349,6 +349,35 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
             onStatusChange(`Multi-View 已保存到工程：${v.file}`, 'success');
             setSelectedFiles((prev) => ({ ...prev, 2: v.file }));
             refreshHistory(2);
+
+            // 自动切分四视图并保存到子目录 <baseName>_v0001/...
+            try {
+              const slices = await splitMultiView(blob);
+              const baseName = v.file.replace(/\.[^.]+$/, '');
+              const setHandle = await saveSegments(
+                'page1.multiview',
+                baseName,
+                v.file,
+                slices.map((s) => ({
+                  // 文件名包含版本号占位符，由 saveSegments 替换为目录的版本号
+                  // 例：front_v0001.png / left_v0001.png ...
+                  name: `${s.view}_{v}.png`,
+                  blob: s.blob,
+                  meta: { view: s.view, bbox: s.bbox, size: s.size },
+                })),
+              );
+              if (setHandle) {
+                onStatusChange(
+                  `已切分 4 视图 → ${setHandle.dirName}/`,
+                  'success',
+                );
+              }
+            } catch (e) {
+              onStatusChange(
+                `Multi-View 切分失败：${e instanceof Error ? e.message : String(e)}`,
+                'warning',
+              );
+            }
           }
         } catch (e) {
           onStatusChange(
@@ -366,12 +395,12 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       onStatusChange(`Multi-View 生成失败：${msg}`, 'error');
       return null;
     }
-  }, [onStatusChange, setNodeState, project, saveAsset, refreshHistory]);
+  }, [onStatusChange, setNodeState, project, saveAsset, saveSegments, refreshHistory]);
 
   // ---- Rough Model node (Tripo AI image → GLB) ---------------------------
   const runRoughModel = useCallback(async (sourceUrl?: string): Promise<string | null> => {
-    const arg = typeof sourceUrl === 'string' ? sourceUrl : undefined;
-    const mvUrl = arg ?? outputsRef.current.multiviewUrl;
+    // 防御：当作为 button onClick handler 直接绑定时，会收到 SyntheticEvent 作为参数
+    const mvUrl = (typeof sourceUrl === 'string' ? sourceUrl : null) ?? outputsRef.current.multiviewUrl;
     if (!mvUrl) {
       onStatusChange('请先生成 Multi-View', 'error');
       return null;
@@ -383,14 +412,54 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     roughAbortRef.current = ctrl;
 
     try {
-      // 使用 Multi-View 作为 Tripo 输入（匹配流水线的连接）。
-      const inputBlob = await (await fetch(mvUrl)).blob();
+      // 优先使用 Multi-View 节点最新一版的切分子目录（front/left/back/right），
+      // 调用 Tripo 多视图建模 API；若读不到切分则退化为单图模式。
+      let multiInputs: { front: Blob; left?: Blob | null; back?: Blob | null; right?: Blob | null } | null = null;
+      if (project) {
+        try {
+          const seg = await loadLatestSegments('page1.multiview');
+          if (seg) {
+            const pick = (view: string): Blob | null => {
+              const entry = seg.index.entries.find(
+                (e) => (e.meta as { view?: string } | undefined)?.view === view,
+              );
+              if (!entry) return null;
+              return seg.files.get(entry.file) ?? null;
+            };
+            const front = pick('front');
+            if (front) {
+              multiInputs = {
+                front,
+                left:  pick('left'),
+                back:  pick('back'),
+                right: pick('right'),
+              };
+              const presentList = ['front',
+                multiInputs.left  ? 'left'  : null,
+                multiInputs.back  ? 'back'  : null,
+                multiInputs.right ? 'right' : null,
+              ].filter(Boolean).join(' / ');
+              onStatusChange(
+                `检测到切分子目录 ${seg.dirName}/，将使用多视图建模（${presentList}）`,
+                'info',
+              );
+            }
+          }
+        } catch (e) {
+          console.warn('[Rough Model] 读取切分集失败，退化为单图模式：', e);
+        }
+      }
 
-      const { blob, result } = await runImageToModel(inputBlob, {
-        onStatus: (msg) => onStatusChange(msg, 'info'),
-        signal: ctrl.signal,
-        filename: 'multiview.png',
-      });
+      const { blob, result } = multiInputs
+        ? await runMultiViewToModel(multiInputs, {
+            onStatus: (msg) => onStatusChange(msg, 'info'),
+            signal: ctrl.signal,
+          })
+        : await runImageToModel(await (await fetch(mvUrl)).blob(), {
+            onStatus: (msg) => onStatusChange(msg, 'info'),
+            signal: ctrl.signal,
+            filename: 'multiview.png',
+          });
 
       // 持久化 + 产生预览 URL
       let savedFile: string | null = null;
@@ -450,7 +519,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     } finally {
       roughAbortRef.current = null;
     }
-  }, [onStatusChange, setNodeState, project, saveAsset, refreshHistory]);
+  }, [onStatusChange, setNodeState, project, saveAsset, refreshHistory, loadLatestSegments]);
 
   const cancelRoughModel = useCallback(() => {
     roughAbortRef.current?.abort();
