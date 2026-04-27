@@ -126,6 +126,22 @@ def load_pipeline():
 
     _o_voxel_mod = o_voxel
     pipe = Trellis2ImageTo3DPipeline.from_pretrained(MODEL_PATH)
+
+    # transformers 5.6 compat: TRELLIS.2's DinoV3FeatureExtractor.extract_features
+    # iterates `self.model.layer`, but new transformers nests the encoder one
+    # level deeper at `self.model.model.layer` (DINOv3ViTModel -> DINOv3ViTEncoder).
+    # Alias it back so the upstream code works unmodified.
+    try:
+        dino = pipe.image_cond_model.model
+        if not hasattr(dino, "layer"):
+            inner = getattr(dino, "model", None)
+            if inner is not None and hasattr(inner, "layer"):
+                dino.layer = inner.layer
+                LOG.info("aliased dino.layer -> dino.model.layer (len=%d)",
+                         len(inner.layer))
+    except Exception as exc:
+        LOG.warning("dino layer alias skipped: %s", exc)
+
     pipe.cuda()
     _pipe = pipe
     LOG.info("pipeline ready in %.1fs", time.time() - t0)

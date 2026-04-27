@@ -1,0 +1,9 @@
+{
+	"servers": {
+		"dangqing-mcp": {
+			"url": "https://mcp-danqing.apps-sl.danlu.netease.com/mcp",
+			"type": "http"
+		}
+	},
+	"inputs": []
+}

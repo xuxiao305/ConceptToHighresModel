@@ -11,4 +11,9 @@ comfyui_history.txt
 # Tripo / 临时模型测试输出
 tripo_test_*.glb
 *.glb
+*.obj
+
+# 测试产物 / 临时图
+Data/trellis2_test/
+Data/multiview_test_*.png
 
