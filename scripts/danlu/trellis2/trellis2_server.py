@@ -45,6 +45,48 @@ _TRELLIS2_REPO = os.environ.get(
 if _TRELLIS2_REPO and _TRELLIS2_REPO not in sys.path:
     sys.path.insert(0, _TRELLIS2_REPO)
 
+# ---------------------------------------------------------------------------
+# transformers 5.6 compatibility shim for the trust_remote_code BiRefNet
+# (RMBG-2.0). Two issues with custom remote-code models:
+#   1. transformers.conversion_mapping.get_model_conversion_mapping() walks
+#      submodules and assumes each PreTrainedModel.config has a non-empty
+#      `model_type` string.
+#   2. modeling_utils expects every PreTrainedModel instance to have an
+#      `all_tied_weights_keys` dict (set during tie_weights), but custom
+#      remote-code modules built with the older transformers API skip that
+#      step and crash later with AttributeError.
+# ---------------------------------------------------------------------------
+try:
+    from transformers import PreTrainedModel  # type: ignore
+    if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
+        PreTrainedModel.all_tied_weights_keys = {}  # class-level fallback
+except Exception:
+    pass
+
+try:
+    # The function is also re-imported into modeling_utils at module load,
+    # so we must patch BOTH binding sites for the override to take effect.
+    from transformers import conversion_mapping as _conv_map  # type: ignore
+    from transformers import modeling_utils as _mu  # type: ignore
+    _orig_get = _conv_map.get_model_conversion_mapping
+
+    def _patched_get(model, key_mapping, hf_quantizer):  # type: ignore[no-untyped-def]
+        from transformers import PreTrainedModel  # local import
+        for sub in model.modules():
+            if isinstance(sub, PreTrainedModel):
+                cfg = getattr(sub, "config", None)
+                if cfg is not None and not getattr(cfg, "model_type", None):
+                    try:
+                        cfg.model_type = "_unknown_remote_code"
+                    except Exception:
+                        pass
+        return _orig_get(model, key_mapping, hf_quantizer)
+
+    _conv_map.get_model_conversion_mapping = _patched_get
+    _mu.get_model_conversion_mapping = _patched_get
+except Exception:  # transformers older than 5.x — no patch needed
+    pass
+
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response

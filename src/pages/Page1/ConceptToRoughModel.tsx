@@ -5,6 +5,7 @@ import { NodeConnector } from '../../components/NodeConnector';
 import { Button } from '../../components/Button';
 import { Placeholder } from '../../components/Placeholder';
 import { ImagePreviewModal } from '../../components/ImagePreviewModal';
+import { GLBViewer } from '../../components/GLBViewer';
 import { runConceptToTPose, runTPoseMultiView } from '../../services/workflows';
 import { runImageToModel, runMultiViewToModel, TripoServiceError } from '../../services/tripo';
 import { splitMultiView } from '../../services/multiviewSplit';
@@ -68,6 +69,9 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
   const [selectedFiles, setSelectedFiles] = useState<Record<number, string>>({});
   // 大图预览
   const [preview, setPreview] = useState<{ url: string; title: string } | null>(null);
+  // 3D Mesh Viewer 当前显示的 GLB URL（双击 Rough Model 节点设置）
+  const [viewerUrl, setViewerUrl] = useState<string | null>(null);
+  const [viewerLabel, setViewerLabel] = useState<string | null>(null);
   // 链式运行中标记，避免并发
   const chainRunningRef = useRef(false);
 
@@ -419,12 +423,18 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         try {
           const seg = await loadLatestSegments('page1.multiview');
           if (seg) {
+            // 视图 → 来源文件名（用于日志/排错）
+            const fileMap: Record<string, string | null> = {
+              front: null, left: null, back: null, right: null,
+            };
             const pick = (view: string): Blob | null => {
               const entry = seg.index.entries.find(
                 (e) => (e.meta as { view?: string } | undefined)?.view === view,
               );
               if (!entry) return null;
-              return seg.files.get(entry.file) ?? null;
+              const blob = seg.files.get(entry.file) ?? null;
+              if (blob) fileMap[view] = entry.file;
+              return blob;
             };
             const front = pick('front');
             if (front) {
@@ -442,6 +452,14 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
               onStatusChange(
                 `检测到切分子目录 ${seg.dirName}/，将使用多视图建模（${presentList}）`,
                 'info',
+              );
+              // 详细打印每个视图实际使用的源文件，便于核对是否拿到了最新一版切分
+              console.log(
+                `[Rough Model] 多视图源（dir=${seg.dirName}, source=${seg.index.source}）:\n` +
+                  `  front: ${fileMap.front ?? '(缺失)'}\n` +
+                  `  left:  ${fileMap.left  ?? '(缺失)'}\n` +
+                  `  back:  ${fileMap.back  ?? '(缺失)'}\n` +
+                  `  right: ${fileMap.right ?? '(缺失)'}`,
               );
             }
           }
@@ -657,7 +675,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
   };
 
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0 }}>
       <input
         ref={fileInputRef}
         type="file"
@@ -685,15 +703,18 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         <Button onClick={resetAll} size="sm">重置 Pipeline</Button>
       </div>
 
+      {/* Pipeline 区（顶部，紧凑高度，可横向滚动） */}
       <div
         style={{
-          flex: 1,
-          overflow: 'auto',
-          padding: '24px 16px',
+          flex: '0 0 auto',
+          overflowX: 'auto',
+          overflowY: 'hidden',
+          padding: '16px 16px',
           background: 'var(--bg-app)',
+          borderBottom: '1px solid var(--border-default)',
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', minHeight: '100%' }}>
+        <div style={{ display: 'flex', alignItems: 'center' }}>
           {NODES.map((node, idx) => {
             const state = states[idx];
             const imageUrl = imageForNode(idx, outputs);
@@ -787,11 +808,22 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                   onBodyClick={
                     idx === 0 ? undefined : () => { void runUpToNode(idx); }
                   }
-                  onBodyDoubleClick={
-                    imageUrl
+                  onBodyDoubleClick={(() => {
+                    // 3D 节点：双击送入下方 3D Mesh Viewer
+                    if (node.display === '3d') {
+                      if (idx === 3 && outputs.roughUrl) {
+                        return () => {
+                          setViewerUrl(outputs.roughUrl);
+                          setViewerLabel(`${idx + 1}. ${node.title}${outputs.roughFile ? ' · ' + outputs.roughFile : ''}`);
+                        };
+                      }
+                      return undefined;
+                    }
+                    // 图像节点：维持原有大图预览
+                    return imageUrl
                       ? () => setPreview({ url: imageUrl, title: `${idx + 1}. ${node.title}` })
-                      : undefined
-                  }
+                      : undefined;
+                  })()}
                 >
                   {body}
                 </NodeCard>
@@ -802,6 +834,11 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
             );
           })}
         </div>
+      </div>
+
+      {/* 3D Mesh Viewer（Pipeline 下方，填充剩余空间） */}
+      <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
+        <GLBViewer url={viewerUrl} label={viewerLabel ?? '3D Mesh Viewer'} />
       </div>
 
       {preview && (

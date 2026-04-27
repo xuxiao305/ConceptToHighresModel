@@ -397,7 +397,12 @@ export async function loadLatestSegmentSet(
     candidates.push({ name, n: parseInt(m[1], 10) });
   }
   if (candidates.length === 0) return null;
-  candidates.sort((a, b) => b.n - a.n);
+  // 排序优先级：先按完整目录名降序（时间戳前缀天然可排序），再按版本号降序兜底。
+  // 之前只按 n 排序导致同 baseName 不同时间戳的多个 _v0001 子目录无法正确选最新。
+  candidates.sort((a, b) => {
+    if (a.name !== b.name) return a.name < b.name ? 1 : -1;
+    return b.n - a.n;
+  });
   const latest = candidates[0].name;
   const subDir = await nodeDir.getDirectoryHandle(latest);
   const idx = await tryReadJson<SegmentSetIndex>(subDir, 'segments.json');
