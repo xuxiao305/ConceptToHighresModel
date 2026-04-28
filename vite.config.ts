@@ -9,9 +9,6 @@ export default defineConfig(({ mode }) => {
   const COMFY_URL = env.VITE_COMFY_URL ?? 'http://127.0.0.1:8188';
   const COMFY_USER = env.VITE_COMFY_USER ?? '';
 
-  // Qwen-Image-Edit FastAPI server (DanLu A30 instance via SSH `-L 8765:127.0.0.1:8765`).
-  const QWEN_URL = env.VITE_QWEN_URL ?? 'http://127.0.0.1:8765';
-
   // TRELLIS.2 image-to-3D FastAPI server (DanLu A30 via SSH `-L 8766:127.0.0.1:8766`).
   const TRELLIS2_URL = env.VITE_TRELLIS2_URL ?? 'http://127.0.0.1:8766';
 
@@ -61,21 +58,6 @@ export default defineConfig(({ mode }) => {
             proxy.on('error', (err, req) => {
               // eslint-disable-next-line no-console
               console.error('[vite-proxy /comfy]', req.method, req.url, '→', err.message);
-            });
-          },
-        },
-        // Qwen-Image-Edit server. Long timeout because /warmup can take minutes
-        // (model is ~50GB streaming from disk) and inference 60-180s per image.
-        '/qwen': {
-          target: QWEN_URL,
-          changeOrigin: true,
-          timeout: 1_800_000,
-          proxyTimeout: 1_800_000,
-          rewrite: (path) => path.replace(/^\/qwen/, ''),
-          configure: (proxy) => {
-            proxy.on('error', (err, req) => {
-              // eslint-disable-next-line no-console
-              console.error('[vite-proxy /qwen]', req.method, req.url, '→', err.message);
             });
           },
         },
