@@ -7,6 +7,8 @@ export interface AlignmentResult {
   mode: AlignmentMode;
   matrix4x4: number[][];
   transformedVertices: Vec3[];
+  alignedSrcLandmarks: Vec3[];
+  targetLandmarks: Vec3[];
   rmse: number;
   meanError: number;
   maxError: number;
@@ -136,6 +138,7 @@ export function alignSourceMeshByLandmarks(
   const { matrix4x4, scale } = computeLandmarkAlignment(sourceLandmarks, targetLandmarks, mode);
 
   const transformedVertices = sourceVertices.map((v) => applyTransform(v, matrix4x4));
+  const alignedSrcLandmarks = sourceLandmarks.map((v) => applyTransform(v, matrix4x4));
 
   const errors: number[] = [];
   for (let i = 0; i < sourceLandmarks.length; i++) {
@@ -157,6 +160,8 @@ export function alignSourceMeshByLandmarks(
     mode,
     matrix4x4,
     transformedVertices,
+    alignedSrcLandmarks,
+    targetLandmarks,
     rmse,
     meanError,
     maxError,

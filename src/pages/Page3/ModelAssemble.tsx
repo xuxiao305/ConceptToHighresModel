@@ -33,6 +33,8 @@ interface ResultPreview {
   mode: AlignmentMode;
   originalVertices: Vec3[];
   alignedVertices: Vec3[];
+  alignedSrcLandmarks: Vec3[];
+  targetLandmarks: Vec3[];
   faces: Face3[];
   rmse: number;
   meanError: number;
@@ -119,6 +121,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const clearTarLandmarks = useLandmarkStore((s) => s.clearTarLandmarks);
   const clearAllLandmarks = useLandmarkStore((s) => s.clearAll);
   const transformSrcLandmarks = useLandmarkStore((s) => s.transformSrcLandmarks);
+  const transformTarLandmarks = useLandmarkStore((s) => s.transformTarLandmarks);
 
   const pairCount = Math.min(srcLandmarks.length, tarLandmarks.length);
   const isBalanced = srcLandmarks.length === tarLandmarks.length && srcLandmarks.length > 0;
@@ -256,6 +259,8 @@ export function ModelAssemble({ onStatusChange }: Props) {
         mode: result.mode,
         originalVertices: srcMesh.vertices,
         alignedVertices: result.transformedVertices,
+        alignedSrcLandmarks: result.alignedSrcLandmarks,
+        targetLandmarks: result.targetLandmarks,
         faces: srcMesh.faces,
         rmse: result.rmse,
         meanError: result.meanError,
@@ -277,12 +282,28 @@ export function ModelAssemble({ onStatusChange }: Props) {
 
   const handleApplyAlignedTransform = () => {
     if (!alignResult) return;
-    setSrcMesh((prev) => ({ ...prev, vertices: alignResult.transformedVertices }));
-    transformSrcLandmarks(alignResult.matrix4x4);
+    applyModelTransform('source', alignResult.matrix4x4);
     setAlignResult(null);
     setSelectedSrcIndex(null);
     setCenterViewMode('result');
     onStatusChange('已将对齐结果应用到 Source 模型与 Source landmarks', 'success');
+  };
+
+  const applyModelTransform = (side: 'source' | 'target', matrix4x4: number[][]) => {
+    if (side === 'source') {
+      setSrcMesh((prev) => ({
+        ...prev,
+        vertices: prev.vertices.map((v) => applyTransform(v, matrix4x4)),
+      }));
+      transformSrcLandmarks(matrix4x4);
+      return;
+    }
+
+    setTarMesh((prev) => ({
+      ...prev,
+      vertices: prev.vertices.map((v) => applyTransform(v, matrix4x4)),
+    }));
+    transformTarLandmarks(matrix4x4);
   };
 
   const restoreDemo = () => {
@@ -637,6 +658,19 @@ function ResultPreviewPanel({
   resultPreview: ResultPreview;
   targetMesh: MeshData;
 }) {
+  // Convert Vec3[] to LandmarkPoint[] for display
+  const srcLandmarkPoints = resultPreview.alignedSrcLandmarks.map((pos, i) => ({
+    index: i + 1,
+    vertexIdx: -1,
+    position: pos,
+  }));
+
+  const tarLandmarkPoints = resultPreview.targetLandmarks.map((pos, i) => ({
+    index: i + 1,
+    vertexIdx: -1,
+    position: pos,
+  }));
+
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
       <div
@@ -670,10 +704,13 @@ function ResultPreviewPanel({
             color="#4a90d9"
             viewMode="solid"
             height="100%"
-            label="Overlay: Aligned Source + Target"
+            label="Overlay: Aligned Source (蓝色点) + Target (橙色点)"
+            landmarks={srcLandmarkPoints}
+            landmarkColor="#ff6b6b"
             overlayVertices={targetMesh.vertices}
             overlayFaces={targetMesh.faces}
             overlayColor="#d9734a"
+            overlayLandmarks={tarLandmarkPoints}
             showViewModeToggle={false}
           />
         )}
@@ -685,7 +722,9 @@ function ResultPreviewPanel({
             color="#4a90d9"
             viewMode="solid"
             height="100%"
-            label="Aligned Source"
+            label="Aligned Source (with src landmarks)"
+            landmarks={srcLandmarkPoints}
+            landmarkColor="#ff6b6b"
             showViewModeToggle={false}
           />
         )}
@@ -697,7 +736,9 @@ function ResultPreviewPanel({
             color="#d9734a"
             viewMode="solid"
             height="100%"
-            label="Target"
+            label="Target (with tar landmarks)"
+            landmarks={tarLandmarkPoints}
+            landmarkColor="#a0d995"
             showViewModeToggle={false}
           />
         )}

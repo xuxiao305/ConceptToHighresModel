@@ -32,6 +32,7 @@ interface LandmarkState {
   clearTarLandmarks: () => void;
   clearAll: () => void;
   transformSrcLandmarks: (matrix: number[][]) => void;
+  transformTarLandmarks: (matrix: number[][]) => void;
 
   isBalanced: () => boolean;
   pairCount: () => number;
@@ -101,6 +102,17 @@ export const useLandmarkStore = create<LandmarkState>((set, get) => ({
   transformSrcLandmarks: (matrix) =>
     set((state) => ({
       srcLandmarks: state.srcLandmarks.map((p) => {
+        const [x, y, z] = p.position;
+        const nx = matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z + matrix[0][3];
+        const ny = matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z + matrix[1][3];
+        const nz = matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z + matrix[2][3];
+        return { ...p, position: [nx, ny, nz] };
+      }),
+    })),
+
+  transformTarLandmarks: (matrix) =>
+    set((state) => ({
+      tarLandmarks: state.tarLandmarks.map((p) => {
         const [x, y, z] = p.position;
         const nx = matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z + matrix[0][3];
         const ny = matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z + matrix[1][3];

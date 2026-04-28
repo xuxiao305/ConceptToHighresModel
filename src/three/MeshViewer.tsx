@@ -318,6 +318,8 @@ export interface MeshViewerProps {
   overlayVertices?: Vec3[];
   overlayFaces?: Face3[];
   overlayColor?: string;
+  /** Optional landmarks for overlay mesh (displayed in overlayColor) */
+  overlayLandmarks?: LandmarkPoint[];
   /** Screen-fraction size for landmark spheres */
   landmarkScreenFraction?: number;
   /** Background color */
@@ -357,6 +359,7 @@ export function MeshViewer({
   overlayVertices,
   overlayFaces,
   overlayColor = '#d9734a',
+  overlayLandmarks = [],
   landmarkScreenFraction,
   background = '#2a2a2a',
   topRightExtra,
@@ -486,6 +489,23 @@ export function MeshViewer({
               onSelect={onLandmarkSelect}
               onDelete={onLandmarkDelete}
               onMove={onLandmarkMove}
+            />
+          ))}
+
+          {overlayLandmarks.map((pt) => (
+            <LandmarkMarker
+              key={`overlay-${pt.index}`}
+              index={pt.index}
+              position={pt.position}
+              label={`T${pt.index}`}
+              color={overlayColor}
+              occlusionGeometry={meshGeometry}
+              screenFraction={landmarkScreenFraction ?? 0.010}
+              selected={false}
+              parentOffsetY={groundOffsetY}
+              onSelect={undefined}
+              onDelete={undefined}
+              onMove={undefined}
             />
           ))}
         </group>
