@@ -47,7 +47,9 @@ export const NODE_DIRS: Record<string, NodeDir> = {
   'page1.multiview': { pageDir: 'page1_concept_to_rough', nodeDir: '03_multiview' },
   'page1.rough':     { pageDir: 'page1_concept_to_rough', nodeDir: '04_rough' },
   'page1.rigging':   { pageDir: 'page1_concept_to_rough', nodeDir: '05_rigging' },
-  // Page 2 / 3 占位（后续节点接入时按需追加）
+  // Page 2
+  'page2.highres':   { pageDir: 'page2_highres', nodeDir: '01_highres' },
+  // Page 3 占位（后续节点接入时按需追加）
 };
 
 /** File System Access API 类型补丁（TS lib 暂未完整覆盖） */

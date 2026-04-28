@@ -1,5 +1,7 @@
-import { useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '../../components/Button';
+import { GLBThumbnail } from '../../components/GLBThumbnail';
+import { useProject } from '../../contexts/ProjectContext';
 import {
   DualViewport,
   MeshViewer,
@@ -15,6 +17,7 @@ import {
   type AlignmentResult,
   applyTransform,
 } from '../../three/alignment';
+import type { AssetVersion } from '../../services/projectStore';
 
 interface Props {
   onStatusChange: (msg: string, status?: 'info' | 'success' | 'warning' | 'error') => void;
@@ -91,6 +94,7 @@ function makeDemoTarget(source: MeshData): MeshData {
 }
 
 export function ModelAssemble({ onStatusChange }: Props) {
+  const { project, listHistory, loadByName } = useProject();
   const demoTarget = useMemo(() => makeDemoTarget(DEMO_SOURCE), []);
 
   const [srcMesh, setSrcMesh] = useState<MeshData>(DEMO_SOURCE);
@@ -105,6 +109,10 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [resultPreview, setResultPreview] = useState<ResultPreview | null>(null);
   const [selectedSrcIndex, setSelectedSrcIndex] = useState<number | null>(null);
   const [selectedTarIndex, setSelectedTarIndex] = useState<number | null>(null);
+  const [highresHistory, setHighresHistory] = useState<AssetVersion[]>([]);
+  const [galleryLoading, setGalleryLoading] = useState(false);
+  const [selectedGalleryFile, setSelectedGalleryFile] = useState<string | null>(null);
+  const [selectedGalleryPreviewUrl, setSelectedGalleryPreviewUrl] = useState<string | null>(null);
 
   const srcInputRef = useRef<HTMLInputElement | null>(null);
   const tarInputRef = useRef<HTMLInputElement | null>(null);
@@ -125,11 +133,105 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const isBalanced = srcLandmarks.length === tarLandmarks.length && srcLandmarks.length > 0;
   const hasResultPreview = resultPreview !== null;
 
-  const resetPreview = () => {
+  const resetPreview = useCallback(() => {
     if (alignResult) setAlignResult(null);
     if (resultPreview) setResultPreview(null);
     if (centerViewMode === 'result') setCenterViewMode('landmark');
-  };
+  }, [alignResult, centerViewMode, resultPreview]);
+
+  const refreshHighresGallery = useCallback(async () => {
+    if (!project) {
+      setHighresHistory([]);
+      setSelectedGalleryFile(null);
+      setSelectedGalleryPreviewUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+      return;
+    }
+
+    setGalleryLoading(true);
+    try {
+      const history = await listHistory('page2.highres');
+      setHighresHistory(history);
+
+      if (history.length === 0) {
+        setSelectedGalleryFile(null);
+        setSelectedGalleryPreviewUrl((prev) => {
+          if (prev) URL.revokeObjectURL(prev);
+          return null;
+        });
+        return;
+      }
+
+      const nextFile = selectedGalleryFile && history.some((v) => v.file === selectedGalleryFile)
+        ? selectedGalleryFile
+        : history[0].file;
+
+      setSelectedGalleryFile(nextFile);
+      const preview = await loadByName('page2.highres', nextFile);
+      setSelectedGalleryPreviewUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return preview?.url ?? null;
+      });
+    } catch {
+      setHighresHistory([]);
+      setSelectedGalleryFile(null);
+      setSelectedGalleryPreviewUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+    } finally {
+      setGalleryLoading(false);
+    }
+  }, [listHistory, loadByName, project, selectedGalleryFile]);
+
+  useEffect(() => {
+    void refreshHighresGallery();
+  }, [refreshHighresGallery]);
+
+  useEffect(() => {
+    return () => {
+      if (selectedGalleryPreviewUrl) URL.revokeObjectURL(selectedGalleryPreviewUrl);
+    };
+  }, [selectedGalleryPreviewUrl]);
+
+  const handleSelectGalleryItem = useCallback(async (fileName: string) => {
+    setSelectedGalleryFile(fileName);
+    const preview = await loadByName('page2.highres', fileName);
+    setSelectedGalleryPreviewUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return preview?.url ?? null;
+    });
+  }, [loadByName]);
+
+  const handleOpenGalleryToSource = useCallback(async (fileName: string) => {
+    let loadedUrlToRevoke: string | null = null;
+    try {
+      onStatusChange(`正在从 Mesh Gallery 打开：${fileName}`, 'info');
+      const loaded = await loadByName('page2.highres', fileName);
+      if (!loaded) {
+        onStatusChange('加载失败：未找到该 highres 模型版本', 'error');
+        return;
+      }
+      loadedUrlToRevoke = loaded.url;
+
+      const mesh = await loadGlbAsMesh(loaded.url);
+      setSrcMesh({
+        name: fileName,
+        vertices: mesh.vertices,
+        faces: mesh.faces,
+      });
+      setSelectedSrcIndex(null);
+      clearAllLandmarks();
+      resetPreview();
+      onStatusChange(`已将 ${fileName} 加载到 Source`, 'success');
+    } catch (err) {
+      onStatusChange(`打开失败：${err instanceof Error ? err.message : '未知错误'}`, 'error');
+    } finally {
+      if (loadedUrlToRevoke) URL.revokeObjectURL(loadedUrlToRevoke);
+    }
+  }, [clearAllLandmarks, loadByName, onStatusChange, resetPreview]);
 
   const selectSourceLandmark = (index: number) => {
     setSelectedSrcIndex(index);
@@ -346,6 +448,79 @@ export function ModelAssemble({ onStatusChange }: Props) {
             Target: {tarMesh.name}
             <br />
             V/F: {tarMesh.vertices.length} / {tarMesh.faces.length}
+          </div>
+        </PanelSection>
+
+        <PanelSection title="Mesh Gallery (Page2 Highres)">
+          <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+            <Button
+              size="sm"
+              onClick={() => {
+                void refreshHighresGallery();
+              }}
+              loading={galleryLoading}
+              style={{ flex: 1, justifyContent: 'center' }}
+            >
+              刷新列表
+            </Button>
+          </div>
+
+          {!project && (
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+              未打开工程，无法读取 Page2 的 highres 输出。
+            </div>
+          )}
+
+          {project && highresHistory.length === 0 && (
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+              暂无 highres 模型历史。
+            </div>
+          )}
+
+          {project && selectedGalleryPreviewUrl && (
+            <div style={{ marginBottom: 8 }}>
+              <GLBThumbnail url={selectedGalleryPreviewUrl} height={110} autoRotateSpeed={0.35} />
+            </div>
+          )}
+
+          {project && highresHistory.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 190, overflow: 'auto' }}>
+              {highresHistory.map((v) => {
+                const selected = selectedGalleryFile === v.file;
+                return (
+                  <button
+                    key={v.file}
+                    onClick={() => {
+                      void handleSelectGalleryItem(v.file);
+                    }}
+                    onDoubleClick={() => {
+                      void handleOpenGalleryToSource(v.file);
+                    }}
+                    title="单击预览，双击加载到 Source"
+                    style={{
+                      textAlign: 'left',
+                      background: selected ? 'var(--bg-elevated)' : 'var(--bg-app)',
+                      border: selected ? '1px solid var(--accent-blue)' : '1px solid var(--border-default)',
+                      borderRadius: 3,
+                      padding: '6px 8px',
+                      color: 'var(--text-primary)',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <div style={{ fontSize: 11, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {v.file}
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
+                      {new Date(v.timestamp).toLocaleString()}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 8, lineHeight: 1.5 }}>
+            双击任意条目可直接替换 Source 模型。
           </div>
         </PanelSection>
 
