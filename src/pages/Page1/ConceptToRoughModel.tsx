@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect, type ReactNode } from 'react';
+import type { CSSProperties } from 'react';
 import type { NodeConfig, NodeState } from '../../types';
 import { NodeCard } from '../../components/NodeCard';
 import { NodeConnector } from '../../components/NodeConnector';
@@ -7,8 +8,14 @@ import { Placeholder } from '../../components/Placeholder';
 import { ImagePreviewModal } from '../../components/ImagePreviewModal';
 import { GLBViewer } from '../../components/GLBViewer';
 import { GLBThumbnail } from '../../components/GLBThumbnail';
-import { runConceptToTPose, runTPoseMultiView } from '../../services/workflows';
+import { runConceptToTPose, runTPoseMultiView, runQwenMultiView, type QwenViewResult } from '../../services/workflows';
 import { runImageToModel, runMultiViewToModel, TripoServiceError } from '../../services/tripo';
+import {
+  generateModel as runTrellis2,
+  getHealth as getTrellis2Health,
+  TRELLIS2_DEFAULTS,
+  type Trellis2Params,
+} from '../../services/trellis2';
 import { splitMultiView } from '../../services/multiviewSplit';
 import { useProject } from '../../contexts/ProjectContext';
 import type { AssetVersion } from '../../services/projectStore';
@@ -29,6 +36,42 @@ const NODE_KEYS = [
   'page1.rough',
   'page1.rigging',
 ];
+
+// ----------------------------------------------------------------------------
+// Rough Model 后端选择
+// ----------------------------------------------------------------------------
+type RoughBackend = 'tripo' | 'trellis2';
+
+const BACKEND_LABEL: Record<RoughBackend, string> = {
+  tripo: 'Tripo (multi-view)',
+  trellis2: 'TRELLIS.2 (single-view, 自部署)',
+};
+
+const ROUGH_BACKEND_LS_KEY = 'page1.rough.backend';
+const TRELLIS2_PARAMS_LS_KEY = 'page1.rough.trellis2Params';
+
+function loadRoughBackend(): RoughBackend {
+  try {
+    const v = localStorage.getItem(ROUGH_BACKEND_LS_KEY);
+    if (v === 'tripo' || v === 'trellis2') return v;
+  } catch {
+    /* ignore */
+  }
+  return 'tripo';
+}
+
+function loadTrellis2Params(): Trellis2Params {
+  try {
+    const raw = localStorage.getItem(TRELLIS2_PARAMS_LS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Trellis2Params;
+      return { ...TRELLIS2_DEFAULTS, ...parsed };
+    }
+  } catch {
+    /* ignore */
+  }
+  return { ...TRELLIS2_DEFAULTS };
+}
 
 interface Props {
   onStatusChange: (msg: string, status?: 'info' | 'success' | 'warning' | 'error') => void;
@@ -61,6 +104,24 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     errors: {},
   });
   const roughAbortRef = useRef<AbortController | null>(null);
+
+  // Qwen 多角度重绘结果
+  const [qwenViews, setQwenViews] = useState<QwenViewResult[]>([]);
+  const [qwenRunning, setQwenRunning] = useState(false);
+
+  // Rough Model 后端选择 + 各后端参数（持久化到 localStorage）
+  const [roughBackend, setRoughBackend] = useState<RoughBackend>(loadRoughBackend);
+  const [trellis2Params, setTrellis2Params] = useState<Trellis2Params>(loadTrellis2Params);
+  // 仅当 backend === 'trellis2' 时显示参数面板
+  const [showTrellis2Params, setShowTrellis2Params] = useState(false);
+
+  useEffect(() => {
+    try { localStorage.setItem(ROUGH_BACKEND_LS_KEY, roughBackend); } catch { /* ignore */ }
+  }, [roughBackend]);
+
+  useEffect(() => {
+    try { localStorage.setItem(TRELLIS2_PARAMS_LS_KEY, JSON.stringify(trellis2Params)); } catch { /* ignore */ }
+  }, [trellis2Params]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -402,7 +463,30 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     }
   }, [onStatusChange, setNodeState, project, saveAsset, saveSegments, refreshHistory]);
 
-  // ---- Rough Model node (Tripo AI image → GLB) ---------------------------
+  // ---- Qwen 多角度重绘（8 camera angles via QwenEditService） ------------
+  const runQwenViews = useCallback(async () => {
+    const conceptFile = outputsRef.current.conceptFile;
+    if (!conceptFile) {
+      onStatusChange('请先上传 Concept 图', 'error');
+      return;
+    }
+    setQwenRunning(true);
+    setQwenViews([]);
+    try {
+      await runQwenMultiView(conceptFile, {
+        onStatus: (msg) => onStatusChange(msg, 'info'),
+        onEach: (view) => setQwenViews((prev) => [...prev, view]),
+      });
+      onStatusChange('Qwen 多角度重绘完成 ✓', 'success');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      onStatusChange(`Qwen 多角度重绘失败：${msg}`, 'error');
+    } finally {
+      setQwenRunning(false);
+    }
+  }, [onStatusChange]);
+
+  // ---- Rough Model node (Tripo / TRELLIS.2 image → GLB) ----------------
   const runRoughModel = useCallback(async (sourceUrl?: string): Promise<string | null> => {
     // 防御：当作为 button onClick handler 直接绑定时，会收到 SyntheticEvent 作为参数
     const mvUrl = (typeof sourceUrl === 'string' ? sourceUrl : null) ?? outputsRef.current.multiviewUrl;
@@ -416,15 +500,16 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     const ctrl = new AbortController();
     roughAbortRef.current = ctrl;
 
+    const backend = roughBackend;
+    onStatusChange(`Rough Model: 使用后端 ${BACKEND_LABEL[backend]}`, 'info');
+
     try {
-      // 优先使用 Multi-View 节点最新一版的切分子目录（front/left/back/right），
-      // 调用 Tripo 多视图建模 API；若读不到切分则退化为单图模式。
+      // 读取多视图切分（front/left/back/right）—— Tripo 多视图模式与 trellis2 单图模式都依赖 front 视图
       let multiInputs: { front: Blob; left?: Blob | null; back?: Blob | null; right?: Blob | null } | null = null;
       if (project) {
         try {
           const seg = await loadLatestSegments('page1.multiview');
           if (seg) {
-            // 视图 → 来源文件名（用于日志/排错）
             const fileMap: Record<string, string | null> = {
               front: null, left: null, back: null, right: null,
             };
@@ -451,10 +536,9 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                 multiInputs.right ? 'right' : null,
               ].filter(Boolean).join(' / ');
               onStatusChange(
-                `检测到切分子目录 ${seg.dirName}/，将使用多视图建模（${presentList}）`,
+                `检测到切分子目录 ${seg.dirName}/，可用视图：${presentList}`,
                 'info',
               );
-              // 详细打印每个视图实际使用的源文件，便于核对是否拿到了最新一版切分
               console.log(
                 `[Rough Model] 多视图源（dir=${seg.dirName}, source=${seg.index.source}）:\n` +
                   `  front: ${fileMap.front ?? '(缺失)'}\n` +
@@ -465,20 +549,61 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
             }
           }
         } catch (e) {
-          console.warn('[Rough Model] 读取切分集失败，退化为单图模式：', e);
+          console.warn('[Rough Model] 读取切分集失败：', e);
         }
       }
 
-      const { blob, result } = multiInputs
-        ? await runMultiViewToModel(multiInputs, {
-            onStatus: (msg) => onStatusChange(msg, 'info'),
-            signal: ctrl.signal,
-          })
-        : await runImageToModel(await (await fetch(mvUrl)).blob(), {
-            onStatus: (msg) => onStatusChange(msg, 'info'),
-            signal: ctrl.signal,
-            filename: 'multiview.png',
-          });
+      let blob: Blob;
+      let saveLabel: string;
+
+      if (backend === 'trellis2') {
+        // TRELLIS.2 单图建模：优先使用切分的 front 视图，否则退化为 multiview 整图
+        const inputBlob = multiInputs?.front ?? await (await fetch(mvUrl)).blob();
+        const sourceLabel = multiInputs?.front ? 'front 视图' : 'Multi-View 整图';
+        onStatusChange(`TRELLIS.2: 探测服务状态…`, 'info');
+        try {
+          const health = await getTrellis2Health();
+          if (!health.modelLoaded) {
+            onStatusChange('TRELLIS.2 服务未加载模型，请先 warmup（点开参数面板有按钮）', 'error');
+            throw new Error('TRELLIS.2 model not loaded');
+          }
+          onStatusChange(
+            `TRELLIS.2 就绪 · ${health.gpuName ?? 'GPU'} · 输入：${sourceLabel}`,
+            'info',
+          );
+        } catch (e) {
+          // /health 接口本身打不通：报错 + 抛出（前端 vite proxy 失败时给清晰提示）
+          throw new Error(
+            `TRELLIS.2 服务不可达：${e instanceof Error ? e.message : String(e)} ` +
+            `（请检查 SSH 隧道 D:\\AI\\Services\\Trellis2Service\\deploy\\ssh_tunnel.ps1 是否启动）`
+          );
+        }
+
+        onStatusChange(`TRELLIS.2 生成中…（典型耗时 4-5 分钟）`, 'info');
+        const t2Result = await runTrellis2(inputBlob, trellis2Params);
+        blob = t2Result.blob;
+        saveLabel = `trellis2 seed=${t2Result.meta.seed} ` +
+          `gen=${t2Result.meta.elapsedGenSec}s bake=${t2Result.meta.elapsedBakeSec}s`;
+        console.log('[Rough Model] TRELLIS.2 meta:', t2Result.meta);
+        onStatusChange(
+          `TRELLIS.2 完成 · 总 ${t2Result.meta.elapsedTotalSec}s（生成 ${t2Result.meta.elapsedGenSec}s + 烘焙 ${t2Result.meta.elapsedBakeSec}s）· ${(t2Result.meta.glbBytes / 1024 / 1024).toFixed(1)} MB`,
+          'success',
+        );
+      } else {
+        // Tripo：优先多视图，否则单图
+        const tripoResult = multiInputs
+          ? await runMultiViewToModel(multiInputs, {
+              onStatus: (msg) => onStatusChange(msg, 'info'),
+              signal: ctrl.signal,
+            })
+          : await runImageToModel(await (await fetch(mvUrl)).blob(), {
+              onStatus: (msg) => onStatusChange(msg, 'info'),
+              signal: ctrl.signal,
+              filename: 'multiview.png',
+            });
+        blob = tripoResult.blob;
+        saveLabel = `tripo task ${tripoResult.result.task_id}`;
+      }
 
       // 持久化 + 产生预览 URL
       let savedFile: string | null = null;
@@ -488,7 +613,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
             'page1.rough',
             blob,
             'glb',
-            `tripo task ${result.task_id}`
+            saveLabel,
           );
           if (v) {
             savedFile = v.file;
@@ -538,7 +663,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     } finally {
       roughAbortRef.current = null;
     }
-  }, [onStatusChange, setNodeState, project, saveAsset, refreshHistory, loadLatestSegments]);
+  }, [onStatusChange, setNodeState, project, saveAsset, refreshHistory, loadLatestSegments, roughBackend, trellis2Params]);
 
   const cancelRoughModel = useCallback(() => {
     roughAbortRef.current?.abort();
@@ -760,13 +885,39 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                       lineHeight: 1.4,
                     }}
                   >
-                    {node.description}
+                    {node.id === 'rough'
+                      ? `后端：${BACKEND_LABEL[roughBackend]}`
+                      : node.description}
                     {idx === 0 && outputs.conceptFile && (
                       <div style={{ marginTop: 2, color: 'var(--text-secondary)' }}>
                         {outputs.conceptFile.name}
                       </div>
                     )}
                   </div>
+                )}
+                {node.id === 'rough' && (
+                  <RoughBackendPanel
+                    backend={roughBackend}
+                    onChangeBackend={setRoughBackend}
+                    trellis2Params={trellis2Params}
+                    onChangeTrellis2Params={setTrellis2Params}
+                    expanded={showTrellis2Params}
+                    onToggleExpanded={() => setShowTrellis2Params((v) => !v)}
+                    onWarmup={async () => {
+                      try {
+                        onStatusChange('TRELLIS.2: 触发 warmup（首次约 1-3 分钟）…', 'info');
+                        const { warmup } = await import('../../services/trellis2');
+                        await warmup();
+                        onStatusChange('TRELLIS.2: warmup 完成', 'success');
+                      } catch (e) {
+                        onStatusChange(
+                          `TRELLIS.2 warmup 失败：${e instanceof Error ? e.message : String(e)}`,
+                          'error',
+                        );
+                      }
+                    }}
+                    disabled={state === 'running'}
+                  />
                 )}
               </>
             );
@@ -995,6 +1146,221 @@ function renderActions(
         </Button>
       )}
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Rough Model 后端选择 + TRELLIS.2 参数面板
+// ---------------------------------------------------------------------------
+
+interface RoughBackendPanelProps {
+  backend: RoughBackend;
+  onChangeBackend: (b: RoughBackend) => void;
+  trellis2Params: Trellis2Params;
+  onChangeTrellis2Params: (p: Trellis2Params) => void;
+  expanded: boolean;
+  onToggleExpanded: () => void;
+  onWarmup: () => void;
+  disabled?: boolean;
+}
+
+function RoughBackendPanel({
+  backend,
+  onChangeBackend,
+  trellis2Params,
+  onChangeTrellis2Params,
+  expanded,
+  onToggleExpanded,
+  onWarmup,
+  disabled,
+}: RoughBackendPanelProps) {
+  const labelStyle: CSSProperties = {
+    fontSize: 10,
+    color: 'var(--text-muted)',
+    minWidth: 64,
+  };
+  const inputStyle: CSSProperties = {
+    flex: 1,
+    fontSize: 11,
+    padding: '2px 4px',
+    background: 'var(--bg-input, var(--bg-app))',
+    color: 'var(--text-primary)',
+    border: '1px solid var(--border-default)',
+    borderRadius: 3,
+  };
+  const rowStyle: CSSProperties = {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 4,
+  };
+
+  // 控件：受控 number 输入
+  const numInput = (
+    label: string,
+    value: number | undefined,
+    fallback: number,
+    update: (n: number) => void,
+    min?: number,
+    max?: number,
+    step?: number,
+  ) => (
+    <div style={rowStyle}>
+      <span style={labelStyle}>{label}</span>
+      <input
+        type="number"
+        disabled={disabled}
+        value={value ?? fallback}
+        min={min}
+        max={max}
+        step={step}
+        onChange={(e) => {
+          const n = Number(e.target.value);
+          if (!Number.isNaN(n)) update(n);
+        }}
+        style={inputStyle}
+      />
+    </div>
+  );
+
+  return (
+    <div
+      style={{
+        marginTop: 6,
+        padding: 6,
+        background: 'var(--bg-surface-2, rgba(255,255,255,0.03))',
+        border: '1px solid var(--border-subtle)',
+        borderRadius: 3,
+        fontSize: 11,
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span style={labelStyle}>后端</span>
+        <select
+          disabled={disabled}
+          value={backend}
+          onChange={(e) => onChangeBackend(e.target.value as RoughBackend)}
+          style={{ ...inputStyle, padding: '2px' }}
+        >
+          <option value="tripo">Tripo (multi-view)</option>
+          <option value="trellis2">TRELLIS.2 (single-view)</option>
+        </select>
+      </div>
+
+      {backend === 'trellis2' && (
+        <>
+          <div
+            style={{
+              marginTop: 6,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+            }}
+          >
+            <button
+              type="button"
+              disabled={disabled}
+              onClick={onToggleExpanded}
+              style={{
+                fontSize: 10,
+                padding: '2px 6px',
+                background: 'transparent',
+                color: 'var(--accent-blue)',
+                border: '1px solid var(--accent-blue)',
+                borderRadius: 3,
+                cursor: 'pointer',
+              }}
+            >
+              {expanded ? '隐藏参数 ▲' : '展开参数 ▼'}
+            </button>
+            <button
+              type="button"
+              disabled={disabled}
+              onClick={onWarmup}
+              title="提前加载模型，避免首次推理慢启动"
+              style={{
+                fontSize: 10,
+                padding: '2px 6px',
+                background: 'transparent',
+                color: 'var(--text-secondary)',
+                border: '1px solid var(--border-default)',
+                borderRadius: 3,
+                cursor: 'pointer',
+              }}
+            >
+              Warmup
+            </button>
+          </div>
+          {expanded && (
+            <>
+              {numInput(
+                'SS steps',
+                trellis2Params.sparseStructureSteps,
+                TRELLIS2_DEFAULTS.sparseStructureSteps,
+                (n) => onChangeTrellis2Params({ ...trellis2Params, sparseStructureSteps: n }),
+                1, 50, 1,
+              )}
+              {numInput(
+                'SLat steps',
+                trellis2Params.slatSteps,
+                TRELLIS2_DEFAULTS.slatSteps,
+                (n) => onChangeTrellis2Params({ ...trellis2Params, slatSteps: n }),
+                1, 50, 1,
+              )}
+              {numInput(
+                'CFG',
+                trellis2Params.cfg,
+                TRELLIS2_DEFAULTS.cfg,
+                (n) => onChangeTrellis2Params({ ...trellis2Params, cfg: n }),
+                0, 20, 0.1,
+              )}
+              {numInput(
+                'Decim',
+                trellis2Params.decimationTarget,
+                TRELLIS2_DEFAULTS.decimationTarget,
+                (n) => onChangeTrellis2Params({ ...trellis2Params, decimationTarget: n }),
+                1000, 10_000_000, 10000,
+              )}
+              {numInput(
+                'TexSize',
+                trellis2Params.textureSize,
+                TRELLIS2_DEFAULTS.textureSize,
+                (n) => onChangeTrellis2Params({ ...trellis2Params, textureSize: n }),
+                512, 4096, 256,
+              )}
+              <div style={rowStyle}>
+                <span style={labelStyle}>Remesh</span>
+                <input
+                  type="checkbox"
+                  disabled={disabled}
+                  checked={trellis2Params.remesh ?? TRELLIS2_DEFAULTS.remesh}
+                  onChange={(e) =>
+                    onChangeTrellis2Params({ ...trellis2Params, remesh: e.target.checked })
+                  }
+                />
+              </div>
+              <div style={rowStyle}>
+                <span style={labelStyle}>Seed</span>
+                <input
+                  type="number"
+                  disabled={disabled}
+                  placeholder="留空=随机"
+                  value={trellis2Params.seed ?? ''}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    onChangeTrellis2Params({
+                      ...trellis2Params,
+                      seed: v === '' ? undefined : Number(v),
+                    });
+                  }}
+                  style={inputStyle}
+                />
+              </div>
+            </>
+          )}
+        </>
+      )}
+    </div>
   );
 }
 

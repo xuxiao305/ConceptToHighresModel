@@ -15,6 +15,17 @@
 
 const BASE = '/trellis';
 
+/** UI 默认值（与服务器端 GenerateRequest 默认对齐）。 */
+export const TRELLIS2_DEFAULTS = {
+  sparseStructureSteps: 12,
+  slatSteps: 12,
+  cfg: 3.0,
+  decimationTarget: 200_000,
+  textureSize: 2048,
+  remesh: true,
+  simplifyCap: 8_000_000,
+} as const;
+
 export interface Trellis2Params {
   /** Number of steps for the sparse-structure flow. 8-16 is typical. */
   sparseStructureSteps?: number;
@@ -113,14 +124,14 @@ export async function generateModel(
 ): Promise<Trellis2Result> {
   const body = {
     image_b64: await fileToBase64(image),
-    sparse_structure_steps: params.sparseStructureSteps ?? 12,
-    slat_steps: params.slatSteps ?? 12,
-    cfg_strength: params.cfg ?? 3.0,
+    sparse_structure_steps: params.sparseStructureSteps ?? TRELLIS2_DEFAULTS.sparseStructureSteps,
+    slat_steps: params.slatSteps ?? TRELLIS2_DEFAULTS.slatSteps,
+    cfg_strength: params.cfg ?? TRELLIS2_DEFAULTS.cfg,
     seed: params.seed ?? null,
-    decimation_target: params.decimationTarget ?? 200_000,
-    texture_size: params.textureSize ?? 2048,
-    remesh: params.remesh ?? true,
-    simplify_cap: params.simplifyCap ?? 8_000_000,
+    decimation_target: params.decimationTarget ?? TRELLIS2_DEFAULTS.decimationTarget,
+    texture_size: params.textureSize ?? TRELLIS2_DEFAULTS.textureSize,
+    remesh: params.remesh ?? TRELLIS2_DEFAULTS.remesh,
+    simplify_cap: params.simplifyCap ?? TRELLIS2_DEFAULTS.simplifyCap,
   };
 
   const res = await fetch(`${BASE}/generate_b64`, {
