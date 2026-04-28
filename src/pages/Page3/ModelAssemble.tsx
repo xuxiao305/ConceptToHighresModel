@@ -121,7 +121,6 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const clearTarLandmarks = useLandmarkStore((s) => s.clearTarLandmarks);
   const clearAllLandmarks = useLandmarkStore((s) => s.clearAll);
   const transformSrcLandmarks = useLandmarkStore((s) => s.transformSrcLandmarks);
-  const transformTarLandmarks = useLandmarkStore((s) => s.transformTarLandmarks);
 
   const pairCount = Math.min(srcLandmarks.length, tarLandmarks.length);
   const isBalanced = srcLandmarks.length === tarLandmarks.length && srcLandmarks.length > 0;
@@ -282,28 +281,20 @@ export function ModelAssemble({ onStatusChange }: Props) {
 
   const handleApplyAlignedTransform = () => {
     if (!alignResult) return;
-    applyModelTransform('source', alignResult.matrix4x4);
+    
+    // 同步应用变换到 mesh 和 landmarks
+    setSrcMesh((prev) => ({
+      ...prev,
+      vertices: prev.vertices.map((v) => applyTransform(v, alignResult.matrix4x4)),
+    }));
+    
+    // 必须在同一个同步调用中应用到 landmarks
+    transformSrcLandmarks(alignResult.matrix4x4);
+    
     setAlignResult(null);
     setSelectedSrcIndex(null);
-    setCenterViewMode('result');
+    setCenterViewMode('landmark');  // 保持在编辑视图以便用户看到变换
     onStatusChange('已将对齐结果应用到 Source 模型与 Source landmarks', 'success');
-  };
-
-  const applyModelTransform = (side: 'source' | 'target', matrix4x4: number[][]) => {
-    if (side === 'source') {
-      setSrcMesh((prev) => ({
-        ...prev,
-        vertices: prev.vertices.map((v) => applyTransform(v, matrix4x4)),
-      }));
-      transformSrcLandmarks(matrix4x4);
-      return;
-    }
-
-    setTarMesh((prev) => ({
-      ...prev,
-      vertices: prev.vertices.map((v) => applyTransform(v, matrix4x4)),
-    }));
-    transformTarLandmarks(matrix4x4);
   };
 
   const restoreDemo = () => {
