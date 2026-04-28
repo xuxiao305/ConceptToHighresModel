@@ -8,7 +8,7 @@ import { Placeholder } from '../../components/Placeholder';
 import { ImagePreviewModal } from '../../components/ImagePreviewModal';
 import { GLBViewer } from '../../components/GLBViewer';
 import { GLBThumbnail } from '../../components/GLBThumbnail';
-import { runConceptToTPose, runTPoseMultiView, runQwenMultiView, type QwenViewResult } from '../../services/workflows';
+import { runConceptToTPose, runTPoseMultiView } from '../../services/workflows';
 import { runImageToModel, runMultiViewToModel, TripoServiceError } from '../../services/tripo';
 import {
   generateModel as runTrellis2,
@@ -105,10 +105,6 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
   });
   const roughAbortRef = useRef<AbortController | null>(null);
 
-  // Qwen 多角度重绘结果
-  const [qwenViews, setQwenViews] = useState<QwenViewResult[]>([]);
-  const [qwenRunning, setQwenRunning] = useState(false);
-
   // Rough Model 后端选择 + 各后端参数（持久化到 localStorage）
   const [roughBackend, setRoughBackend] = useState<RoughBackend>(loadRoughBackend);
   const [trellis2Params, setTrellis2Params] = useState<Trellis2Params>(loadTrellis2Params);
@@ -201,7 +197,6 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           errors: {},
         };
       });
-
       setStates(() => {
         const next: NodeState[] = ['idle', 'idle', 'idle', 'idle', 'idle'];
         if (concept) next[0] = 'complete';
@@ -462,29 +457,6 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       return null;
     }
   }, [onStatusChange, setNodeState, project, saveAsset, saveSegments, refreshHistory]);
-
-  // ---- Qwen 多角度重绘（8 camera angles via QwenEditService） ------------
-  const runQwenViews = useCallback(async () => {
-    const conceptFile = outputsRef.current.conceptFile;
-    if (!conceptFile) {
-      onStatusChange('请先上传 Concept 图', 'error');
-      return;
-    }
-    setQwenRunning(true);
-    setQwenViews([]);
-    try {
-      await runQwenMultiView(conceptFile, {
-        onStatus: (msg) => onStatusChange(msg, 'info'),
-        onEach: (view) => setQwenViews((prev) => [...prev, view]),
-      });
-      onStatusChange('Qwen 多角度重绘完成 ✓', 'success');
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      onStatusChange(`Qwen 多角度重绘失败：${msg}`, 'error');
-    } finally {
-      setQwenRunning(false);
-    }
-  }, [onStatusChange]);
 
   // ---- Rough Model node (Tripo / TRELLIS.2 image → GLB) ----------------
   const runRoughModel = useCallback(async (sourceUrl?: string): Promise<string | null> => {

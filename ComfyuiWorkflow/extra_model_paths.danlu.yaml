@@ -1,0 +1,19 @@
+# DanLu ComfyUI model path mapping for Qwen_MultiView workflow.
+#
+# Usage:
+# 1) Copy this file to <COMFYUI_DIR>/extra_model_paths.yaml
+# 2) Restart ComfyUI
+#
+# Expected files:
+# - /project/qwen_edit/comfyui_models/diffusion_models/qwen_image_edit_2509_fp8_e4m3fn.safetensors
+# - /project/qwen_edit/comfyui_models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors
+# - /project/qwen_edit/comfyui_models/vae/qwen_image_vae.safetensors
+# - /project/qwen_edit/loras/Qwen-Edit-2509-Multiple-angles.safetensors
+# - /project/qwen_edit/loras/Qwen-Image-Edit-Lightning-4steps-V1.0-bf16.safetensors
+
+qwen_danlu:
+  base_path: /project
+  diffusion_models: qwen_edit/comfyui_models/diffusion_models
+  text_encoders: qwen_edit/comfyui_models/text_encoders
+  vae: qwen_edit/comfyui_models/vae
+  loras: qwen_edit/loras
