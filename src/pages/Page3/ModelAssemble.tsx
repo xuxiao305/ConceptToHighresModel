@@ -120,7 +120,6 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const clearSrcLandmarks = useLandmarkStore((s) => s.clearSrcLandmarks);
   const clearTarLandmarks = useLandmarkStore((s) => s.clearTarLandmarks);
   const clearAllLandmarks = useLandmarkStore((s) => s.clearAll);
-  const transformSrcLandmarks = useLandmarkStore((s) => s.transformSrcLandmarks);
 
   const pairCount = Math.min(srcLandmarks.length, tarLandmarks.length);
   const isBalanced = srcLandmarks.length === tarLandmarks.length && srcLandmarks.length > 0;
@@ -282,18 +281,21 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const handleApplyAlignedTransform = () => {
     if (!alignResult) return;
     
-    // 同步应用变换到 mesh 和 landmarks
+    const newVertices = srcMesh.vertices.map((v) => applyTransform(v, alignResult.matrix4x4));
     setSrcMesh((prev) => ({
       ...prev,
-      vertices: prev.vertices.map((v) => applyTransform(v, alignResult.matrix4x4)),
+      vertices: newVertices,
     }));
     
-    // 必须在同一个同步调用中应用到 landmarks
-    transformSrcLandmarks(alignResult.matrix4x4);
+    // 手动变换每一个 landmark
+    srcLandmarks.forEach((landmark) => {
+      const newPos = applyTransform(landmark.position, alignResult.matrix4x4);
+      updateSrcLandmark(landmark.index, newPos);
+    });
     
     setAlignResult(null);
     setSelectedSrcIndex(null);
-    setCenterViewMode('landmark');  // 保持在编辑视图以便用户看到变换
+    setCenterViewMode('landmark');
     onStatusChange('已将对齐结果应用到 Source 模型与 Source landmarks', 'success');
   };
 
