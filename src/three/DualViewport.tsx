@@ -20,9 +20,27 @@ interface DualViewportProps {
   onViewModeChange: (m: ViewMode) => void;
   srcLandmarks?: LandmarkPoint[];
   tarLandmarks?: LandmarkPoint[];
-  onSrcClick?: (idx: number, pos: Vec3) => void;
-  onTarClick?: (idx: number, pos: Vec3) => void;
+  onSrcClick?: (
+    idx: number,
+    pos: Vec3,
+    modifiers: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean },
+  ) => void;
+  onTarClick?: (
+    idx: number,
+    pos: Vec3,
+    modifiers: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean },
+  ) => void;
   pickingEnabled?: boolean;
+  srcPickingEnabled?: boolean;
+  tarPickingEnabled?: boolean;
+  selectedSrcLandmarkIndex?: number | null;
+  selectedTarLandmarkIndex?: number | null;
+  onSelectSrcLandmark?: (index: number) => void;
+  onSelectTarLandmark?: (index: number) => void;
+  onDeleteSrcLandmark?: (index: number) => void;
+  onDeleteTarLandmark?: (index: number) => void;
+  onMoveSrcLandmark?: (index: number, position: Vec3) => void;
+  onMoveTarLandmark?: (index: number, position: Vec3) => void;
   height?: number | string;
   /** Show camera-sync toggle at the top */
   showCameraSync?: boolean;
@@ -46,6 +64,16 @@ export function DualViewport({
   onSrcClick,
   onTarClick,
   pickingEnabled = false,
+  srcPickingEnabled,
+  tarPickingEnabled,
+  selectedSrcLandmarkIndex = null,
+  selectedTarLandmarkIndex = null,
+  onSelectSrcLandmark,
+  onSelectTarLandmark,
+  onDeleteSrcLandmark,
+  onDeleteTarLandmark,
+  onMoveSrcLandmark,
+  onMoveTarLandmark,
   height = '100%',
   showCameraSync = true,
   landmarkScreenFraction,
@@ -103,8 +131,12 @@ export function DualViewport({
             updatedVertices={srcUpdatedVertices}
             landmarks={srcLandmarks}
             landmarkColor="#ff4d4f"
+            selectedLandmarkIndex={selectedSrcLandmarkIndex}
+            onLandmarkSelect={onSelectSrcLandmark}
+            onLandmarkDelete={onDeleteSrcLandmark}
+            onLandmarkMove={onMoveSrcLandmark}
             onMeshClick={onSrcClick}
-            pickingEnabled={pickingEnabled}
+            pickingEnabled={srcPickingEnabled ?? pickingEnabled}
             height="100%"
             label={srcLabel}
             cameraSyncId={cameraSyncEnabled ? 'source' : undefined}
@@ -121,8 +153,12 @@ export function DualViewport({
             viewMode={viewMode}
             landmarks={tarLandmarks}
             landmarkColor="#1890ff"
+            selectedLandmarkIndex={selectedTarLandmarkIndex}
+            onLandmarkSelect={onSelectTarLandmark}
+            onLandmarkDelete={onDeleteTarLandmark}
+            onLandmarkMove={onMoveTarLandmark}
             onMeshClick={onTarClick}
-            pickingEnabled={pickingEnabled}
+            pickingEnabled={tarPickingEnabled ?? pickingEnabled}
             height="100%"
             label={tarLabel}
             cameraSyncId={cameraSyncEnabled ? 'target' : undefined}

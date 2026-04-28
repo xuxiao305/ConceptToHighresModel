@@ -47,7 +47,11 @@ interface MeshObjectProps {
   /** When true, attempts to swap in `updatedVertices` each frame (no realloc). */
   dynamic?: boolean;
   updatedVertices?: Vec3[];
-  onMeshClick?: (vertexIdx: number, position: Vec3) => void;
+  onMeshClick?: (
+    vertexIdx: number,
+    position: Vec3,
+    modifiers: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean },
+  ) => void;
   /** Expose the BufferGeometry so LandmarkMarker can do occlusion tests. */
   onGeometryReady?: (geo: THREE.BufferGeometry) => void;
 }
@@ -64,6 +68,8 @@ function MeshObject({
 }: MeshObjectProps) {
   const meshRef = useRef<THREE.Mesh>(null);
   const downPos = useRef<{ x: number; y: number } | null>(null);
+  const shouldHandlePick = useRef(false);
+  const downModifiers = useRef({ ctrlKey: false, shiftKey: false, altKey: false });
   const downIntersection = useRef<{
     face: { a: number; b: number; c: number };
     point: THREE.Vector3;
@@ -111,6 +117,16 @@ function MeshObject({
 
   const handlePointerDown = useCallback((e: ThreeEvent<PointerEvent>) => {
     downPos.current = { x: e.clientX, y: e.clientY };
+    downModifiers.current = {
+      ctrlKey: Boolean(e.ctrlKey),
+      shiftKey: Boolean(e.shiftKey),
+      altKey: Boolean(e.altKey),
+    };
+    shouldHandlePick.current = Boolean(onMeshClick && e.button === 0 && e.ctrlKey);
+    if (shouldHandlePick.current) {
+      // Prevent OrbitControls from consuming the click and causing a tiny camera twitch.
+      e.stopPropagation();
+    }
     const intersection = e.intersections?.[0];
     if (intersection && intersection.face) {
       downIntersection.current = {
@@ -120,11 +136,12 @@ function MeshObject({
     } else {
       downIntersection.current = null;
     }
-  }, []);
+  }, [onMeshClick]);
 
   const handlePointerUp = useCallback(
     (e: ThreeEvent<PointerEvent>) => {
       if (!onMeshClick || !meshRef.current) return;
+      if (!shouldHandlePick.current) return;
       if (!downPos.current) return;
       const dx = e.clientX - downPos.current.x;
       const dy = e.clientY - downPos.current.y;
@@ -135,20 +152,18 @@ function MeshObject({
       const { face, point } = stored;
       const geo = meshRef.current.geometry;
       const posAttr = geo.attributes.position as THREE.BufferAttribute;
+      const localPoint = meshRef.current.worldToLocal(point.clone());
       const vA = new THREE.Vector3().fromBufferAttribute(posAttr, face.a);
       const vB = new THREE.Vector3().fromBufferAttribute(posAttr, face.b);
       const vC = new THREE.Vector3().fromBufferAttribute(posAttr, face.c);
-      const dists = [vA, vB, vC].map((v) => v.distanceTo(point));
+      const dists = [vA, vB, vC].map((v) => v.distanceTo(localPoint));
       const minIdx = dists.indexOf(Math.min(...dists));
       const vertexIdx = [face.a, face.b, face.c][minIdx];
-      const vertexPos: Vec3 = [
-        posAttr.getX(vertexIdx),
-        posAttr.getY(vertexIdx),
-        posAttr.getZ(vertexIdx),
-      ];
-      onMeshClick(vertexIdx, vertexPos);
+      const hitPos: Vec3 = [localPoint.x, localPoint.y, localPoint.z];
+      onMeshClick(vertexIdx, hitPos, downModifiers.current);
       downIntersection.current = null;
       downPos.current = null;
+      shouldHandlePick.current = false;
     },
     [onMeshClick],
   );
@@ -285,7 +300,15 @@ export interface MeshViewerProps {
   updatedVertices?: Vec3[];
   landmarks?: LandmarkPoint[];
   landmarkColor?: string;
-  onMeshClick?: (vertexIdx: number, position: Vec3) => void;
+  selectedLandmarkIndex?: number | null;
+  onLandmarkSelect?: (index: number) => void;
+  onLandmarkDelete?: (index: number) => void;
+  onLandmarkMove?: (index: number, position: Vec3) => void;
+  onMeshClick?: (
+    vertexIdx: number,
+    position: Vec3,
+    modifiers: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean },
+  ) => void;
   pickingEnabled?: boolean;
   height?: number | string;
   label?: string;
@@ -322,6 +345,10 @@ export function MeshViewer({
   updatedVertices,
   landmarks = [],
   landmarkColor = '#ff4d4f',
+  selectedLandmarkIndex = null,
+  onLandmarkSelect,
+  onLandmarkDelete,
+  onLandmarkMove,
   onMeshClick,
   pickingEnabled = false,
   height = '100%',
@@ -432,7 +459,7 @@ export function MeshViewer({
             viewMode={internalMode}
             dynamic={role === 'source' || role === 'result'}
             updatedVertices={updatedVertices}
-            onMeshClick={pickingEnabled ? onMeshClick : undefined}
+            onMeshClick={onMeshClick}
             onGeometryReady={handleGeometryReady}
           />
 
@@ -448,11 +475,17 @@ export function MeshViewer({
           {landmarks.map((pt) => (
             <LandmarkMarker
               key={pt.index}
+              index={pt.index}
               position={pt.position}
               label={`${pt.index}`}
               color={landmarkColor}
               occlusionGeometry={meshGeometry}
               screenFraction={landmarkScreenFraction ?? 0.010}
+              selected={selectedLandmarkIndex === pt.index}
+              parentOffsetY={groundOffsetY}
+              onSelect={onLandmarkSelect}
+              onDelete={onLandmarkDelete}
+              onMove={onLandmarkMove}
             />
           ))}
         </group>

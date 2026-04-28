@@ -24,9 +24,14 @@ interface LandmarkState {
 
   addSrcLandmark: (vertexIdx: number, position: Vec3) => void;
   addTarLandmark: (vertexIdx: number, position: Vec3) => void;
+  updateSrcLandmark: (index: number, position: Vec3, vertexIdx?: number) => void;
+  updateTarLandmark: (index: number, position: Vec3, vertexIdx?: number) => void;
   removeSrcLandmark: (index: number) => void;
   removeTarLandmark: (index: number) => void;
+  clearSrcLandmarks: () => void;
+  clearTarLandmarks: () => void;
   clearAll: () => void;
+  transformSrcLandmarks: (matrix: number[][]) => void;
 
   isBalanced: () => boolean;
   pairCount: () => number;
@@ -53,6 +58,20 @@ export const useLandmarkStore = create<LandmarkState>((set, get) => ({
     }));
   },
 
+  updateSrcLandmark: (index, position, vertexIdx = -1) =>
+    set((state) => ({
+      srcLandmarks: state.srcLandmarks.map((p) =>
+        p.index === index ? { ...p, position, vertexIdx } : p,
+      ),
+    })),
+
+  updateTarLandmark: (index, position, vertexIdx = -1) =>
+    set((state) => ({
+      tarLandmarks: state.tarLandmarks.map((p) =>
+        p.index === index ? { ...p, position, vertexIdx } : p,
+      ),
+    })),
+
   removeSrcLandmark: (index) =>
     set((state) => ({
       srcLandmarks: state.srcLandmarks.filter((p) => p.index !== index),
@@ -63,11 +82,32 @@ export const useLandmarkStore = create<LandmarkState>((set, get) => ({
       tarLandmarks: state.tarLandmarks.filter((p) => p.index !== index),
     })),
 
+  clearSrcLandmarks: () => {
+    srcCounter = 0;
+    set({ srcLandmarks: [] });
+  },
+
+  clearTarLandmarks: () => {
+    tarCounter = 0;
+    set({ tarLandmarks: [] });
+  },
+
   clearAll: () => {
     srcCounter = 0;
     tarCounter = 0;
     set({ srcLandmarks: [], tarLandmarks: [] });
   },
+
+  transformSrcLandmarks: (matrix) =>
+    set((state) => ({
+      srcLandmarks: state.srcLandmarks.map((p) => {
+        const [x, y, z] = p.position;
+        const nx = matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z + matrix[0][3];
+        const ny = matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z + matrix[1][3];
+        const nz = matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z + matrix[2][3];
+        return { ...p, position: [nx, ny, nz] };
+      }),
+    })),
 
   isBalanced: () => {
     const { srcLandmarks, tarLandmarks } = get();
