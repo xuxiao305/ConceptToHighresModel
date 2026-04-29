@@ -39,3 +39,5 @@ export {
 } from './meshFeatures';
 export { matchGlobalCandidates } from './globalCandidates';
 export type { GlobalMatchOptions } from './globalCandidates';
+export { ransacFilterCandidates } from './ransacAlign';
+export type { RansacOptions, RansacResult } from './ransacAlign';

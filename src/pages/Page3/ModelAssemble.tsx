@@ -11,6 +11,8 @@ import {
   growRegion,
   matchRegionCandidates,
   matchGlobalCandidates,
+  ransacFilterCandidates,
+  bboxDiagonal,
   type Vec3,
   type Face3,
   type ViewMode,
@@ -140,6 +142,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [globalSamples, setGlobalSamples] = useState(60);
   const [globalRings, setGlobalRings] = useState(3);
   const [globalRequireMutual, setGlobalRequireMutual] = useState(true);
+  const [ransacAutoApply, setRansacAutoApply] = useState(true);
+  const [ransacThresholdPct, setRansacThresholdPct] = useState(5);
+  const [ransacIterations, setRansacIterations] = useState(300);
 
   const srcAdjacency: MeshAdjacency = useMemo(
     () => buildMeshAdjacency(srcMesh.vertices, srcMesh.faces),
@@ -258,7 +263,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
       return;
     }
     const t0 = performance.now();
-    const result = matchGlobalCandidates(
+    let result = matchGlobalCandidates(
       { vertices: srcMesh.vertices, adjacency: srcAdjacency },
       { vertices: tarMesh.vertices, adjacency: tarAdjacency },
       {
@@ -267,12 +272,26 @@ export function ModelAssemble({ onStatusChange }: Props) {
         requireMutual: globalRequireMutual,
       },
     );
+    const rawCount = result.length;
+    let ransacInfo = '';
+    if (ransacAutoApply && result.length >= 4) {
+      const r = ransacFilterCandidates(result, tarMesh.vertices, {
+        iterations: ransacIterations,
+        inlierThreshold: bboxDiagonal(tarMesh.vertices) * (ransacThresholdPct / 100),
+      });
+      if (r.matrix4x4 && r.inliers.length >= 3) {
+        result = r.inliers;
+        ransacInfo = ` · RANSAC 留下 ${r.inliers.length}/${rawCount} (RMSE=${r.rmse.toFixed(4)})`;
+      } else {
+        ransacInfo = ` · RANSAC 失败（保留全部 ${rawCount}）`;
+      }
+    }
     const dt = performance.now() - t0;
     setCandidates(result);
     setAcceptedCandidateIds(new Set());
     const accepted = result.filter((c) => c.suggestAccept).length;
     onStatusChange(
-      `全网格匹配：${result.length} 对（${accepted} 推荐接受）— ${dt.toFixed(1)}ms`,
+      `全网格匹配：${result.length} 对（${accepted} 推荐接受）${ransacInfo} — ${dt.toFixed(1)}ms`,
       result.length > 0 ? 'success' : 'warning',
     );
   }, [
@@ -283,8 +302,37 @@ export function ModelAssemble({ onStatusChange }: Props) {
     globalSamples,
     globalRings,
     globalRequireMutual,
+    ransacAutoApply,
+    ransacIterations,
+    ransacThresholdPct,
     onStatusChange,
   ]);
+
+  const handleRansacRefine = useCallback(() => {
+    if (candidates.length < 4) {
+      onStatusChange('候选少于 4，RANSAC 无法精修', 'warning');
+      return;
+    }
+    const t0 = performance.now();
+    const r = ransacFilterCandidates(candidates, tarMesh.vertices, {
+      iterations: ransacIterations,
+      inlierThreshold: bboxDiagonal(tarMesh.vertices) * (ransacThresholdPct / 100),
+    });
+    const dt = performance.now() - t0;
+    if (!r.matrix4x4 || r.inliers.length < 3) {
+      onStatusChange(
+        `RANSAC 失败：未找到一致的 inlier 集合（threshold=${(ransacThresholdPct).toFixed(1)}%）`,
+        'error',
+      );
+      return;
+    }
+    setCandidates(r.inliers);
+    setAcceptedCandidateIds(new Set());
+    onStatusChange(
+      `RANSAC 精修：保留 ${r.inliers.length}/${candidates.length}（RMSE=${r.rmse.toFixed(4)}） — ${dt.toFixed(1)}ms`,
+      'success',
+    );
+  }, [candidates, tarMesh, ransacIterations, ransacThresholdPct, onStatusChange]);
 
   // Stale-candidate guard: invalidate suggestions when seed regions change.
   useEffect(() => {
@@ -622,17 +670,59 @@ export function ModelAssemble({ onStatusChange }: Props) {
     onStatusChange('已将对齐结果应用到 Source 模型与 Source landmarks', 'success');
   };
 
-  const restoreDemo = () => {
-    setSrcMesh(DEMO_SOURCE);
-    setTarMesh(demoTarget);
-    clearAllLandmarks();
-    setAlignResult(null);
-    setSelectedSrcIndex(null);
-    setSelectedTarIndex(null);
-    setSrcRegion(null);
-    setTarRegion(null);
-    onStatusChange('已恢复 Demo Source/Target', 'info');
-  };
+  const restoreDemo = useCallback(async () => {
+    const srcUrl = '/demo/alignmenttest_arm_hires.glb';
+    const tarUrl = '/demo/alignmenttest_arm_hires_Deformed.glb';
+    try {
+      onStatusChange('正在加载 Demo: alignmenttest_arm_hires (源 + 形变)…', 'info');
+      const [srcLoaded, tarLoaded] = await Promise.all([
+        loadGlbAsMesh(srcUrl),
+        loadGlbAsMesh(tarUrl),
+      ]);
+      setSrcMesh({
+        name: 'alignmenttest_arm_hires.glb',
+        vertices: srcLoaded.vertices,
+        faces: srcLoaded.faces,
+      });
+      setTarMesh({
+        name: 'alignmenttest_arm_hires_Deformed.glb',
+        vertices: tarLoaded.vertices,
+        faces: tarLoaded.faces,
+      });
+      clearAllLandmarks();
+      setAlignResult(null);
+      setResultPreview(null);
+      setSelectedSrcIndex(null);
+      setSelectedTarIndex(null);
+      setSrcRegion(null);
+      setTarRegion(null);
+      setCandidates([]);
+      setAcceptedCandidateIds(new Set());
+      setCenterViewMode('landmark');
+      onStatusChange(
+        `Demo 已加载：Src V/F=${srcLoaded.vertices.length}/${srcLoaded.faces.length}, ` +
+          `Tar V/F=${tarLoaded.vertices.length}/${tarLoaded.faces.length}`,
+        'success',
+      );
+    } catch (err) {
+      // Fallback: tiny inline demo so the page is still usable
+      setSrcMesh(DEMO_SOURCE);
+      setTarMesh(demoTarget);
+      clearAllLandmarks();
+      setAlignResult(null);
+      setResultPreview(null);
+      setSelectedSrcIndex(null);
+      setSelectedTarIndex(null);
+      setSrcRegion(null);
+      setTarRegion(null);
+      setCandidates([]);
+      setAcceptedCandidateIds(new Set());
+      onStatusChange(
+        `Demo GLB 加载失败（${err instanceof Error ? err.message : '未知错误'}），已回退到内置盒子 Demo`,
+        'warning',
+      );
+    }
+  }, [clearAllLandmarks, demoTarget, onStatusChange]);
 
   return (
     <div
@@ -659,7 +749,15 @@ export function ModelAssemble({ onStatusChange }: Props) {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             <Button size="sm" onClick={() => srcInputRef.current?.click()}>导入 Source GLB</Button>
             <Button size="sm" onClick={() => tarInputRef.current?.click()}>导入 Target GLB</Button>
-            <Button size="sm" onClick={restoreDemo}>恢复 Demo</Button>
+            <Button
+              size="sm"
+              onClick={() => {
+                void restoreDemo();
+              }}
+              title="加载 alignmenttest_arm_hires.glb (源) + alignmenttest_arm_hires_Deformed.glb (形变)"
+            >
+              加载 Demo (arm hires)
+            </Button>
           </div>
           <input ref={srcInputRef} type="file" accept=".glb" style={{ display: 'none' }} onChange={onSrcFileChange} />
           <input ref={tarInputRef} type="file" accept=".glb" style={{ display: 'none' }} onChange={onTarFileChange} />
@@ -960,6 +1058,57 @@ export function ModelAssemble({ onStatusChange }: Props) {
             互最近邻过滤（更稳，更少）
           </label>
 
+          <label
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: 11,
+              color: 'var(--text-muted)',
+              marginBottom: 6,
+              cursor: 'pointer',
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={ransacAutoApply}
+              onChange={(e) => setRansacAutoApply(e.target.checked)}
+            />
+            自动 RANSAC 几何一致性过滤（强烈推荐）
+          </label>
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            RANSAC 阈值（% of bbox 对角线）
+          </div>
+          <input
+            type="range"
+            min={1}
+            max={20}
+            step={0.5}
+            value={ransacThresholdPct}
+            onChange={(e) => setRansacThresholdPct(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {ransacThresholdPct.toFixed(1)}%
+          </div>
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            RANSAC 迭代数
+          </div>
+          <input
+            type="range"
+            min={50}
+            max={2000}
+            step={50}
+            value={ransacIterations}
+            onChange={(e) => setRansacIterations(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {ransacIterations}
+          </div>
+
           <Button
             size="sm"
             variant="primary"
@@ -967,6 +1116,15 @@ export function ModelAssemble({ onStatusChange }: Props) {
             style={{ width: '100%', justifyContent: 'center' }}
           >
             全网格查找候选
+          </Button>
+          <Button
+            size="sm"
+            onClick={handleRansacRefine}
+            disabled={candidates.length < 4}
+            style={{ width: '100%', justifyContent: 'center', marginTop: 6 }}
+            title="用 RANSAC 在当前候选集合中筛出几何一致的子集"
+          >
+            RANSAC 精修当前候选
           </Button>
         </PanelSection>
 
