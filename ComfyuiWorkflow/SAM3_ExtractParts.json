@@ -1,0 +1,235 @@
+{
+  "1": {
+    "inputs": {
+      "image": "NoJacket.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "2": {
+    "inputs": {
+      "multi_prompts_store": "[{\"positive_points\":[{\"x\":298.26621086685407,\"y\":321.3652855121622},{\"x\":214.89988061225083,\"y\":490.70488583023314},{\"x\":313.89739778959216,\"y\":495.9153350707891},{\"x\":230.53106753498895,\"y\":282.286916207992},{\"x\":287.84541958502865,\"y\":266.65556848632394}],\"negative_points\":[{\"x\":241.1128134973472,\"y\":180.33900641488634},{\"x\":241.1128134973472,\"y\":180.33900641488634},{\"x\":108.71665864808942,\"y\":155.12043282026522},{\"x\":108.71665864808942,\"y\":155.12043282026522},{\"x\":297.85402271845766,\"y\":151.96811112093758},{\"x\":297.85402271845766,\"y\":151.96811112093758},{\"x\":206.4788443010627,\"y\":574.9292390729597},{\"x\":206.4788443010627,\"y\":574.9292390729597},{\"x\":323.73120912647437,\"y\":579.6827523066481},{\"x\":323.73120912647437,\"y\":579.6827523066481}],\"positive_boxes\":[],\"negative_boxes\":[],\"text_prompt\":\"\"},{\"positive_points\":[{\"x\":616.1003449625289,\"y\":282.286916207992},{\"x\":636.9419275261797,\"y\":438.60039342467286},{\"x\":636.9419275261797,\"y\":498.52055969106715},{\"x\":612.3935068953142,\"y\":418.697565453021},{\"x\":618.1249431750209,\"y\":332.7251519023198},{\"x\":599.2841695375453,\"y\":272.58601528285635},{\"x\":632.5584892852972,\"y\":261.4944844042501}],\"negative_points\":[{\"x\":609.9306734345652,\"y\":196.10061491152456},{\"x\":609.9306734345652,\"y\":196.10061491152456},{\"x\":635.1489886439476,\"y\":564.9222537328586},{\"x\":635.1489886439476,\"y\":564.9222537328586}],\"positive_boxes\":[],\"negative_boxes\":[],\"text_prompt\":\"\"},{\"positive_points\":[{\"x\":225.32067189407624,\"y\":902.3303758341593},{\"x\":230.53106753498895,\"y\":1048.222954569728},{\"x\":207.08428715088178,\"y\":1121.1692439375124},{\"x\":251.59796343275508,\"y\":885.9346345106958},{\"x\":219.00497439939593,\"y\":878.2656328200205}],\"negative_points\":[{\"x\":228.50365589265596,\"y\":810.8033462804146},{\"x\":228.50365589265596,\"y\":810.8033462804146},{\"x\":215.89449828796475,\"y\":1192.2342718990594},{\"x\":215.89449828796475,\"y\":1192.2342718990594}],\"positive_boxes\":[],\"negative_boxes\":[],\"text_prompt\":\"\"},{\"positive_points\":[{\"x\":568.9509112193188,\"y\":895.916032162261},{\"x\":531.1234384052451,\"y\":1110.2739077165406},{\"x\":628.844409841602,\"y\":1122.8831945138513},{\"x\":605.1910790893679,\"y\":921.1368410617912},{\"x\":612.2572413654676,\"y\":889.4863852845832},{\"x\":645.5315611132196,\"y\":952.8665617337616},{\"x\":540.9551276202849,\"y\":1035.2607911176938},{\"x\":621.7641898648254,\"y\":1036.8452955289233}],\"negative_points\":[{\"x\":578.4077794228372,\"y\":813.9556679797424},{\"x\":578.4077794228372,\"y\":813.9556679797424},{\"x\":527.9711490040722,\"y\":1185.929628500404},{\"x\":527.9711490040722,\"y\":1185.929628500404},{\"x\":638.3012780451204,\"y\":1198.5389152977145},{\"x\":638.3012780451204,\"y\":1198.5389152977145}],\"positive_boxes\":[],\"negative_boxes\":[],\"text_prompt\":\"\"}]",
+      "canvas": "",
+      "image": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "SAM3TextClickCollector",
+    "_meta": {
+      "title": "SAM3 Text+Click Collector"
+    }
+  },
+  "3": {
+    "inputs": {
+      "confidence_threshold": 0.2,
+      "refinement_iterations": 10,
+      "use_multimask": false,
+      "vis_mode": "fill_only",
+      "sam3_model_config": [
+        "16",
+        0
+      ],
+      "image": [
+        "1",
+        0
+      ],
+      "multi_prompts": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "SAM3TextClickSegmentation",
+    "_meta": {
+      "title": "SAM3 Text+Click Segmentation"
+    }
+  },
+  "4": {
+    "inputs": {
+      "images": [
+        "3",
+        1
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "预览图像"
+    }
+  },
+  "5": {
+    "inputs": {
+      "combined": true,
+      "crop_factor": 1,
+      "bbox_fill": false,
+      "drop_size": 50,
+      "contour_fill": false,
+      "mask": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "MaskToSEGS",
+    "_meta": {
+      "title": "MASK to SEGS"
+    }
+  },
+  "6": {
+    "inputs": {
+      "alpha_mode": true,
+      "min_alpha": 0,
+      "segs": [
+        "5",
+        0
+      ],
+      "fallback_image_opt": [
+        "3",
+        1
+      ]
+    },
+    "class_type": "SEGSPreview",
+    "_meta": {
+      "title": "SEGS Preview（遮罩应用）"
+    }
+  },
+  "7": {
+    "inputs": {
+      "merge_mode": "union",
+      "masks": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "SAM3MergeMasks",
+    "_meta": {
+      "title": "SAM3 Merge Masks"
+    }
+  },
+  "8": {
+    "inputs": {
+      "mask": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "MaskPreview",
+    "_meta": {
+      "title": "预览遮罩"
+    }
+  },
+  "9": {
+    "inputs": {
+      "image": "NoJacket.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "10": {
+    "inputs": {
+      "mode": "extract_masked_area",
+      "background": "Color",
+      "background_color": "#FFFFFF",
+      "image": [
+        "9",
+        0
+      ],
+      "mask": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "AILab_MaskExtractor",
+    "_meta": {
+      "title": "遮罩提取 (RMBG) 🎭"
+    }
+  },
+  "11": {
+    "inputs": {
+      "prompt": "note this is the SAME subject with different angle with such order:\ntop left: front view \ntop right: left view\nbottom left: right view\nbottom right: back view \n\nYou need enlarged the subject, scale filling its zone, but do NOT make it across to other grids\n",
+      "model": "gemini-3-pro-image-preview",
+      "seed": 43,
+      "aspect_ratio": "auto",
+      "resolution": "1K",
+      "response_modalities": "IMAGE+TEXT",
+      "system_prompt": "You are an expert image-generation engine. You must ALWAYS produce an image.\nInterpret all user input—regardless of format, intent, or abstraction—as literal visual directives for image composition.\nIf a prompt is conversational or lacks specific visual details, you must creatively invent a concrete visual scenario that depicts the concept.\nPrioritize generating the visual representation above any text, formatting, or conversational requests.",
+      "images": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "GeminiImage2Node",
+    "_meta": {
+      "title": "Nano Banana Pro（Google Gemini 图像）"
+    }
+  },
+  "12": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "保存图像"
+    }
+  },
+  "13": {
+    "inputs": {
+      "padding": 8,
+      "white_threshold": 240,
+      "use_alpha": false,
+      "min_area": 64,
+      "max_objects": 16,
+      "layout": "auto",
+      "background": "white",
+      "resample": "lanczos",
+      "image": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "SmartCropAndEnlargeAuto",
+    "_meta": {
+      "title": "Smart Crop & Enlarge (Auto)"
+    }
+  },
+  "14": {
+    "inputs": {
+      "images": [
+        "13",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "预览图像"
+    }
+  },
+  "16": {
+    "inputs": {
+      "precision": "fp32",
+      "compile": "flash_attn"
+    },
+    "class_type": "LoadSAM3Model",
+    "_meta": {
+      "title": "(Down)Load SAM3 Model"
+    }
+  },
+  "17": {
+    "inputs": {
+      "anything": [
+        "16",
+        0
+      ]
+    },
+    "class_type": "Anything Everywhere",
+    "_meta": {
+      "title": "Anything Everywhere"
+    }
+  }
+}

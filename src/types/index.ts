@@ -31,7 +31,8 @@ export interface NodeConfig {
 /**
  * Extraction node mode:
  *   - banana: 用 Banana Pro (Gemini) + 文本提示词直接生成提取结果
- *   - sam3:   使用 SAM3 框选/点选进行分割（待实现）
+ *   - sam3:   点击"生成"后弹出 SAM3 独立窗口进行交互式点选，
+ *             用户"导出 JSON"后窗口自动关闭、结果回传。
  */
 export type ExtractionMode = 'banana' | 'sam3';
 
@@ -39,8 +40,10 @@ export interface ExtractionState {
   mode: ExtractionMode;
   /** Banana Pro 当前选中的提示词预设索引 */
   promptIndex: number;
-  /** 上一次成功生成的图片 blob: URL（用于节点预览） */
+  /** 当前展示的图片 blob: URL（生成结果或选中的历史版本） */
   resultUrl: string | null;
+  /** 当前展示图片对应的工程文件名（用于历史下拉、复制路径） */
+  resultFile?: string | null;
   /** 错误信息（若有） */
   error?: string;
 }

@@ -4,8 +4,17 @@ import { NodeCard } from '../../components/NodeCard';
 import { NodeConnector } from '../../components/NodeConnector';
 import { Button } from '../../components/Button';
 import { Placeholder } from '../../components/Placeholder';
+import { ImagePreviewModal } from '../../components/ImagePreviewModal';
 import { useProject } from '../../contexts/ProjectContext';
-import { EXTRACTION_PROMPT_PRESETS, extractWithPrompt } from '../../services/extraction';
+import {
+  EXTRACTION_PROMPT_PRESETS,
+  extractWithPrompt,
+  extractWithSAM3,
+  SAM3CancelledError,
+  SAM3NotWiredError,
+} from '../../services/extraction';
+import { NODE_DIRS, type AssetVersion } from '../../services/projectStore';
+import { splitMultiView } from '../../services/multiviewSplit';
 
 export const PART_NODES: NodeConfig[] = [
   { id: 'extraction', title: 'Extraction', display: 'image' },
@@ -32,10 +41,15 @@ interface Props {
 }
 
 export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: Props) {
-  const { project, loadLatest, saveAsset } = useProject();
+  const { project, loadLatest, saveAsset, listHistory, loadByName, saveSegments } = useProject();
   const [renaming, setRenaming] = useState(false);
   const [draftName, setDraftName] = useState(pipeline.name);
   const [splitView, setSplitView] = useState(false);
+
+  // Extraction 节点历史版本（仅本 Pipeline 自己的，按 pipeline.name 前缀过滤）
+  const [extractionHistory, setExtractionHistory] = useState<AssetVersion[]>([]);
+  // 图片大图预览
+  const [preview, setPreview] = useState<{ url: string; title: string } | null>(null);
 
   // Source image for Extraction (loaded from page1.multiview on the active project).
   // Falls back to "no source available" if the project hasn't been opened or
@@ -93,6 +107,87 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     [pipeline, extraction, onUpdate]
   );
 
+  // 加载本 Pipeline 的 Extraction 历史（按 pipeline.name 前缀过滤）。
+  const safeName = pipeline.name.replace(/[^A-Za-z0-9._-]/g, '_');
+  const refreshExtractionHistory = useCallback(async () => {
+    if (!project) {
+      setExtractionHistory([]);
+      return;
+    }
+    try {
+      const all = await listHistory('page2.extraction');
+      const mine = all.filter((v) => v.file.startsWith(`${safeName}_`));
+      setExtractionHistory(mine);
+    } catch (err) {
+      console.warn('[PartPipeline] list extraction history failed:', err);
+      setExtractionHistory([]);
+    }
+  }, [project, listHistory, safeName]);
+
+  useEffect(() => { void refreshExtractionHistory(); }, [refreshExtractionHistory]);
+
+  // Project loaded but the in-memory extraction state is empty → auto-load the
+  // latest saved extraction as the current preview, so the node doesn't snap
+  // back to "show the multi-view source" after a reload.
+  useEffect(() => {
+    if (!project) return;
+    if (extraction.resultUrl || extraction.resultFile) return;
+    if (extractionHistory.length === 0) return;
+    const latest = extractionHistory[0];
+    void handleSelectExtractionHistory(latest.file);
+    // Only run when the history list materializes for the first time.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project, extractionHistory]);
+
+  // 切换历史版本：从工程目录加载 blob，替换当前 resultUrl/resultFile。
+  const handleSelectExtractionHistory = useCallback(async (fileName: string) => {
+    if (!project || !fileName) return;
+    try {
+      const r = await loadByName('page2.extraction', fileName);
+      if (!r) {
+        onStatus(`[${pipeline.name}] 无法读取该历史版本`, 'error');
+        return;
+      }
+      if (extraction.resultUrl) URL.revokeObjectURL(extraction.resultUrl);
+      onUpdate(pipeline.id, {
+        ...pipeline,
+        nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 0 ? 'complete' : v)),
+        extraction: { ...extraction, resultUrl: r.url, resultFile: fileName, error: undefined },
+      });
+      onStatus(`[${pipeline.name}] 已切换到 ${fileName}`, 'success');
+    } catch (err) {
+      onStatus(
+        `[${pipeline.name}] 加载历史版本失败：${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    }
+  }, [project, loadByName, pipeline, extraction, onUpdate, onStatus]);
+
+  // "复制图片所在路径"：浏览器无法直接打开资源管理器，只能把绝对路径放剪贴板。
+  // 路径精确到文件夹一级（不含文件名），便于直接粘贴到资源管理器地址栏。
+  const handleCopyExtractionPath = useCallback(async () => {
+    if (!project) {
+      onStatus(`[${pipeline.name}] 未打开工程`, 'warning');
+      return;
+    }
+    if (!project.meta.absolutePath) {
+      onStatus(
+        `[${pipeline.name}] 未配置工程绝对路径，请先点击右上角"📋 路径"按钮设置`,
+        'warning',
+      );
+      return;
+    }
+    const dirs = NODE_DIRS['page2.extraction'];
+    const sep = /[\\]/.test(project.meta.absolutePath) ? '\\' : '/';
+    const fullDir = [project.meta.absolutePath, dirs.pageDir, dirs.nodeDir].join(sep);
+    try {
+      await navigator.clipboard.writeText(fullDir);
+      onStatus(`[${pipeline.name}] 已复制目录路径：${fullDir}`, 'success');
+    } catch {
+      onStatus(`[${pipeline.name}] 复制失败 — 路径：${fullDir}`, 'warning');
+    }
+  }, [pipeline.name, project, onStatus]);
+
   const setStateAt = useCallback(
     (i: number, s: NodeState) => {
       const next: PartPipelineState = {
@@ -104,32 +199,95 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     [pipeline, onUpdate]
   );
 
-  // Real Extraction runner (Banana Pro). Returns the blob: URL on success.
+  // Real Extraction runner. Dispatches by mode then writes the final 4-view
+  // PNG (+ split per-view sub-set) to the project, exactly like Page1's
+  // Multi-View node.
   const runExtraction = useCallback(async (): Promise<string | null> => {
-    if (extraction.mode === 'sam3') {
-      onStatus(`[${pipeline.name}] SAM3 模式尚未实现`, 'warning');
-      return null;
-    }
     if (!sourceFile) {
       onStatus(`[${pipeline.name}] 缺少源图片：请先在 Page1 生成 Multi-View`, 'error');
       return null;
     }
+
     const preset = EXTRACTION_PROMPT_PRESETS[extraction.promptIndex] ?? EXTRACTION_PROMPT_PRESETS[0];
+    const noteForMode =
+      extraction.mode === 'banana'
+        ? `${pipeline.name} · Banana · ${preset.label}`
+        : `${pipeline.name} · SAM3`;
+
     // Set running
     onUpdate(pipeline.id, {
       ...pipeline,
       nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 0 ? 'running' : v)),
       extraction: { ...extraction, error: undefined },
     });
-    onStatus(`[${pipeline.name}] Banana Pro 提取中…`, 'info');
+    onStatus(
+      `[${pipeline.name}] ${extraction.mode === 'banana' ? 'Banana Pro' : 'SAM3'} 提取中…`,
+      'info',
+    );
+
     try {
-      const url = await extractWithPrompt({
-        source: sourceFile,
-        prompt: preset.prompt,
-        onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
-      });
+      const url =
+        extraction.mode === 'banana'
+          ? await extractWithPrompt({
+              source: sourceFile,
+              prompt: preset.prompt,
+              onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
+            })
+          : await extractWithSAM3({
+              source: sourceFile,
+              onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
+            });
+
       // Revoke previous result URL if any
       if (extraction.resultUrl) URL.revokeObjectURL(extraction.resultUrl);
+
+      // Save to project (full 4-view PNG)
+      let savedFile: string | null = null;
+      if (project) {
+        try {
+          const blob = await (await fetch(url)).blob();
+          const v = await saveAsset('page2.extraction', blob, 'png', noteForMode, pipeline.name);
+          if (v) {
+            savedFile = v.file;
+            onStatus(`[${pipeline.name}] 已保存到工程：${v.file}`, 'success');
+
+            // Auto-split 2x2 grid into 4 individual views (front/left/back/right),
+            // mirroring page1.multiview's behaviour. Stored under
+            // <basename>_v0001/{view}_v0001.png plus segments.json.
+            try {
+              const slices = await splitMultiView(blob);
+              const baseName = v.file.replace(/\.[^.]+$/, '');
+              const setHandle = await saveSegments(
+                'page2.extraction',
+                baseName,
+                v.file,
+                slices.map((s) => ({
+                  name: `${s.view}_{v}.png`,
+                  blob: s.blob,
+                  meta: { view: s.view, bbox: s.bbox, size: s.size },
+                })),
+              );
+              if (setHandle) {
+                onStatus(
+                  `[${pipeline.name}] 已切分 4 视图 → ${setHandle.dirName}/`,
+                  'success',
+                );
+              }
+            } catch (e) {
+              onStatus(
+                `[${pipeline.name}] 4 视图切分失败：${e instanceof Error ? e.message : String(e)}`,
+                'warning',
+              );
+            }
+          }
+        } catch (e) {
+          onStatus(
+            `[${pipeline.name}] 保存到工程失败：${e instanceof Error ? e.message : String(e)}`,
+            'error',
+          );
+        }
+      }
+
       onUpdate(pipeline.id, {
         ...pipeline,
         nodeStates: pipeline.nodeStates.map((v, idx) => {
@@ -142,45 +300,39 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
           }
           return v;
         }),
-        extraction: { ...extraction, resultUrl: url, error: undefined },
+        extraction: { ...extraction, resultUrl: url, resultFile: savedFile, error: undefined },
       });
       onStatus(`[${pipeline.name}] Extraction 完成`, 'success');
-
-      // 持久化到工程目录 page2_highres/01_extraction/
-      // 文件名形如 <pipelineName>_<ts>.png（多 Pipeline 之间隔离）
-      if (project) {
-        try {
-          const blob = await (await fetch(url)).blob();
-          const v = await saveAsset(
-            'page2.extraction',
-            blob,
-            'png',
-            `${pipeline.name} · ${preset.label}`,
-            pipeline.name,
-          );
-          if (v) {
-            onStatus(`[${pipeline.name}] 已保存到工程：${v.file}`, 'success');
-          }
-        } catch (e) {
-          onStatus(
-            `[${pipeline.name}] 保存到工程失败：${e instanceof Error ? e.message : String(e)}`,
-            'error',
-          );
-        }
-      }
+      // Reload the per-pipeline history dropdown.
+      void refreshExtractionHistory();
       return url;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      // SAM3CancelledError → soft revert to "ready" with a warning toast.
+      if (err instanceof SAM3CancelledError) {
+        console.warn('[PartPipeline] SAM3 cancelled:', err);
+        onUpdate(pipeline.id, {
+          ...pipeline,
+          nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 0 ? 'ready' : v)),
+          extraction: { ...extraction, error: undefined },
+        });
+        onStatus(`[${pipeline.name}] 已取消 SAM3 标注`, 'warning');
+        return null;
+      }
+      const friendlyMsg =
+        err instanceof SAM3NotWiredError
+          ? `SAM3 子进程桥接异常（${msg}）`
+          : msg;
       console.error('[PartPipeline] extraction failed:', err);
       onUpdate(pipeline.id, {
         ...pipeline,
         nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 0 ? 'error' : v)),
-        extraction: { ...extraction, error: msg },
+        extraction: { ...extraction, error: friendlyMsg },
       });
-      onStatus(`[${pipeline.name}] Extraction 失败：${msg}`, 'error');
+      onStatus(`[${pipeline.name}] Extraction 失败：${friendlyMsg}`, 'error');
       return null;
     }
-  }, [pipeline, extraction, sourceFile, onStatus, onUpdate, project, saveAsset]);
+  }, [pipeline, extraction, sourceFile, onStatus, onUpdate, project, saveAsset, saveSegments, refreshExtractionHistory]);
 
   const runNode = useCallback(
     (i: number) => {
@@ -317,25 +469,12 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
             const expanded = !!pipeline.expanded[i];
 
             const headerExtra =
-              node.id === 'extraction' ? (
-                <select
-                  value={extraction.mode}
-                  onChange={(e) => updateExtraction({ mode: e.target.value as ExtractionMode })}
-                  onClick={(e) => e.stopPropagation()}
-                  title="切换提取模式"
-                  style={{
-                    background: 'var(--bg-app)',
-                    color: 'var(--text-primary)',
-                    border: '1px solid var(--border-default)',
-                    fontSize: 10,
-                    padding: '2px 4px',
-                    borderRadius: 2,
-                    maxWidth: 130,
-                  }}
-                >
-                  <option value="banana">{EXTRACTION_MODE_LABEL.banana}</option>
-                  <option value="sam3">{EXTRACTION_MODE_LABEL.sam3}</option>
-                </select>
+              node.id === 'extraction' && project && extractionHistory.length > 0 ? (
+                <HistoryDropdown
+                  history={extractionHistory}
+                  selected={extraction.resultFile ?? undefined}
+                  onSelect={handleSelectExtractionHistory}
+                />
               ) : undefined;
 
             const displayType =
@@ -351,9 +490,12 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
                     mode={extraction.mode}
                     promptIndex={extraction.promptIndex}
                     resultUrl={extraction.resultUrl}
+                    resultFile={extraction.resultFile ?? null}
                     sourceUrl={sourceUrl}
                     error={extraction.error}
+                    onModeChange={(m) => updateExtraction({ mode: m })}
                     onPromptChange={(idx) => updateExtraction({ promptIndex: idx })}
+                    onCopyPath={handleCopyExtractionPath}
                     label={`${pipeline.name} · ${node.title}`}
                   />
                 ) : (
@@ -369,6 +511,15 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
 
             const actions = renderPartActions(node, state, i, runNode, setStateAt, splitView, setSplitView);
 
+            // 双击节点正文：图像类节点弹大图预览。
+            const previewImageUrl =
+              node.id === 'extraction'
+                ? extraction.resultUrl ?? sourceUrl
+                : undefined;
+            const onBodyDoubleClick = previewImageUrl
+              ? () => setPreview({ url: previewImageUrl, title: `${i + 1}. ${node.title} · ${pipeline.name}` })
+              : undefined;
+
             return (
               <div key={node.id} style={{ display: 'flex', alignItems: 'center' }}>
                 <NodeCard
@@ -379,6 +530,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
                   expanded={node.optional ? expanded : true}
                   onToggleExpand={node.optional ? () => toggleExpand(i) : undefined}
                   headerExtra={headerExtra}
+                  onBodyDoubleClick={onBodyDoubleClick}
                   actions={actions}
                 >
                   {body}
@@ -391,6 +543,14 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
           })}
         </div>
       </div>
+
+      {preview && (
+        <ImagePreviewModal
+          url={preview.url}
+          title={preview.title}
+          onClose={() => setPreview(null)}
+        />
+      )}
     </div>
   );
 }
@@ -478,9 +638,12 @@ interface ExtractionBodyProps {
   mode: ExtractionMode;
   promptIndex: number;
   resultUrl: string | null;
+  resultFile: string | null;
   sourceUrl: string | null;
   error?: string;
+  onModeChange: (mode: ExtractionMode) => void;
   onPromptChange: (idx: number) => void;
+  onCopyPath: () => void;
   label: string;
 }
 
@@ -489,9 +652,12 @@ function ExtractionBody({
   mode,
   promptIndex,
   resultUrl,
+  resultFile,
   sourceUrl,
   error,
+  onModeChange,
   onPromptChange,
+  onCopyPath,
   label,
 }: ExtractionBodyProps) {
   // Pick the image to preview: result if present, otherwise the source.
@@ -508,6 +674,29 @@ function ExtractionBody({
         imageUrl={previewUrl ?? undefined}
         height={140}
       />
+
+      {/* 提取模式选择器（从节点头部下拉移到正文，给历史下拉腾位置） */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+        <label style={{ fontSize: 10, color: 'var(--text-muted)' }}>提取模式</label>
+        <select
+          value={mode}
+          onChange={(e) => onModeChange(e.target.value as ExtractionMode)}
+          disabled={state === 'running'}
+          title="切换提取模式"
+          style={{
+            background: 'var(--bg-app)',
+            color: 'var(--text-primary)',
+            border: '1px solid var(--border-default)',
+            fontSize: 11,
+            padding: '3px 4px',
+            borderRadius: 2,
+            width: '100%',
+          }}
+        >
+          <option value="banana">{EXTRACTION_MODE_LABEL.banana}</option>
+          <option value="sam3">{EXTRACTION_MODE_LABEL.sam3}</option>
+        </select>
+      </div>
 
       {mode === 'banana' ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -542,16 +731,54 @@ function ExtractionBody({
       ) : (
         <div
           style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 4,
             fontSize: 10,
             color: 'var(--text-muted)',
             padding: '6px 8px',
             border: '1px dashed var(--border-default)',
             borderRadius: 2,
-            textAlign: 'center',
+            lineHeight: 1.5,
           }}
         >
-          SAM3 切割模式 — 待实现
+          <div style={{ color: 'var(--text-secondary)', fontWeight: 600 }}>
+            SAM3 切割模式
+          </div>
+          <div>
+            点击下方"生成"按钮，会弹出 SAM3 标注窗口并自动加载源 Multi-View 图。
+            在窗口中完成点选/框选后点"导出 JSON"，窗口会自动关闭并把结果回传到这里。
+          </div>
+          {!sourceUrl && (
+            <div style={{ color: 'var(--accent-yellow, #d49b3b)', marginTop: 2 }}>
+              未检测到源图片：请先在 Page1 生成 Multi-View
+            </div>
+          )}
         </div>
+      )}
+
+      {/* 复制路径（浏览器无法直接 reveal in folder） */}
+      {resultFile && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onCopyPath(); }}
+          onDoubleClick={(e) => e.stopPropagation()}
+          title={`复制图片所在文件夹的绝对路径到剪贴板\n文件名：${resultFile}`}
+          style={{
+            background: 'var(--bg-app)',
+            color: 'var(--text-secondary)',
+            border: '1px solid var(--border-default)',
+            fontSize: 10,
+            padding: '2px 6px',
+            borderRadius: 2,
+            cursor: 'pointer',
+            textAlign: 'left',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          📋 复制所在文件夹路径
+        </button>
       )}
 
       {error && (
@@ -561,4 +788,52 @@ function ExtractionBody({
       )}
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// History dropdown (与 Page1 保持一致的样式)
+// ---------------------------------------------------------------------------
+
+interface HistoryDropdownProps {
+  history: AssetVersion[];
+  selected?: string;
+  onSelect: (fileName: string) => void;
+}
+
+function HistoryDropdown({ history, selected, onSelect }: HistoryDropdownProps) {
+  return (
+    <select
+      value={selected ?? ''}
+      onChange={(e) => onSelect(e.target.value)}
+      onClick={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
+      title="选择历史版本"
+      style={{
+        background: 'var(--bg-surface-3)',
+        color: 'var(--text-primary)',
+        border: '1px solid var(--border-default)',
+        borderRadius: 3,
+        fontSize: 10,
+        padding: '1px 4px',
+        maxWidth: 130,
+      }}
+    >
+      {!selected && <option value="" disabled>选择历史版本…</option>}
+      {history.map((v) => (
+        <option key={v.file} value={v.file}>
+          {prettyVersionLabel(v)}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function prettyVersionLabel(v: AssetVersion): string {
+  try {
+    const d = new Date(v.timestamp);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  } catch {
+    return v.file;
+  }
 }
