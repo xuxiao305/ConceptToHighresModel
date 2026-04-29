@@ -60,6 +60,9 @@ interface DualViewportProps {
   tarCandidateVertices?: number[];
   srcCandidateColor?: string;
   tarCandidateColor?: string;
+  /** Generic debug point layers per side (saliency pool, FPS, etc.) */
+  srcPointLayers?: Array<{ indices: number[]; color: string; size?: number; opacity?: number }>;
+  tarPointLayers?: Array<{ indices: number[]; color: string; size?: number; opacity?: number }>;
 }
 
 export function DualViewport({
@@ -98,6 +101,8 @@ export function DualViewport({
   tarCandidateVertices,
   srcCandidateColor,
   tarCandidateColor,
+  srcPointLayers,
+  tarPointLayers,
 }: DualViewportProps) {
   const cameraSyncEnabled = useCameraSyncStore((s) => s.syncEnabled);
   const setCameraSyncEnabled = useCameraSyncStore((s) => s.setSyncEnabled);
@@ -164,6 +169,7 @@ export function DualViewport({
             highlightColor={srcHighlightColor}
             candidateVertices={srcCandidateVertices}
             candidateColor={srcCandidateColor}
+            pointLayers={srcPointLayers}
           />
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
@@ -190,6 +196,7 @@ export function DualViewport({
             highlightColor={tarHighlightColor}
             candidateVertices={tarCandidateVertices}
             candidateColor={tarCandidateColor}
+            pointLayers={tarPointLayers}
           />
         </div>
       </div>

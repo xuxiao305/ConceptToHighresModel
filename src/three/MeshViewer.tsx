@@ -392,6 +392,17 @@ export interface MeshViewerProps {
   candidateVertices?: number[];
   /** Color for the candidate set (default '#ffffff') */
   candidateColor?: string;
+  /**
+   * Generic debug point layers — render multiple independent point sets
+   * with their own color/size/opacity.  Each layer is drawn after
+   * highlight + candidate sets.
+   */
+  pointLayers?: Array<{
+    indices: number[];
+    color: string;
+    size?: number;
+    opacity?: number;
+  }>;
 }
 
 export function MeshViewer({
@@ -428,6 +439,7 @@ export function MeshViewer({
   highlightColor = '#7df0ff',
   candidateVertices,
   candidateColor = '#ffffff',
+  pointLayers,
 }: MeshViewerProps) {
   const [meshGeometry, setMeshGeometry] = useState<THREE.BufferGeometry | null>(null);
   const handleGeometryReady = useCallback((geo: THREE.BufferGeometry) => {
@@ -551,6 +563,19 @@ export function MeshViewer({
               size={14}
               opacity={1}
             />
+          )}
+
+          {pointLayers && pointLayers.map((layer, i) =>
+            layer.indices.length > 0 ? (
+              <HighlightPoints
+                key={`pl-${i}-${layer.color}`}
+                vertices={vertices}
+                indices={layer.indices}
+                color={layer.color}
+                size={layer.size ?? 8}
+                opacity={layer.opacity ?? 0.9}
+              />
+            ) : null,
           )}
 
           {landmarks.map((pt) => (

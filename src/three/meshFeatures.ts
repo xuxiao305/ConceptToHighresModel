@@ -198,6 +198,95 @@ export function computeMultiScaleCurvature(
 }
 
 // ---------------------------------------------------------------------------
+// Scale-aware curvature descriptor (geometric radius bins)
+// ---------------------------------------------------------------------------
+
+/**
+ * Density-invariant alternative to `computeMultiScaleCurvature`.
+ *
+ * Why this exists:
+ *   The BFS-ring descriptor uses topological ring distance.  When two
+ *   meshes have very different polygon density (e.g. an arm-only low-poly
+ *   source vs. a hi-res whole-character target), 3 BFS rings on the
+ *   source can cover a huge area while 3 rings on the target cover a
+ *   tiny patch.  The descriptors are then computed at incompatible
+ *   physical scales and matching collapses.
+ *
+ * What this does:
+ *   For each seed, BFS-expand to collect all vertices within Euclidean
+ *   radius `maxRadius`, then bin them by geometric distance into `bins`
+ *   shells.  Each shell stores the average normal-deflection from the
+ *   seed normal — exactly what the BFS version stored, but the bins are
+ *   physically comparable across meshes.
+ *
+ * Output: Float32Array length = vertexIndices.length * bins
+ */
+export function computeScaleAwareCurvature(
+  vertexIndices: number[],
+  vertices: Vec3[],
+  adjacency: MeshAdjacency,
+  maxRadius: number,
+  bins: number,
+): Float32Array {
+  const out = new Float32Array(vertexIndices.length * bins);
+  if (maxRadius <= 0 || bins < 1) return out;
+  const r2Max = maxRadius * maxRadius;
+  const binWidth = maxRadius / bins;
+
+  for (let s = 0; s < vertexIndices.length; s++) {
+    const seed = vertexIndices[s];
+    const seedPos = vertices[seed];
+    const seedNormal = adjacency.vertexNormals[seed];
+    if (!seedPos || !seedNormal) continue;
+
+    const accBuf = new Float64Array(bins);
+    const cntBuf = new Int32Array(bins);
+
+    // BFS-grow within maxRadius
+    const visited = new Set<number>([seed]);
+    let frontier: number[] = [seed];
+    while (frontier.length > 0) {
+      const next: number[] = [];
+      for (const v of frontier) {
+        const neigh = adjacency.vertexNeighbors.get(v);
+        if (!neigh) continue;
+        for (const m of neigh) {
+          if (visited.has(m)) continue;
+          const mp = vertices[m];
+          if (!mp) continue;
+          const dx = mp[0] - seedPos[0];
+          const dy = mp[1] - seedPos[1];
+          const dz = mp[2] - seedPos[2];
+          const d2 = dx * dx + dy * dy + dz * dz;
+          if (d2 > r2Max) continue; // outside radius — also stops BFS branch
+          visited.add(m);
+          next.push(m);
+
+          const nm = adjacency.vertexNormals[m];
+          if (!nm) continue;
+          let cos = seedNormal[0] * nm[0] + seedNormal[1] * nm[1] + seedNormal[2] * nm[2];
+          if (cos > 1) cos = 1;
+          else if (cos < -1) cos = -1;
+          const deflection = Math.acos(cos);
+
+          const dist = Math.sqrt(d2);
+          let bin = Math.floor(dist / binWidth);
+          if (bin >= bins) bin = bins - 1;
+          accBuf[bin] += deflection;
+          cntBuf[bin]++;
+        }
+      }
+      frontier = next;
+    }
+
+    for (let b = 0; b < bins; b++) {
+      out[s * bins + b] = cntBuf[b] > 0 ? accBuf[b] / cntBuf[b] : 0;
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Bounding-volume helpers
 // ---------------------------------------------------------------------------
 

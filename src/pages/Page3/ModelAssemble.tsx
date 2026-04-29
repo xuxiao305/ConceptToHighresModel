@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '../../components/Button';
 import { GLBThumbnail } from '../../components/GLBThumbnail';
+import { OrthoCompareModal } from '../../components/OrthoCompareModal';
 import { useProject } from '../../contexts/ProjectContext';
+import {
+  parseSegmentationJson,
+  regionsUnionBBox,
+  type SegmentationPack,
+} from '../../services/segmentationPack';
 import {
   DualViewport,
   MeshViewer,
@@ -12,13 +18,23 @@ import {
   matchRegionCandidates,
   matchGlobalCandidates,
   ransacFilterCandidates,
+  matchPartialToWhole,
+  computePartialDebug,
   bboxDiagonal,
+  renderOrthoFrontViewWithCamera,
+  loadMaskGray,
+  reprojectMaskToVertices,
+  extractImageSubjectBBox,
   type Vec3,
   type Face3,
   type ViewMode,
   type MeshAdjacency,
   type MeshRegion,
   type LandmarkCandidate,
+  type PartialDebugResult,
+  type SubjectBBox,
+  type OrthoFrontCamera,
+  type MaskReprojectionResult,
 } from '../../three';
 import {
   alignSourceMeshByLandmarks,
@@ -145,6 +161,64 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [ransacAutoApply, setRansacAutoApply] = useState(true);
   const [ransacThresholdPct, setRansacThresholdPct] = useState(5);
   const [ransacIterations, setRansacIterations] = useState(300);
+
+  // ── Partial-to-whole (Phase 2.6) ──────────────────────────────────────
+  const [partialSrcSamples, setPartialSrcSamples] = useState(20);
+  const [partialTarSamples, setPartialTarSamples] = useState(80);
+  const [partialTopK, setPartialTopK] = useState(5);
+  const [partialThresholdPct, setPartialThresholdPct] = useState(5);
+  const [partialIterations, setPartialIterations] = useState(600);
+  const [partialDescriptor, setPartialDescriptor] = useState<'curvature' | 'fpfh'>('fpfh');
+  const [partialSeedWeight, setPartialSeedWeight] = useState(2.0);
+  // PCA axial+radial feature weight. Critical for cylindrical parts
+  // like arms / legs where pure FPFH collapses to a single feature.
+  const [partialAxialWeight, setPartialAxialWeight] = useState(5.0);
+  const [partialLoading, setPartialLoading] = useState(false);
+
+  // ── Phase 1 debug visualization ───────────────────────────────────────
+  const [partialDebug, setPartialDebug] = useState<PartialDebugResult | null>(null);
+  const [showSaliency, setShowSaliency] = useState(true);
+  const [showFPS, setShowFPS] = useState(true);
+  const [showTopK, setShowTopK] = useState(true);
+
+  // ── 2D localization (SAM3) state ──────────────────────────────────────
+  // Used to verify that an external 2D image (e.g. concept art / Bot.png)
+  // aligns with an orthographic front render of the target mesh, before
+  // we wire mask → vertex reprojection.
+  const [refImageUrl, setRefImageUrl] = useState<string | null>(null);
+  const [refImageName, setRefImageName] = useState<string | null>(null);
+  const [refImageSize, setRefImageSize] = useState<{ w: number; h: number } | null>(null);
+  const [refSubjectBBox, setRefSubjectBBox] = useState<SubjectBBox | null>(null);
+  const [maskImageUrl, setMaskImageUrl] = useState<string | null>(null);
+  const [maskImageName, setMaskImageName] = useState<string | null>(null);
+  // Optional segmentation.json sidecar (SAM3 export). When present its
+  // union of region bboxes is the most reliable framing source.
+  const [segPack, setSegPack] = useState<SegmentationPack | null>(null);
+  const [segPackName, setSegPackName] = useState<string | null>(null);
+  const [orthoRenderUrl, setOrthoRenderUrl] = useState<string | null>(null);
+  // Camera that was actually used for the most recent render. Required
+  // for mask reprojection so the projection used to interpret a mask
+  // matches the one used to render it.
+  const [orthoCamera, setOrthoCamera] = useState<OrthoFrontCamera | null>(null);
+  const [maskReproj, setMaskReproj] = useState<MaskReprojectionResult | null>(null);
+  const [showOrthoCompare, setShowOrthoCompare] = useState(false);
+  // Auto-fit is the default; users only override these manually if the
+  // automatic subject-bbox extraction misjudges the image.
+  const [autoFit, setAutoFit] = useState(true);
+  const [orthoScale, setOrthoScale] = useState(1.0);
+  const [orthoOffsetX, setOrthoOffsetX] = useState(0);
+  const [orthoOffsetY, setOrthoOffsetY] = useState(0);
+  const refImageInputRef = useRef<HTMLInputElement | null>(null);
+  const maskImageInputRef = useRef<HTMLInputElement | null>(null);
+  const segJsonInputRef = useRef<HTMLInputElement | null>(null);
+
+  // The bbox actually used for fitting: JSON union > image auto-extract.
+  const fitBBox = useMemo(() => {
+    if (segPack) return regionsUnionBBox(segPack.regions);
+    return refSubjectBBox
+      ? { x: refSubjectBBox.x, y: refSubjectBBox.y, w: refSubjectBBox.w, h: refSubjectBBox.h }
+      : null;
+  }, [segPack, refSubjectBBox]);
 
   const srcAdjacency: MeshAdjacency = useMemo(
     () => buildMeshAdjacency(srcMesh.vertices, srcMesh.faces),
@@ -334,6 +408,423 @@ export function ModelAssemble({ onStatusChange }: Props) {
     );
   }, [candidates, tarMesh, ransacIterations, ransacThresholdPct, onStatusChange]);
 
+  const handleFindPartial = useCallback(() => {
+    if (srcMesh.vertices.length === 0 || tarMesh.vertices.length === 0) {
+      onStatusChange('Source/Target 尚未加载', 'warning');
+      return;
+    }
+    setPartialLoading(true);
+    // Defer to next frame so React can render the loading state first
+    setTimeout(() => {
+    const t0 = performance.now();
+    const r = matchPartialToWhole(
+      { vertices: srcMesh.vertices, adjacency: srcAdjacency },
+      { vertices: tarMesh.vertices, adjacency: tarAdjacency },
+      {
+        numSrcSamples: partialSrcSamples,
+        numTarSamples: partialTarSamples,
+        topK: partialTopK,
+        iterations: partialIterations,
+        inlierThreshold: partialThresholdPct / 100,
+        descriptor: partialDescriptor,
+        tarSeedCentroid: tarRegion?.centroid,
+        tarSeedRadius: tarRegion?.boundingRadius,
+        tarSeedWeight: tarRegion ? partialSeedWeight : 0,
+        tarConstraintVertices: tarRegion?.vertices,
+        axialWeight: partialAxialWeight,
+      },
+    );
+    const dt = performance.now() - t0;
+    if (!r.matrix4x4 || r.pairs.length < 3) {
+      setCandidates([]);
+      setAcceptedCandidateIds(new Set());
+      onStatusChange(
+        `部分匹配失败：inliers=${r.bestInlierCount}（threshold=${(partialThresholdPct).toFixed(1)}% src bbox）` +
+          ` — 试着加大 topK / 迭代数 / threshold`,
+        'error',
+      );
+      setPartialLoading(false);
+      return;
+    }
+    setCandidates(r.pairs);
+    setAcceptedCandidateIds(new Set());
+    onStatusChange(
+      `部分匹配：${r.pairs.length} 对（RMSE=${r.rmse.toFixed(4)} src 单位） — ${dt.toFixed(1)}ms`,
+      'success',
+    );
+    setPartialLoading(false);
+    }, 16);
+  }, [
+    srcMesh,
+    tarMesh,
+    srcAdjacency,
+    tarAdjacency,
+    partialSrcSamples,
+    partialTarSamples,
+    partialTopK,
+    partialIterations,
+    partialThresholdPct,
+    partialDescriptor,
+    partialSeedWeight,
+    partialAxialWeight,
+    tarRegion,
+    onStatusChange,
+  ]);
+
+  const handleRunPartialDebug = useCallback(() => {
+    if (srcMesh.vertices.length === 0 || tarMesh.vertices.length === 0) {
+      onStatusChange('Source/Target 尚未加载', 'warning');
+      return;
+    }
+    setPartialLoading(true);
+    setTimeout(() => {
+    const t0 = performance.now();
+    const dbg = computePartialDebug(
+      { vertices: srcMesh.vertices, adjacency: srcAdjacency },
+      { vertices: tarMesh.vertices, adjacency: tarAdjacency },
+      {
+        numSrcSamples: partialSrcSamples,
+        numTarSamples: partialTarSamples,
+        topK: partialTopK,
+        descriptor: partialDescriptor,
+        tarSeedCentroid: tarRegion?.centroid,
+        tarSeedRadius: tarRegion?.boundingRadius,
+        tarSeedWeight: tarRegion ? partialSeedWeight : 0,
+        tarConstraintVertices: tarRegion?.vertices,
+        axialWeight: partialAxialWeight,
+      },
+    );
+    const dt = performance.now() - t0;
+    setPartialDebug(dbg);
+    onStatusChange(
+      `调试快照: 显著池 src=${dbg.srcSaliencyTop.length} tar=${dbg.tarSaliencyTop.length}` +
+        ` | FPS src=${dbg.srcFPS.length} tar=${dbg.tarFPS.length}` +
+        ` | 平均最佳 top-1 距离=${dbg.avgBestDist.toFixed(4)} — ${dt.toFixed(1)}ms`,
+      'info',
+    );
+    setPartialLoading(false);
+    }, 16);
+  }, [
+    srcMesh,
+    tarMesh,
+    srcAdjacency,
+    tarAdjacency,
+    partialSrcSamples,
+    partialTarSamples,
+    partialTopK,
+    partialDescriptor,
+    partialSeedWeight,
+    partialAxialWeight,
+    tarRegion,
+    onStatusChange,
+  ]);
+
+  const handleClearPartialDebug = useCallback(() => {
+    setPartialDebug(null);
+  }, []);
+
+  // ── 2D localization handlers ──────────────────────────────────────────
+
+  const loadImageDimensions = (url: string): Promise<{ w: number; h: number }> =>
+    new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
+      img.onerror = () => reject(new Error('image decode failed'));
+      img.src = url;
+    });
+
+  const handleLoadRefImage = useCallback(async (file: File) => {
+    const url = URL.createObjectURL(file);
+    try {
+      const size = await loadImageDimensions(url);
+      setRefImageUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return url;
+      });
+      setRefImageName(file.name);
+      setRefImageSize(size);
+      // Invalidate any stale ortho render — its size may not match.
+      setOrthoRenderUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+      // Auto-extract subject bbox so the renderer can fit the target
+      // mesh to the same image-space framing as the reference image.
+      try {
+        const bbox = await extractImageSubjectBBox(url);
+        setRefSubjectBBox(bbox);
+        if (bbox) {
+          onStatusChange(
+            `已加载参考图：${file.name} (${size.w}×${size.h}) · 主体 bbox=${bbox.w}×${bbox.h}@(${bbox.x},${bbox.y}) [${bbox.method}]`,
+            'success',
+          );
+        } else {
+          onStatusChange(
+            `已加载参考图：${file.name} (${size.w}×${size.h}) · 主体检测失败，将退化为铺满拟合`,
+            'warning',
+          );
+        }
+      } catch {
+        setRefSubjectBBox(null);
+        onStatusChange(
+          `已加载参考图：${file.name} (${size.w}×${size.h}) · 主体提取异常`,
+          'warning',
+        );
+      }
+    } catch (err) {
+      URL.revokeObjectURL(url);
+      onStatusChange(
+        `参考图加载失败：${err instanceof Error ? err.message : '未知错误'}`,
+        'error',
+      );
+    }
+  }, [onStatusChange]);
+
+  const handleLoadMaskImage = useCallback(async (file: File) => {
+    const url = URL.createObjectURL(file);
+    try {
+      const size = await loadImageDimensions(url);
+      if (refImageSize && (size.w !== refImageSize.w || size.h !== refImageSize.h)) {
+        URL.revokeObjectURL(url);
+        onStatusChange(
+          `Mask 尺寸 ${size.w}×${size.h} 与参考图 ${refImageSize.w}×${refImageSize.h} 不一致`,
+          'error',
+        );
+        return;
+      }
+      setMaskImageUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return url;
+      });
+      setMaskImageName(file.name);
+      onStatusChange(`已加载 SAM3 mask：${file.name}`, 'success');
+    } catch (err) {
+      URL.revokeObjectURL(url);
+      onStatusChange(
+        `Mask 加载失败：${err instanceof Error ? err.message : '未知错误'}`,
+        'error',
+      );
+    }
+  }, [refImageSize, onStatusChange]);
+
+  const handleRenderOrtho = useCallback(() => {
+    if (!refImageSize) {
+      onStatusChange('请先加载参考图（用于决定渲染尺寸）', 'warning');
+      return;
+    }
+    if (tarMesh.vertices.length === 0 || tarMesh.faces.length === 0) {
+      onStatusChange('Target mesh 为空，无法渲染正视图', 'warning');
+      return;
+    }
+    try {
+      const useAuto = autoFit && !!fitBBox;
+      const { dataUrl, camera } = renderOrthoFrontViewWithCamera(
+        tarMesh.vertices,
+        tarMesh.faces,
+        {
+          width: refImageSize.w,
+          height: refImageSize.h,
+          background: null,
+          meshColor: '#dddddd',
+          ...(useAuto
+            ? { fitToImageBBox: fitBBox! }
+            : {
+                scale: orthoScale,
+                offsetX: orthoOffsetX,
+                offsetY: orthoOffsetY,
+              }),
+        },
+      );
+      setOrthoRenderUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return dataUrl;
+      });
+      setOrthoCamera(camera);
+      // Render geometry/camera changed → previous reprojection is stale.
+      setMaskReproj(null);
+      if (useAuto) {
+        const b = fitBBox!;
+        const src = segPack ? `${segPack.regions.length}-region 并集` : '图像主体';
+        onStatusChange(
+          `已渲染 Target 正视图 ${refImageSize.w}×${refImageSize.h} · 自动拟合到 ${src} ${b.w}×${b.h}@(${b.x},${b.y})`,
+          'success',
+        );
+      } else {
+        onStatusChange(
+          `已渲染 Target 正交正视图 ${refImageSize.w}×${refImageSize.h}` +
+            ` · scale=${orthoScale.toFixed(2)} offset=(${orthoOffsetX.toFixed(2)}, ${orthoOffsetY.toFixed(2)})`,
+          'success',
+        );
+      }
+    } catch (err) {
+      onStatusChange(
+        `渲染失败：${err instanceof Error ? err.message : '未知错误'}`,
+        'error',
+      );
+    }
+  }, [refImageSize, tarMesh, autoFit, fitBBox, segPack, orthoScale, orthoOffsetX, orthoOffsetY, onStatusChange]);
+
+  // Reproject the SAM3 mask onto Target mesh vertices using the camera
+  // captured from the most recent ortho render. Output: per-region
+  // vertex sets that downstream code can use as semantic priors.
+  const handleReprojectMask = useCallback(async () => {
+    if (!orthoCamera) {
+      onStatusChange('请先点 “渲染 Target 正视图” 锁定虚拟相机', 'warning');
+      return;
+    }
+    if (!segPack) {
+      onStatusChange('请先加载 segmentation.json', 'warning');
+      return;
+    }
+    if (!maskImageUrl) {
+      onStatusChange('请先加载 mask 图（segmentation_mask.png）', 'warning');
+      return;
+    }
+    try {
+      const t0 = performance.now();
+      const mask = await loadMaskGray(maskImageUrl);
+      if (!mask) {
+        onStatusChange('mask 解码失败', 'error');
+        return;
+      }
+      const result = reprojectMaskToVertices(
+        tarMesh.vertices,
+        mask,
+        segPack.regions,
+        orthoCamera,
+        { splatRadiusPx: 1 },
+      );
+      setMaskReproj(result);
+      const stats = Array.from(result.regions.entries())
+        .map(([label, set]) => `${label}=${set.size}`)
+        .join(', ');
+      const dt = performance.now() - t0;
+      onStatusChange(
+        `反投影完成：${stats} · 未命中像素=${result.unassignedPixels} · ${dt.toFixed(1)}ms`,
+        'success',
+      );
+    } catch (err) {
+      onStatusChange(
+        `反投影失败：${err instanceof Error ? err.message : '未知错误'}`,
+        'error',
+      );
+    }
+  }, [orthoCamera, segPack, maskImageUrl, tarMesh, onStatusChange]);
+
+  // Adopt a reprojected SAM3 region as the partial-match Target seed.
+  // Builds a synthetic MeshRegion (centroid + bounding radius) so the
+  // existing soft-seed pipeline picks it up without code changes.
+  const handleAdoptRegionAsTarSeed = useCallback(
+    (label: string) => {
+      if (!maskReproj) return;
+      const set = maskReproj.regions.get(label);
+      if (!set || set.size === 0) {
+        onStatusChange(`区域 "${label}" 没有顶点可用作 seed`, 'warning');
+        return;
+      }
+      let cx = 0, cy = 0, cz = 0;
+      for (const idx of set) {
+        const v = tarMesh.vertices[idx];
+        cx += v[0]; cy += v[1]; cz += v[2];
+      }
+      const inv = 1 / set.size;
+      const centroid: Vec3 = [cx * inv, cy * inv, cz * inv];
+      let r2max = 0;
+      for (const idx of set) {
+        const v = tarMesh.vertices[idx];
+        const dx = v[0] - centroid[0];
+        const dy = v[1] - centroid[1];
+        const dz = v[2] - centroid[2];
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 > r2max) r2max = d2;
+      }
+      const boundingRadius = Math.sqrt(r2max);
+      // Synthetic MeshRegion. seedVertex is just any member; vertexLayer
+      // is empty because BFS layer info isn't applicable to a reprojected
+      // set. Downstream consumers (partial-match) only read centroid +
+      // boundingRadius + vertices, so the rest is cosmetic.
+      const seedVertex = set.values().next().value as number;
+      const region: MeshRegion = {
+        seedVertex,
+        vertices: new Set(set),
+        vertexLayer: new Map(),
+        centroid,
+        boundingRadius,
+        finalSteps: 0,
+        stopReason: 'frontier-empty',
+      };
+      setTarRegion(region);
+      onStatusChange(
+        `已将 SAM3 区域 "${label}" (${set.size} 顶点) 设为 Target seed · 中心=(${centroid[0].toFixed(3)}, ${centroid[1].toFixed(3)}, ${centroid[2].toFixed(3)}) · 半径=${boundingRadius.toFixed(3)}`,
+        'success',
+      );
+    },
+    [maskReproj, tarMesh, onStatusChange],
+  );
+
+  const onRefImageFileChange = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      await handleLoadRefImage(file);
+      e.currentTarget.value = '';
+    },
+    [handleLoadRefImage],
+  );
+
+  const onMaskImageFileChange = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      await handleLoadMaskImage(file);
+      e.currentTarget.value = '';
+    },
+    [handleLoadMaskImage],
+  );
+
+  // segmentation.json sidecar (multi-region SAM3 export). When loaded
+  // we adopt its region bboxes as the most reliable framing source and
+  // ignore image-based subject extraction.
+  const handleLoadSegJson = useCallback(async (file: File) => {
+    try {
+      const text = await file.text();
+      const pack = parseSegmentationJson(text);
+      setSegPack(pack);
+      setSegPackName(file.name);
+      const union = regionsUnionBBox(pack.regions);
+      onStatusChange(
+        `已加载 ${file.name} · ${pack.regions.length} 个区域：${pack.regions.map((r) => r.label).join(', ')}` +
+          (union ? ` · 并集 bbox ${union.w}×${union.h}@(${union.x},${union.y})` : ''),
+        'success',
+      );
+    } catch (err) {
+      onStatusChange(
+        `segmentation.json 解析失败：${err instanceof Error ? err.message : '未知错误'}`,
+        'error',
+      );
+    }
+  }, [onStatusChange]);
+
+  const onSegJsonFileChange = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      await handleLoadSegJson(file);
+      e.currentTarget.value = '';
+    },
+    [handleLoadSegJson],
+  );
+
+  // Cleanup blob URLs on unmount.
+  useEffect(() => {
+    return () => {
+      if (refImageUrl) URL.revokeObjectURL(refImageUrl);
+      if (maskImageUrl) URL.revokeObjectURL(maskImageUrl);
+      if (orthoRenderUrl) URL.revokeObjectURL(orthoRenderUrl);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Stale-candidate guard: invalidate suggestions when seed regions change.
   useEffect(() => {
     setCandidates([]);
@@ -372,6 +863,55 @@ export function ModelAssemble({ onStatusChange }: Props) {
     });
     return out.length > 0 ? out : undefined;
   }, [candidates, acceptedCandidateIds]);
+
+  // Phase 1 debug visualization layers (saliency + FPS + topK)
+  const srcDebugLayers = useMemo(() => {
+    if (!partialDebug) return undefined;
+    const layers: Array<{ indices: number[]; color: string; size?: number; opacity?: number }> = [];
+    if (showSaliency) {
+      layers.push({ indices: partialDebug.srcSaliencyTop, color: '#39e87a', size: 4, opacity: 0.5 });
+    }
+    if (showFPS) {
+      layers.push({ indices: partialDebug.srcFPS, color: '#7df0ff', size: 12, opacity: 1 });
+    }
+    return layers.length > 0 ? layers : undefined;
+  }, [partialDebug, showSaliency, showFPS]);
+
+  const tarDebugLayers = useMemo(() => {
+    const layers: Array<{ indices: number[]; color: string; size?: number; opacity?: number }> = [];
+    // SAM3 reprojection layer (always visible when present, sits below
+    // the partial-match debug layers so the user can compare).
+    if (maskReproj) {
+      // Stable per-label color palette.
+      const palette = ['#ff5e6c', '#7bd57f', '#5fb3ff', '#ffd84a', '#c69cff', '#ffa05c'];
+      let i = 0;
+      for (const [, set] of maskReproj.regions) {
+        layers.push({
+          indices: Array.from(set),
+          color: palette[i % palette.length],
+          size: 6,
+          opacity: 0.85,
+        });
+        i++;
+      }
+    }
+    if (partialDebug) {
+      if (showSaliency) {
+        layers.push({ indices: partialDebug.tarSaliencyTop, color: '#996b3a', size: 4, opacity: 0.5 });
+      }
+      if (showFPS) {
+        layers.push({ indices: partialDebug.tarFPS, color: '#ffb066', size: 10, opacity: 1 });
+      }
+      if (showTopK) {
+        const set = new Set<number>();
+        for (const m of partialDebug.topKMatches) {
+          for (const t of m.matches) set.add(t.tarVertex);
+        }
+        layers.push({ indices: Array.from(set), color: '#ff66ff', size: 14, opacity: 1 });
+      }
+    }
+    return layers.length > 0 ? layers : undefined;
+  }, [maskReproj, partialDebug, showSaliency, showFPS, showTopK]);
 
   const resetPreview = useCallback(() => {
     if (alignResult) setAlignResult(null);
@@ -502,6 +1042,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
         setTarMesh(mesh);
         setSelectedTarIndex(null);
         setTarRegion(null);
+        // Camera & reprojection are bound to the previous mesh — drop them.
+        setOrthoCamera(null);
+        setMaskReproj(null);
       }
       clearAllLandmarks();
       resetPreview();
@@ -672,7 +1215,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
 
   const restoreDemo = useCallback(async () => {
     const srcUrl = '/demo/alignmenttest_arm_hires.glb';
-    const tarUrl = '/demo/alignmenttest_arm_hires_Deformed.glb';
+    const tarUrl = '/demo/alignmenttest_bot.glb';
     try {
       onStatusChange('正在加载 Demo: alignmenttest_arm_hires (源 + 形变)…', 'info');
       const [srcLoaded, tarLoaded] = await Promise.all([
@@ -724,6 +1267,16 @@ export function ModelAssemble({ onStatusChange }: Props) {
     }
   }, [clearAllLandmarks, demoTarget, onStatusChange]);
 
+  const debugLabelStyle: React.CSSProperties = {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    fontSize: 11,
+    color: 'var(--text-muted)',
+    marginBottom: 6,
+    cursor: 'pointer',
+  };
+
   return (
     <div
       style={{
@@ -754,7 +1307,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
               onClick={() => {
                 void restoreDemo();
               }}
-              title="加载 alignmenttest_arm_hires.glb (源) + alignmenttest_arm_hires_Deformed.glb (形变)"
+              title="加载 alignmenttest_arm_hires.glb (源手臂) + alignmenttest_bot.glb (整身角色)"
             >
               加载 Demo (arm hires)
             </Button>
@@ -769,6 +1322,330 @@ export function ModelAssemble({ onStatusChange }: Props) {
             Target: {tarMesh.name}
             <br />
             V/F: {tarMesh.vertices.length} / {tarMesh.faces.length}
+          </div>
+        </PanelSection>
+
+        <PanelSection title="2D 定位 (SAM3 验证)">
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
+            用一张参考图（概念图 / Bot.png）+ SAM3 mask，对照 Target 的正交正视渲染图，
+            肉眼判断标准虚拟相机是否对齐。三层叠加：参考图 / mask / 正视渲染。
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <Button size="sm" onClick={() => refImageInputRef.current?.click()}>
+              加载参考图
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => maskImageInputRef.current?.click()}
+              disabled={!refImageUrl}
+              title={refImageUrl ? '加载 SAM3 mask（需与参考图同分辨率）' : '请先加载参考图'}
+            >
+              加载 Mask
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => segJsonInputRef.current?.click()}
+              title="加载 SAM3 多区域 segmentation.json（提供最可靠的拟合 bbox）"
+            >
+              加载 segmentation.json
+            </Button>
+            <Button
+              size="sm"
+              variant="primary"
+              onClick={handleRenderOrtho}
+              disabled={!refImageSize || tarMesh.vertices.length === 0}
+              title={
+                !refImageSize
+                  ? '请先加载参考图以确定渲染尺寸'
+                  : '按参考图分辨率渲染 Target 的正交正视图'
+              }
+            >
+              渲染 Target 正视图
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => setShowOrthoCompare(true)}
+              disabled={!refImageUrl && !maskImageUrl && !orthoRenderUrl}
+            >
+              三图叠加对照
+            </Button>
+            <Button
+              size="sm"
+              variant="primary"
+              onClick={() => { void handleReprojectMask(); }}
+              disabled={!orthoCamera || !segPack || !maskImageUrl}
+              title={
+                !orthoCamera
+                  ? '请先点 “渲染 Target 正视图” 锁定相机'
+                  : !segPack
+                    ? '请先加载 segmentation.json'
+                    : !maskImageUrl
+                      ? '请先加载 mask 图'
+                      : '把 mask 各区域反投影到 Target 顶点'
+              }
+            >
+              反投影 mask 到 Target 顶点
+            </Button>
+            {maskReproj && (
+              <Button
+                size="sm"
+                onClick={() => setMaskReproj(null)}
+                title="清除 Target 视口里的反投影高亮"
+              >
+                清除反投影高亮
+              </Button>
+            )}
+          </div>
+
+          {maskReproj && (
+            <div
+              style={{
+                marginTop: 8,
+                padding: 8,
+                border: '1px solid var(--border-default)',
+                borderRadius: 3,
+                background: 'var(--bg-app)',
+                fontSize: 11,
+                color: 'var(--text-secondary)',
+                lineHeight: 1.6,
+              }}
+            >
+              <div style={{ fontWeight: 600, marginBottom: 4, color: 'var(--text-primary)' }}>
+                反投影结果
+              </div>
+              {Array.from(maskReproj.regions.entries()).map(([label, set], i) => {
+                const palette = ['#ff5e6c', '#7bd57f', '#5fb3ff', '#ffd84a', '#c69cff', '#ffa05c'];
+                const color = palette[i % palette.length];
+                const hits = maskReproj.perRegionPixelHits.get(label) ?? 0;
+                const isCurrentSeed =
+                  tarRegion !== null && tarRegion.vertices.size === set.size && set.size > 0 &&
+                  // cheap identity check: first vertex matches
+                  tarRegion.vertices.has(set.values().next().value as number);
+                return (
+                  <div
+                    key={label}
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      gap: 6,
+                    }}
+                  >
+                    <span style={{ flex: 1 }}>
+                      <span style={{ color }}>●</span> {label}
+                    </span>
+                    <span style={{ color: 'var(--text-muted)' }}>
+                      {set.size} 顶点 / {hits} 像素
+                    </span>
+                    <button
+                      onClick={() => handleAdoptRegionAsTarSeed(label)}
+                      title="把该区域作为 partial-match 的 Target 软 seed"
+                      disabled={set.size === 0}
+                      style={{
+                        background: isCurrentSeed ? 'var(--accent-blue)' : 'transparent',
+                        border: `1px solid ${isCurrentSeed ? 'var(--accent-blue)' : 'var(--border-default)'}`,
+                        color: isCurrentSeed ? '#fff' : 'var(--text-secondary)',
+                        padding: '0 6px',
+                        cursor: set.size === 0 ? 'not-allowed' : 'pointer',
+                        borderRadius: 2,
+                        fontSize: 10,
+                        height: 18,
+                      }}
+                    >
+                      {isCurrentSeed ? '✓ seed' : '设为 seed'}
+                    </button>
+                  </div>
+                );
+              })}
+              <div
+                style={{
+                  marginTop: 4,
+                  fontSize: 10,
+                  color: 'var(--text-muted)',
+                }}
+              >
+                未命中像素：{maskReproj.unassignedPixels}
+              </div>
+            </div>
+          )}
+
+          <div style={{ display: 'none' }}>
+            {/* anchor to keep below blocks aligned */}
+          </div>
+
+          <div
+            style={{
+              marginTop: 10,
+              padding: 8,
+              border: '1px solid var(--border-default)',
+              borderRadius: 3,
+              background: 'var(--bg-app)',
+            }}
+          >
+            <label
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                fontSize: 11,
+                color: 'var(--text-secondary)',
+                marginBottom: 6,
+                cursor: 'pointer',
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={autoFit}
+                onChange={(e) => setAutoFit(e.target.checked)}
+              />
+              自动拟合参考图主体（推荐）
+            </label>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6, lineHeight: 1.5 }}>
+              {segPack && fitBBox
+                ? `使用 segmentation.json 区域并集：${fitBBox.w}×${fitBBox.h}@(${fitBBox.x},${fitBBox.y}) · ${segPack.regions.length} 区域`
+                : refSubjectBBox
+                  ? `已检测主体 bbox：${refSubjectBBox.w}×${refSubjectBBox.h}@(${refSubjectBBox.x},${refSubjectBBox.y}) [${refSubjectBBox.method}]`
+                  : refImageUrl
+                    ? '未检测到清晰主体，将退化为铺满拟合或手动模式'
+                    : '加载参考图后会自动提取主体 bbox'}
+            </div>
+
+            <div
+              style={{
+                fontSize: 11,
+                color: 'var(--text-secondary)',
+                marginTop: 4,
+                marginBottom: 6,
+                opacity: autoFit ? 0.4 : 1,
+              }}
+            >
+              手动微调（autoFit 关闭时生效）
+            </div>
+
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              缩放 (scale)
+            </div>
+            <input
+              type="range"
+              min={0.4}
+              max={1.5}
+              step={0.01}
+              value={orthoScale}
+              onChange={(e) => setOrthoScale(Number(e.target.value))}
+              disabled={autoFit}
+              style={{ width: '100%' }}
+            />
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+              {orthoScale.toFixed(2)}× {orthoScale < 1 ? '(渲染会变小)' : orthoScale > 1 ? '(渲染会变大)' : ''}
+            </div>
+
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>水平偏移 X</div>
+            <input
+              type="range"
+              min={-0.5}
+              max={0.5}
+              step={0.005}
+              value={orthoOffsetX}
+              onChange={(e) => setOrthoOffsetX(Number(e.target.value))}
+              disabled={autoFit}
+              style={{ width: '100%' }}
+            />
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+              {orthoOffsetX.toFixed(3)}（正值=右移）
+            </div>
+
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>垂直偏移 Y</div>
+            <input
+              type="range"
+              min={-0.5}
+              max={0.5}
+              step={0.005}
+              value={orthoOffsetY}
+              onChange={(e) => setOrthoOffsetY(Number(e.target.value))}
+              disabled={autoFit}
+              style={{ width: '100%' }}
+            />
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+              {orthoOffsetY.toFixed(3)}（正值=上移）
+            </div>
+
+            <div style={{ display: 'flex', gap: 6 }}>
+              <Button
+                size="sm"
+                onClick={() => {
+                  setOrthoScale(1);
+                  setOrthoOffsetX(0);
+                  setOrthoOffsetY(0);
+                }}
+                disabled={autoFit}
+                style={{ flex: 1, justifyContent: 'center' }}
+              >
+                重置
+              </Button>
+              <Button
+                size="sm"
+                variant="primary"
+                onClick={handleRenderOrtho}
+                disabled={!refImageSize || tarMesh.vertices.length === 0}
+                style={{ flex: 1, justifyContent: 'center' }}
+              >
+                重新渲染
+              </Button>
+            </div>
+          </div>
+
+          <input
+            ref={refImageInputRef}
+            type="file"
+            accept="image/*"
+            style={{ display: 'none' }}
+            onChange={onRefImageFileChange}
+          />
+          <input
+            ref={maskImageInputRef}
+            type="file"
+            accept="image/*"
+            style={{ display: 'none' }}
+            onChange={onMaskImageFileChange}
+          />
+          <input
+            ref={segJsonInputRef}
+            type="file"
+            accept="application/json,.json"
+            style={{ display: 'none' }}
+            onChange={onSegJsonFileChange}
+          />
+
+          <div
+            style={{
+              marginTop: 10,
+              padding: 6,
+              background: 'var(--bg-app)',
+              border: '1px solid var(--border-default)',
+              borderRadius: 3,
+              fontSize: 10,
+              color: 'var(--text-secondary)',
+              lineHeight: 1.6,
+            }}
+          >
+            参考图: {refImageName ?? '(未加载)'}
+            {refImageSize && (
+              <> · {refImageSize.w}×{refImageSize.h}</>
+            )}
+            <br />
+            Mask: {maskImageName ?? '(未加载)'}
+            <br />
+            JSON: {segPackName ?? '(未加载)'}
+            {segPack && (
+              <> · {segPack.regions.length} 区域：{segPack.regions.map((r) => r.label).join(', ')}</>
+            )}
+            <br />
+            正视渲染: {orthoRenderUrl ? '已就绪' : '(未渲染)'}
+          </div>
+
+          <div style={{ marginTop: 8, fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+            约定：相机沿 +X 看向 -X，up=+Y，画面右映射到世界 -Z（角色左侧）。
           </div>
         </PanelSection>
 
@@ -1128,6 +2005,238 @@ export function ModelAssemble({ onStatusChange }: Props) {
           </Button>
         </PanelSection>
 
+        <PanelSection title="部分匹配 (Partial → Whole)">
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
+            适用于 Source 是部件、Target 是包含该部件的整体（如：手臂 → 完整角色）。
+            <br />
+            <span style={{ color: tarRegion ? '#7fd97f' : '#e08a8a', fontWeight: 600 }}>
+              {tarRegion
+                ? `✓ Target seed 中心已设置（半径=${tarRegion.boundingRadius.toFixed(3)}），软约束权重=${partialSeedWeight.toFixed(1)}`
+                : '⚠ 建议先在 Target 上 Seed 一个大概位置（手臂附近），作为软约束提示'}
+            </span>
+          </div>
+
+          {tarRegion && (
+            <>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                Seed 软约束权重（0=禁用，越大越偏向 seed）
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={10}
+                step={0.5}
+                value={partialSeedWeight}
+                onChange={(e) => setPartialSeedWeight(Number(e.target.value))}
+                style={{ width: '100%' }}
+              />
+              <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+                {partialSeedWeight.toFixed(1)}
+              </div>
+            </>
+          )}
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            主轴 (axial) 特征权重（圆柱形部件必备，0=关闭）
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={15}
+            step={0.5}
+            value={partialAxialWeight}
+            onChange={(e) => setPartialAxialWeight(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {partialAxialWeight.toFixed(1)} {partialAxialWeight === 0 ? '(关闭)' : ''}
+          </div>
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            Src 采样数（部件，少而精）
+          </div>
+          <input
+            type="range"
+            min={10}
+            max={80}
+            step={2}
+            value={partialSrcSamples}
+            onChange={(e) => setPartialSrcSamples(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {partialSrcSamples}
+          </div>
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            Tar 采样数（整体，要密）
+          </div>
+          <input
+            type="range"
+            min={50}
+            max={500}
+            step={10}
+            value={partialTarSamples}
+            onChange={(e) => setPartialTarSamples(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {partialTarSamples}
+          </div>
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            每个 src 保留候选数 (top-K)
+          </div>
+          <input
+            type="range"
+            min={1}
+            max={15}
+            step={1}
+            value={partialTopK}
+            onChange={(e) => setPartialTopK(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {partialTopK}
+          </div>
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            inlier 阈值（% of <b>src</b> bbox 对角线）
+          </div>
+          <input
+            type="range"
+            min={1}
+            max={20}
+            step={0.5}
+            value={partialThresholdPct}
+            onChange={(e) => setPartialThresholdPct(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {partialThresholdPct.toFixed(1)}%
+          </div>
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            RANSAC 迭代数（大些更稳）
+          </div>
+          <input
+            type="range"
+            min={100}
+            max={3000}
+            step={100}
+            value={partialIterations}
+            onChange={(e) => setPartialIterations(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {partialIterations}
+          </div>
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>描述子</div>
+          <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+            <Button
+              size="sm"
+              variant={partialDescriptor === 'fpfh' ? 'primary' : 'secondary'}
+              onClick={() => setPartialDescriptor('fpfh')}
+              style={{ flex: 1, justifyContent: 'center' }}
+              title="33-dim 方向直方图，区分度最高，稍慢"
+            >
+              FPFH
+            </Button>
+            <Button
+              size="sm"
+              variant={partialDescriptor === 'curvature' ? 'primary' : 'secondary'}
+              onClick={() => setPartialDescriptor('curvature')}
+              style={{ flex: 1, justifyContent: 'center' }}
+              title="12-dim 尺度感知曲率，快"
+            >
+              曲率
+            </Button>
+          </div>
+
+          <Button
+            size="sm"
+            variant="primary"
+            onClick={handleFindPartial}
+            loading={partialLoading}
+            disabled={partialLoading}
+            style={{ width: '100%', justifyContent: 'center' }}
+          >
+            {partialLoading ? '计算中…' : '部分匹配查找'}
+          </Button>
+          <Button
+            size="sm"
+            onClick={handleRunPartialDebug}
+            loading={partialLoading}
+            disabled={partialLoading}
+            style={{ width: '100%', justifyContent: 'center', marginTop: 6 }}
+            title="只跑前几步（saliency + FPS + top-K），不跑 RANSAC，方便看选点情况"
+          >
+            {partialLoading ? '计算中…' : '调试快照（看选点）'}
+          </Button>
+        </PanelSection>
+
+        {partialDebug && (
+          <PanelSection title="调试可视化">
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
+              暗色 = saliency 池；亮色 = FPS 采样；品红 = top-K 候选集合（target 端）。
+              <br />
+              <span style={{ color: '#39e87a' }}>● Src Saliency</span>{' '}
+              <span style={{ color: '#7df0ff' }}>● Src FPS</span>{' '}
+              <span style={{ color: '#ffb066' }}>● Tar FPS</span>{' '}
+              <span style={{ color: '#ff66ff' }}>● Top-K</span>
+            </div>
+
+            <label style={debugLabelStyle}>
+              <input
+                type="checkbox"
+                checked={showSaliency}
+                onChange={(e) => setShowSaliency(e.target.checked)}
+              />
+              显示 Saliency 池（{partialDebug.srcSaliencyTop.length} / {partialDebug.tarSaliencyTop.length}）
+            </label>
+            <label style={debugLabelStyle}>
+              <input
+                type="checkbox"
+                checked={showFPS}
+                onChange={(e) => setShowFPS(e.target.checked)}
+              />
+              显示 FPS 采样（{partialDebug.srcFPS.length} / {partialDebug.tarFPS.length}）
+            </label>
+            <label style={debugLabelStyle}>
+              <input
+                type="checkbox"
+                checked={showTopK}
+                onChange={(e) => setShowTopK(e.target.checked)}
+              />
+              显示 Top-K 候选合集
+            </label>
+
+            <div
+              style={{
+                marginTop: 8,
+                padding: 6,
+                background: 'var(--bg-app)',
+                border: '1px solid var(--border-default)',
+                borderRadius: 3,
+                fontSize: 10,
+                color: 'var(--text-secondary)',
+                lineHeight: 1.5,
+              }}
+            >
+              平均最佳 top-1 距离：{partialDebug.avgBestDist.toFixed(4)}
+            </div>
+
+            <Button
+              size="sm"
+              onClick={handleClearPartialDebug}
+              style={{ width: '100%', justifyContent: 'center', marginTop: 6 }}
+            >
+              清除调试可视化
+            </Button>
+          </PanelSection>
+        )}
+
         <PanelSection title="候选匹配 (Phase 2)">
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6, lineHeight: 1.5 }}>
             基于 Seed 区域的局部匹配（数量较少，适合精修）。
@@ -1322,6 +2431,8 @@ export function ModelAssemble({ onStatusChange }: Props) {
               tarCandidateVertices={tarCandidateArr}
               srcCandidateColor="#ffffff"
               tarCandidateColor="#fffacd"
+              srcPointLayers={srcDebugLayers}
+              tarPointLayers={tarDebugLayers}
             />
           )}
           {centerViewMode === 'result' && resultPreview && (
@@ -1450,8 +2561,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
 
         {resultPreview && (
           <PanelSection title="Result View">
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
-              <Button
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>              <Button
                 size="sm"
                 variant={resultViewMode === 'overlay' ? 'primary' : 'secondary'}
                 onClick={() => {
@@ -1502,6 +2612,34 @@ export function ModelAssemble({ onStatusChange }: Props) {
           </PanelSection>
         )}
       </aside>
+
+      {showOrthoCompare && refImageSize && (
+        <OrthoCompareModal
+          width={refImageSize.w}
+          height={refImageSize.h}
+          title="2D 定位对照"
+          highlightBBox={fitBBox ?? refSubjectBBox ?? null}
+          onClose={() => setShowOrthoCompare(false)}
+          layers={[
+            ...(refImageUrl
+              ? [{ url: refImageUrl, label: '参考图', defaultOpacity: 1 }]
+              : []),
+            ...(orthoRenderUrl
+              ? [{ url: orthoRenderUrl, label: 'Target 正视渲染', defaultOpacity: 0.6 }]
+              : []),
+            ...(maskImageUrl
+              ? [
+                  {
+                    url: maskImageUrl,
+                    label: 'SAM3 Mask（红色）',
+                    defaultOpacity: 0.5,
+                    tintColor: '#ff3355',
+                  },
+                ]
+              : []),
+          ]}
+        />
+      )}
     </div>
   );
 }

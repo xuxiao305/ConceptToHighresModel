@@ -41,3 +41,26 @@ export { matchGlobalCandidates } from './globalCandidates';
 export type { GlobalMatchOptions } from './globalCandidates';
 export { ransacFilterCandidates } from './ransacAlign';
 export type { RansacOptions, RansacResult } from './ransacAlign';
+export { matchPartialToWhole, computePartialDebug } from './partialMatch';
+export type { PartialMatchOptions, PartialMatchResult, PartialDebugResult } from './partialMatch';
+export { computeFPFH, computeMultiScaleFPFH, FPFH_DIM } from './fpfh';
+export {
+  computeOrthoFrontFrustum,
+  renderOrthoFrontView,
+  renderOrthoFrontViewWithFrustum,
+} from './orthoFrontRender';
+export type { OrthoFrontFrustum, OrthoRenderOptions } from './orthoFrontRender';
+export { renderOrthoFrontViewWithCamera } from './orthoFrontRender';
+export type { OrthoFrontCamera } from './orthoFrontRender';
+export {
+  projectVerticesToImage,
+  buildFrontVertexMap,
+  loadMaskGray,
+  reprojectMaskToVertices,
+} from './maskReproject';
+export type {
+  MaskReprojectionResult,
+  MaskReprojectionOptions,
+} from './maskReproject';
+export { extractImageSubjectBBox } from './imageSubjectBBox';
+export type { SubjectBBox, ExtractOptions as SubjectExtractOptions } from './imageSubjectBBox';
