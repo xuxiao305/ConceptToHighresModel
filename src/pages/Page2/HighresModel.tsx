@@ -19,6 +19,11 @@ const makePart = (idx: number): PartPipelineState => ({
     return arr;
   })(),
   expanded: {},
+  extraction: {
+    mode: 'banana',
+    promptIndex: 0,
+    resultUrl: null,
+  },
 });
 
 export function HighresModel({ onStatusChange }: Props) {

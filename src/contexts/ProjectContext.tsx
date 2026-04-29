@@ -37,7 +37,8 @@ interface ProjectContextValue {
     nodeKey: string,
     blob: Blob,
     ext: string,
-    note?: string
+    note?: string,
+    prefix?: string,
   ) => Promise<AssetVersion | null>;
 
   /** 读取节点最新产物（含 Blob 与 ObjectURL）；未打开 / 无数据返回 null */
@@ -94,9 +95,9 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   );
 
   const saveAsset = useCallback(
-    async (nodeKey: string, blob: Blob, ext: string, note?: string) => {
+    async (nodeKey: string, blob: Blob, ext: string, note?: string, prefix?: string) => {
       if (!project) return null;
-      return await saveNodeAsset(project, nodeKey, blob, ext, note);
+      return await saveNodeAsset(project, nodeKey, blob, ext, note, prefix);
     },
     [project]
   );

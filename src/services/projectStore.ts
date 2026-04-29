@@ -48,7 +48,8 @@ export const NODE_DIRS: Record<string, NodeDir> = {
   'page1.rough':     { pageDir: 'page1_concept_to_rough', nodeDir: '04_rough' },
   'page1.rigging':   { pageDir: 'page1_concept_to_rough', nodeDir: '05_rigging' },
   // Page 2
-  'page2.highres':   { pageDir: 'page2_highres', nodeDir: '01_highres' },
+  'page2.extraction': { pageDir: 'page2_highres', nodeDir: '01_extraction' },
+  'page2.highres':   { pageDir: 'page2_highres', nodeDir: '02_highres' },
   // Page 3 占位（后续节点接入时按需追加）
 };
 
@@ -212,6 +213,7 @@ async function saveIndex(nodeDir: FSDirHandle, idx: NodeIndex): Promise<void> {
  * @param blob    要写入的二进制
  * @param ext     文件扩展名（不带点），如 "png" / "glb"
  * @param note    可选备注
+ * @param prefix  可选文件名前缀（如 pipeline 名），生成 `<prefix>_<ts>.<ext>`
  * @returns 写入的版本信息
  */
 export async function saveNodeAsset(
@@ -219,13 +221,15 @@ export async function saveNodeAsset(
   nodeKey: string,
   blob: Blob,
   ext: string,
-  note?: string
+  note?: string,
+  prefix?: string,
 ): Promise<AssetVersion> {
   const nodeDir = await getNodeDir(handle, nodeKey, true);
   if (!nodeDir) throw new Error(`无法创建节点目录: ${nodeKey}`);
 
   const ts = makeTimestamp();
-  const fileName = `${ts}.${ext.replace(/^\./, '')}`;
+  const safePrefix = prefix ? `${prefix.replace(/[^A-Za-z0-9._-]/g, '_')}_` : '';
+  const fileName = `${safePrefix}${ts}.${ext.replace(/^\./, '')}`;
   await writeFile(nodeDir, fileName, blob);
 
   const idx = await loadIndex(nodeDir);

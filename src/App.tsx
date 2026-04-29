@@ -31,10 +31,21 @@ export default function App() {
     >
       <TopNav active={page} onChange={setPage} onProjectStatus={handleStatus} />
 
-      <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-        {page === 'page1' && <ConceptToRoughModel onStatusChange={handleStatus} />}
-        {page === 'page2' && <HighresModel onStatusChange={handleStatus} />}
-        {page === 'page3' && <ModelAssemble onStatusChange={handleStatus} />}
+      {/*
+        All three pages stay mounted at all times so their internal state
+        (uploads, in-flight generations, node-state machines) survives
+        navigation. Inactive pages are hidden via CSS — never unmounted.
+      */}
+      <div style={{ flex: 1, display: 'flex', overflow: 'hidden', position: 'relative' }}>
+        <PageHost active={page === 'page1'}>
+          <ConceptToRoughModel onStatusChange={handleStatus} />
+        </PageHost>
+        <PageHost active={page === 'page2'}>
+          <HighresModel onStatusChange={handleStatus} />
+        </PageHost>
+        <PageHost active={page === 'page3'}>
+          <ModelAssemble onStatusChange={handleStatus} />
+        </PageHost>
       </div>
 
       <StatusBar
@@ -42,6 +53,33 @@ export default function App() {
         status={status.type}
         rightInfo={`Page: ${pageLabel(page)}`}
       />
+    </div>
+  );
+}
+
+interface PageHostProps {
+  active: boolean;
+  children: React.ReactNode;
+}
+
+/**
+ * Keeps a page mounted while inactive (so its React state and any in-flight
+ * async work is preserved), hiding it via CSS only. `inert` removes inactive
+ * pages from the focus / accessibility tree.
+ */
+function PageHost({ active, children }: PageHostProps) {
+  return (
+    <div
+      // `inert` is a real DOM attribute; React forwards unknown attrs to host
+      // nodes verbatim. Casting via spread to avoid TS complaints.
+      {...(active ? {} : { inert: '' })}
+      style={{
+        flex: 1,
+        display: active ? 'flex' : 'none',
+        overflow: 'hidden',
+      }}
+    >
+      {children}
     </div>
   );
 }

@@ -28,12 +28,31 @@ export interface NodeConfig {
   description?: string;
 }
 
+/**
+ * Extraction node mode:
+ *   - banana: 用 Banana Pro (Gemini) + 文本提示词直接生成提取结果
+ *   - sam3:   使用 SAM3 框选/点选进行分割（待实现）
+ */
+export type ExtractionMode = 'banana' | 'sam3';
+
+export interface ExtractionState {
+  mode: ExtractionMode;
+  /** Banana Pro 当前选中的提示词预设索引 */
+  promptIndex: number;
+  /** 上一次成功生成的图片 blob: URL（用于节点预览） */
+  resultUrl: string | null;
+  /** 错误信息（若有） */
+  error?: string;
+}
+
 export interface PartPipelineState {
   id: string;
   name: string;
   nodeStates: NodeState[];
   /** Optional nodes expanded flag, keyed by node index */
   expanded: Record<number, boolean>;
+  /** Extraction 节点模式 + 结果（在 React state 中维护，未持久化到工程目录） */
+  extraction?: ExtractionState;
 }
 
 export type PageId = 'page1' | 'page2' | 'page3';
