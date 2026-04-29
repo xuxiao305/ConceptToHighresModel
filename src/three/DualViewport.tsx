@@ -50,6 +50,16 @@ interface DualViewportProps {
   /** Labels override */
   srcLabel?: string;
   tarLabel?: string;
+  /** Region-grow highlight: vertex indices to mark */
+  srcHighlightVertices?: number[];
+  tarHighlightVertices?: number[];
+  srcHighlightColor?: string;
+  tarHighlightColor?: string;
+  /** Phase 2 candidate vertices (drawn as larger bright dots) */
+  srcCandidateVertices?: number[];
+  tarCandidateVertices?: number[];
+  srcCandidateColor?: string;
+  tarCandidateColor?: string;
 }
 
 export function DualViewport({
@@ -80,6 +90,14 @@ export function DualViewport({
   srcUpdatedVertices,
   srcLabel = 'Source',
   tarLabel = 'Target',
+  srcHighlightVertices,
+  tarHighlightVertices,
+  srcHighlightColor,
+  tarHighlightColor,
+  srcCandidateVertices,
+  tarCandidateVertices,
+  srcCandidateColor,
+  tarCandidateColor,
 }: DualViewportProps) {
   const cameraSyncEnabled = useCameraSyncStore((s) => s.syncEnabled);
   const setCameraSyncEnabled = useCameraSyncStore((s) => s.setSyncEnabled);
@@ -142,6 +160,10 @@ export function DualViewport({
             cameraSyncId={cameraSyncEnabled ? 'source' : undefined}
             landmarkScreenFraction={landmarkScreenFraction}
             showViewModeToggle={false}
+            highlightVertices={srcHighlightVertices}
+            highlightColor={srcHighlightColor}
+            candidateVertices={srcCandidateVertices}
+            candidateColor={srcCandidateColor}
           />
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
@@ -164,6 +186,10 @@ export function DualViewport({
             cameraSyncId={cameraSyncEnabled ? 'target' : undefined}
             landmarkScreenFraction={landmarkScreenFraction}
             showViewModeToggle={false}
+            highlightVertices={tarHighlightVertices}
+            highlightColor={tarHighlightColor}
+            candidateVertices={tarCandidateVertices}
+            candidateColor={tarCandidateColor}
           />
         </div>
       </div>

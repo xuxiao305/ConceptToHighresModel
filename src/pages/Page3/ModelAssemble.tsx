@@ -7,9 +7,16 @@ import {
   MeshViewer,
   useLandmarkStore,
   loadGlbAsMesh,
+  buildMeshAdjacency,
+  growRegion,
+  matchRegionCandidates,
+  matchGlobalCandidates,
   type Vec3,
   type Face3,
   type ViewMode,
+  type MeshAdjacency,
+  type MeshRegion,
+  type LandmarkCandidate,
 } from '../../three';
 import {
   alignSourceMeshByLandmarks,
@@ -114,6 +121,35 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [selectedGalleryFile, setSelectedGalleryFile] = useState<string | null>(null);
   const [selectedGalleryPreviewUrl, setSelectedGalleryPreviewUrl] = useState<string | null>(null);
 
+  // ── Phase 1 region-grow state ─────────────────────────────────────────
+  const [seedMode, setSeedMode] = useState(false);
+  const [growMaxSteps, setGrowMaxSteps] = useState(15);
+  const [growMaxVertices, setGrowMaxVertices] = useState(2000);
+  const [growCurvatureDeg, setGrowCurvatureDeg] = useState(60);
+  const [srcRegion, setSrcRegion] = useState<MeshRegion | null>(null);
+  const [tarRegion, setTarRegion] = useState<MeshRegion | null>(null);
+
+  // ── Phase 2 candidate matching state ──────────────────────────────────
+  const [numCandidates, setNumCandidates] = useState(5);
+  const [candidates, setCandidates] = useState<LandmarkCandidate[]>([]);
+  const [acceptedCandidateIds, setAcceptedCandidateIds] = useState<Set<number>>(
+    () => new Set(),
+  );
+
+  // ── Whole-mesh global candidates (Phase 2.5) ──────────────────────────
+  const [globalSamples, setGlobalSamples] = useState(60);
+  const [globalRings, setGlobalRings] = useState(3);
+  const [globalRequireMutual, setGlobalRequireMutual] = useState(true);
+
+  const srcAdjacency: MeshAdjacency = useMemo(
+    () => buildMeshAdjacency(srcMesh.vertices, srcMesh.faces),
+    [srcMesh],
+  );
+  const tarAdjacency: MeshAdjacency = useMemo(
+    () => buildMeshAdjacency(tarMesh.vertices, tarMesh.faces),
+    [tarMesh],
+  );
+
   const srcInputRef = useRef<HTMLInputElement | null>(null);
   const tarInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -129,9 +165,165 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const clearTarLandmarks = useLandmarkStore((s) => s.clearTarLandmarks);
   const clearAllLandmarks = useLandmarkStore((s) => s.clearAll);
 
+  const clearCandidates = useCallback(() => {
+    setCandidates([]);
+    setAcceptedCandidateIds(new Set());
+  }, []);
+
+  const handleFindCandidates = useCallback(() => {
+    if (!srcRegion || !tarRegion) {
+      onStatusChange('请先在 Source 和 Target 上各设置一个 Seed', 'warning');
+      return;
+    }
+    if (srcRegion.vertices.size < 3 || tarRegion.vertices.size < 3) {
+      onStatusChange('区域顶点过少（< 3），无法匹配候选', 'warning');
+      return;
+    }
+    const t0 = performance.now();
+    const result = matchRegionCandidates(
+      { region: srcRegion, vertices: srcMesh.vertices, adjacency: srcAdjacency },
+      { region: tarRegion, vertices: tarMesh.vertices, adjacency: tarAdjacency },
+      { numCandidates },
+    );
+    const dt = performance.now() - t0;
+    setCandidates(result);
+    setAcceptedCandidateIds(new Set());
+    const accepted = result.filter((c) => c.suggestAccept).length;
+    onStatusChange(
+      `已生成 ${result.length} 个候选（${accepted} 推荐接受）— ${dt.toFixed(1)}ms`,
+      'success',
+    );
+  }, [
+    srcRegion,
+    tarRegion,
+    srcMesh,
+    tarMesh,
+    srcAdjacency,
+    tarAdjacency,
+    numCandidates,
+    onStatusChange,
+  ]);
+
+  const handleAcceptCandidate = useCallback(
+    (i: number) => {
+      const c = candidates[i];
+      if (!c) return;
+      addSrcLandmark(c.srcVertex, c.srcPosition);
+      addTarLandmark(c.tarVertex, c.tarPosition);
+      setAcceptedCandidateIds((prev) => {
+        const next = new Set(prev);
+        next.add(i);
+        return next;
+      });
+      onStatusChange(
+        `已接受候选 #${i + 1}（confidence=${c.confidence.toFixed(2)}）→ landmark pair`,
+        'success',
+      );
+    },
+    [candidates, addSrcLandmark, addTarLandmark, onStatusChange],
+  );
+
+  const handleRejectCandidate = useCallback(
+    (i: number) => {
+      setCandidates((prev) => prev.filter((_, idx) => idx !== i));
+      setAcceptedCandidateIds((prev) => {
+        const next = new Set<number>();
+        for (const idx of prev) {
+          if (idx === i) continue;
+          next.add(idx > i ? idx - 1 : idx);
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  const handleAcceptAllCandidates = useCallback(() => {
+    let accepted = 0;
+    candidates.forEach((c, i) => {
+      if (acceptedCandidateIds.has(i)) return;
+      addSrcLandmark(c.srcVertex, c.srcPosition);
+      addTarLandmark(c.tarVertex, c.tarPosition);
+      accepted++;
+    });
+    setAcceptedCandidateIds(new Set(candidates.map((_, i) => i)));
+    if (accepted > 0) {
+      onStatusChange(`已接受 ${accepted} 对候选 → landmark pairs`, 'success');
+    }
+  }, [candidates, acceptedCandidateIds, addSrcLandmark, addTarLandmark, onStatusChange]);
+
+  const handleFindGlobalCandidates = useCallback(() => {
+    if (srcMesh.vertices.length === 0 || tarMesh.vertices.length === 0) {
+      onStatusChange('Source/Target 尚未加载', 'warning');
+      return;
+    }
+    const t0 = performance.now();
+    const result = matchGlobalCandidates(
+      { vertices: srcMesh.vertices, adjacency: srcAdjacency },
+      { vertices: tarMesh.vertices, adjacency: tarAdjacency },
+      {
+        numSamples: globalSamples,
+        rings: globalRings,
+        requireMutual: globalRequireMutual,
+      },
+    );
+    const dt = performance.now() - t0;
+    setCandidates(result);
+    setAcceptedCandidateIds(new Set());
+    const accepted = result.filter((c) => c.suggestAccept).length;
+    onStatusChange(
+      `全网格匹配：${result.length} 对（${accepted} 推荐接受）— ${dt.toFixed(1)}ms`,
+      result.length > 0 ? 'success' : 'warning',
+    );
+  }, [
+    srcMesh,
+    tarMesh,
+    srcAdjacency,
+    tarAdjacency,
+    globalSamples,
+    globalRings,
+    globalRequireMutual,
+    onStatusChange,
+  ]);
+
+  // Stale-candidate guard: invalidate suggestions when seed regions change.
+  useEffect(() => {
+    setCandidates([]);
+    setAcceptedCandidateIds(new Set());
+  }, [srcRegion, tarRegion]);
+
   const pairCount = Math.min(srcLandmarks.length, tarLandmarks.length);
   const isBalanced = srcLandmarks.length === tarLandmarks.length && srcLandmarks.length > 0;
   const hasResultPreview = resultPreview !== null;
+
+  const srcHighlightArr = useMemo(
+    () => (srcRegion ? Array.from(srcRegion.vertices) : undefined),
+    [srcRegion],
+  );
+  const tarHighlightArr = useMemo(
+    () => (tarRegion ? Array.from(tarRegion.vertices) : undefined),
+    [tarRegion],
+  );
+
+  const srcCandidateArr = useMemo(() => {
+    if (candidates.length === 0) return undefined;
+    const out: number[] = [];
+    candidates.forEach((c, i) => {
+      if (acceptedCandidateIds.has(i)) return;
+      out.push(c.srcVertex);
+    });
+    return out.length > 0 ? out : undefined;
+  }, [candidates, acceptedCandidateIds]);
+
+  const tarCandidateArr = useMemo(() => {
+    if (candidates.length === 0) return undefined;
+    const out: number[] = [];
+    candidates.forEach((c, i) => {
+      if (acceptedCandidateIds.has(i)) return;
+      out.push(c.tarVertex);
+    });
+    return out.length > 0 ? out : undefined;
+  }, [candidates, acceptedCandidateIds]);
 
   const resetPreview = useCallback(() => {
     if (alignResult) setAlignResult(null);
@@ -223,6 +415,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         faces: mesh.faces,
       });
       setSelectedSrcIndex(null);
+      setSrcRegion(null);
       clearAllLandmarks();
       resetPreview();
       onStatusChange(`已将 ${fileName} 加载到 Source`, 'success');
@@ -256,9 +449,11 @@ export function ModelAssemble({ onStatusChange }: Props) {
       if (side === 'source') {
         setSrcMesh(mesh);
         setSelectedSrcIndex(null);
+        setSrcRegion(null);
       } else {
         setTarMesh(mesh);
         setSelectedTarIndex(null);
+        setTarRegion(null);
       }
       clearAllLandmarks();
       resetPreview();
@@ -290,6 +485,19 @@ export function ModelAssemble({ onStatusChange }: Props) {
     modifiers: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean },
   ) => {
     if (!modifiers.ctrlKey) return;
+    if (seedMode) {
+      const region = growRegion(idx, srcMesh.vertices, srcAdjacency, {
+        maxSteps: growMaxSteps,
+        maxVertices: growMaxVertices,
+        curvatureThreshold: (growCurvatureDeg * Math.PI) / 180,
+      });
+      setSrcRegion(region);
+      onStatusChange(
+        `Source 区域：seed=${region.seedVertex} | 顶点=${region.vertices.size} | 步数=${region.finalSteps} | 停止=${region.stopReason}`,
+        'info',
+      );
+      return;
+    }
     const nextIndex = (srcLandmarks[srcLandmarks.length - 1]?.index ?? 0) + 1;
     addSrcLandmark(idx, pos);
     selectSourceLandmark(nextIndex);
@@ -303,6 +511,19 @@ export function ModelAssemble({ onStatusChange }: Props) {
     modifiers: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean },
   ) => {
     if (!modifiers.ctrlKey) return;
+    if (seedMode) {
+      const region = growRegion(idx, tarMesh.vertices, tarAdjacency, {
+        maxSteps: growMaxSteps,
+        maxVertices: growMaxVertices,
+        curvatureThreshold: (growCurvatureDeg * Math.PI) / 180,
+      });
+      setTarRegion(region);
+      onStatusChange(
+        `Target 区域：seed=${region.seedVertex} | 顶点=${region.vertices.size} | 步数=${region.finalSteps} | 停止=${region.stopReason}`,
+        'info',
+      );
+      return;
+    }
     const nextIndex = (tarLandmarks[tarLandmarks.length - 1]?.index ?? 0) + 1;
     addTarLandmark(idx, pos);
     selectTargetLandmark(nextIndex);
@@ -408,6 +629,8 @@ export function ModelAssemble({ onStatusChange }: Props) {
     setAlignResult(null);
     setSelectedSrcIndex(null);
     setSelectedTarIndex(null);
+    setSrcRegion(null);
+    setTarRegion(null);
     onStatusChange('已恢复 Demo Source/Target', 'info');
   };
 
@@ -567,6 +790,308 @@ export function ModelAssemble({ onStatusChange }: Props) {
             Ctrl+左键点击网格添加点。左键拖拽 marker 可移动，右键 marker 可删除。
           </div>
         </PanelSection>
+
+        <PanelSection title="区域 Seed (Phase 1)">
+          <Button
+            size="sm"
+            variant={seedMode ? 'primary' : 'secondary'}
+            onClick={() => setSeedMode((v) => !v)}
+            style={{ width: '100%', justifyContent: 'center' }}
+          >
+            {seedMode ? '退出 Seed 模式' : '启用 Seed 模式'}
+          </Button>
+
+          <div style={{ marginTop: 10, fontSize: 11, color: 'var(--text-muted)' }}>
+            BFS 层数 (maxSteps)
+          </div>
+          <input
+            type="range"
+            min={1}
+            max={40}
+            step={1}
+            value={growMaxSteps}
+            onChange={(e) => setGrowMaxSteps(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+            {growMaxSteps} 层
+          </div>
+
+          <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-muted)' }}>
+            顶点上限 (maxVertices)
+          </div>
+          <input
+            type="range"
+            min={50}
+            max={5000}
+            step={50}
+            value={growMaxVertices}
+            onChange={(e) => setGrowMaxVertices(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+            {growMaxVertices}
+          </div>
+
+          <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-muted)' }}>
+            法线偏转阈值 (curvature)
+          </div>
+          <input
+            type="range"
+            min={10}
+            max={180}
+            step={5}
+            value={growCurvatureDeg}
+            onChange={(e) => setGrowCurvatureDeg(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+            {growCurvatureDeg}° {growCurvatureDeg >= 180 ? '(关闭曲率剪枝)' : ''}
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginTop: 8 }}>
+            <Button
+              size="sm"
+              onClick={() => setSrcRegion(null)}
+              disabled={!srcRegion}
+              style={{ justifyContent: 'center' }}
+            >
+              清空 Src 区域
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => setTarRegion(null)}
+              disabled={!tarRegion}
+              style={{ justifyContent: 'center' }}
+            >
+              清空 Tar 区域
+            </Button>
+          </div>
+
+          {(srcRegion || tarRegion) && (
+            <div
+              style={{
+                marginTop: 10,
+                padding: 8,
+                borderRadius: 3,
+                border: '1px solid var(--border-default)',
+                background: 'var(--bg-app)',
+                fontSize: 10,
+                color: 'var(--text-secondary)',
+                lineHeight: 1.5,
+              }}
+            >
+              {srcRegion && (
+                <div style={{ marginBottom: 4 }}>
+                  <span style={{ color: '#7df0ff' }}>Src</span>: seed={srcRegion.seedVertex} ·{' '}
+                  V={srcRegion.vertices.size} · steps={srcRegion.finalSteps} ·{' '}
+                  {srcRegion.stopReason}
+                </div>
+              )}
+              {tarRegion && (
+                <div>
+                  <span style={{ color: '#ffb066' }}>Tar</span>: seed={tarRegion.seedVertex} ·{' '}
+                  V={tarRegion.vertices.size} · steps={tarRegion.finalSteps} ·{' '}
+                  {tarRegion.stopReason}
+                </div>
+              )}
+            </div>
+          )}
+
+          <div style={{ marginTop: 8, fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+            启用后，Ctrl+Click 不再加 landmark，而是设定 seed 并扩张区域；蓝色=源区域，橙色=目标区域。
+          </div>
+        </PanelSection>
+
+        <PanelSection title="全网格查找 (Global)">
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
+            适用于 Source 与 Target 形态相近、但拓扑/transform 不同的情况。
+            从整个网格上挑显著点 → 空间 FPS 散开 → 多尺度曲率配对。
+          </div>
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            采样数 (numSamples)
+          </div>
+          <input
+            type="range"
+            min={10}
+            max={200}
+            step={5}
+            value={globalSamples}
+            onChange={(e) => setGlobalSamples(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {globalSamples}
+          </div>
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            描述子尺度 (rings)
+          </div>
+          <input
+            type="range"
+            min={1}
+            max={6}
+            step={1}
+            value={globalRings}
+            onChange={(e) => setGlobalRings(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {globalRings} 圈
+          </div>
+
+          <label
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: 11,
+              color: 'var(--text-muted)',
+              marginBottom: 6,
+              cursor: 'pointer',
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={globalRequireMutual}
+              onChange={(e) => setGlobalRequireMutual(e.target.checked)}
+            />
+            互最近邻过滤（更稳，更少）
+          </label>
+
+          <Button
+            size="sm"
+            variant="primary"
+            onClick={handleFindGlobalCandidates}
+            style={{ width: '100%', justifyContent: 'center' }}
+          >
+            全网格查找候选
+          </Button>
+        </PanelSection>
+
+        <PanelSection title="候选匹配 (Phase 2)">
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6, lineHeight: 1.5 }}>
+            基于 Seed 区域的局部匹配（数量较少，适合精修）。
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>
+            候选数 (numCandidates)
+          </div>
+          <input
+            type="range"
+            min={1}
+            max={12}
+            step={1}
+            value={numCandidates}
+            onChange={(e) => setNumCandidates(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8 }}>
+            {numCandidates}
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+            <Button
+              size="sm"
+              variant="primary"
+              onClick={handleFindCandidates}
+              disabled={!srcRegion || !tarRegion}
+              style={{ justifyContent: 'center' }}
+            >
+              查找候选
+            </Button>
+            <Button
+              size="sm"
+              onClick={clearCandidates}
+              disabled={candidates.length === 0}
+              style={{ justifyContent: 'center' }}
+            >
+              清空候选
+            </Button>
+          </div>
+
+          {candidates.length > 0 && (
+            <Button
+              size="sm"
+              onClick={handleAcceptAllCandidates}
+              disabled={acceptedCandidateIds.size === candidates.length}
+              style={{ marginTop: 6, width: '100%', justifyContent: 'center' }}
+            >
+              全部接受 ({candidates.length - acceptedCandidateIds.size})
+            </Button>
+          )}
+
+          <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
+            {candidates.length === 0 && (
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+                先在两个 mesh 上各设置一个 seed，再点"查找候选"。
+              </div>
+            )}
+            {candidates.map((c, i) => {
+              const accepted = acceptedCandidateIds.has(i);
+              const conf = c.confidence;
+              const confColor = conf >= 0.7 ? '#7fd97f' : conf >= 0.5 ? '#e9d36c' : '#e08a8a';
+              return (
+                <div
+                  key={`${c.srcVertex}-${c.tarVertex}-${i}`}
+                  style={{
+                    border: '1px solid var(--border-default)',
+                    borderRadius: 3,
+                    padding: '4px 6px',
+                    background: accepted ? 'var(--bg-elevated)' : 'var(--bg-app)',
+                    fontSize: 10,
+                    color: 'var(--text-secondary)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 4,
+                  }}
+                >
+                  <span style={{ width: 14, color: 'var(--text-muted)' }}>#{i + 1}</span>
+                  <span style={{ color: confColor, fontWeight: 600, width: 32 }}>
+                    {(conf * 100).toFixed(0)}%
+                  </span>
+                  <span style={{ flex: 1, color: 'var(--text-muted)' }}>
+                    {c.srcVertex}↔{c.tarVertex}
+                  </span>
+                  {accepted ? (
+                    <span style={{ color: 'var(--accent-green, #7fd97f)' }}>✓</span>
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => handleAcceptCandidate(i)}
+                        title="接受为 landmark pair"
+                        style={{
+                          background: 'transparent',
+                          border: '1px solid var(--border-default)',
+                          color: '#7fd97f',
+                          padding: '0 6px',
+                          cursor: 'pointer',
+                          borderRadius: 2,
+                        }}
+                      >
+                        ✓
+                      </button>
+                      <button
+                        onClick={() => handleRejectCandidate(i)}
+                        title="拒绝该候选"
+                        style={{
+                          background: 'transparent',
+                          border: '1px solid var(--border-default)',
+                          color: '#e08a8a',
+                          padding: '0 6px',
+                          cursor: 'pointer',
+                          borderRadius: 2,
+                        }}
+                      >
+                        ✕
+                      </button>
+                    </>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </PanelSection>
       </aside>
 
       <main style={{ display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden' }}>
@@ -631,6 +1156,14 @@ export function ModelAssemble({ onStatusChange }: Props) {
               srcLabel="Source"
               tarLabel="Target"
               showCameraSync
+              srcHighlightVertices={srcHighlightArr}
+              tarHighlightVertices={tarHighlightArr}
+              srcHighlightColor="#7df0ff"
+              tarHighlightColor="#ffb066"
+              srcCandidateVertices={srcCandidateArr}
+              tarCandidateVertices={tarCandidateArr}
+              srcCandidateColor="#ffffff"
+              tarCandidateColor="#fffacd"
             />
           )}
           {centerViewMode === 'result' && resultPreview && (

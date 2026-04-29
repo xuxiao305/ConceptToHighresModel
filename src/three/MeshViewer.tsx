@@ -202,6 +202,51 @@ function MeshObject({
 }
 
 // ---------------------------------------------------------------------------
+// Region-grow highlight points
+// ---------------------------------------------------------------------------
+
+function HighlightPoints({
+  vertices,
+  indices,
+  color,
+  size = 6,
+  opacity = 0.85,
+}: {
+  vertices: Vec3[];
+  indices: number[];
+  color: string;
+  size?: number;
+  opacity?: number;
+}) {
+  const geometry = useMemo(() => {
+    const positions = new Float32Array(indices.length * 3);
+    for (let i = 0; i < indices.length; i++) {
+      const v = vertices[indices[i]];
+      if (!v) continue;
+      positions[i * 3] = v[0];
+      positions[i * 3 + 1] = v[1];
+      positions[i * 3 + 2] = v[2];
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    return geo;
+  }, [vertices, indices]);
+
+  return (
+    <points geometry={geometry}>
+      <pointsMaterial
+        color={color}
+        size={size}
+        sizeAttenuation={false}
+        depthTest={false}
+        transparent
+        opacity={opacity}
+      />
+    </points>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Auto-fit camera + sync
 // ---------------------------------------------------------------------------
 
@@ -336,6 +381,17 @@ export interface MeshViewerProps {
   onViewModeChange?: (mode: ViewMode) => void;
   /** Place the model on the grid (lift so bbox.min.y sits at y=0). Default true. */
   placeOnGround?: boolean;
+  /**
+   * Vertex indices (into `vertices`) to render as small highlight points.
+   * Used by region-grow visualization.  No effect on picking.
+   */
+  highlightVertices?: number[];
+  /** Color of highlight points (default '#7df0ff') */
+  highlightColor?: string;
+  /** Secondary (larger, brighter) highlight set, e.g. candidate vertices */
+  candidateVertices?: number[];
+  /** Color for the candidate set (default '#ffffff') */
+  candidateColor?: string;
 }
 
 export function MeshViewer({
@@ -368,6 +424,10 @@ export function MeshViewer({
   showFitButton = true,
   onViewModeChange,
   placeOnGround = true,
+  highlightVertices,
+  highlightColor = '#7df0ff',
+  candidateVertices,
+  candidateColor = '#ffffff',
 }: MeshViewerProps) {
   const [meshGeometry, setMeshGeometry] = useState<THREE.BufferGeometry | null>(null);
   const handleGeometryReady = useCallback((geo: THREE.BufferGeometry) => {
@@ -472,6 +532,24 @@ export function MeshViewer({
               faces={overlayFaces}
               color={overlayColor}
               viewMode="wireframe"
+            />
+          )}
+
+          {highlightVertices && highlightVertices.length > 0 && (
+            <HighlightPoints
+              vertices={vertices}
+              indices={highlightVertices}
+              color={highlightColor}
+            />
+          )}
+
+          {candidateVertices && candidateVertices.length > 0 && (
+            <HighlightPoints
+              vertices={vertices}
+              indices={candidateVertices}
+              color={candidateColor}
+              size={14}
+              opacity={1}
             />
           )}
 
