@@ -11,34 +11,31 @@ import {
   extractWithPrompt,
 } from '../../services/extraction';
 import { type AssetVersion } from '../../services/projectStore';
-import { splitMultiView } from '../../services/multiviewSplit';
+import { splitMultiView, enlargeMultiViewToFill } from '../../services/multiviewSplit';
 
 /**
- * Full node list (Mode B · Multi-View). Mode A · Extraction omits the standalone
- * `multiview` node since the Extract Jacket node already produces a 4-view sheet
- * directly. Use {@link getPartNodes} to obtain the mode-specific list.
+ * Pipeline node list. The standalone `multiview` node was removed once the
+ * Extract Jacket node started producing a 4-view sheet (+ split per-view
+ * sub-set + 等比放大撑满) directly. Both pipeline modes now share the same
+ * node list — the only difference is which Page1 asset is loaded as source.
  */
 export const PART_NODES: NodeConfig[] = [
   { id: 'imageInput', title: 'Image Input', display: 'image' },
   { id: 'extraction', title: 'Extract Jacket', display: 'image' },
-  { id: 'multiview', title: 'Multi-View', display: 'multiview' },
   { id: 'modify', title: 'Modify', display: 'image', optional: true },
   { id: 'highres', title: 'Highres Model 3D', display: '3d' },
   { id: 'retex', title: 'Re-Texturing', display: '3d', optional: true },
   { id: 'region', title: 'Region Define', display: '3d', optional: true },
 ];
 
-/** Returns the node list for a given pipeline mode. */
-export function getPartNodes(mode: PipelineMode): NodeConfig[] {
-  if (mode === 'extraction') {
-    return PART_NODES.filter((n) => n.id !== 'multiview');
-  }
+/** Returns the node list for a given pipeline mode (currently mode-agnostic). */
+export function getPartNodes(_mode: PipelineMode): NodeConfig[] {
   return PART_NODES;
 }
 
 const PIPELINE_MODE_LABEL: Record<PipelineMode, string> = {
-  extraction: 'A · Extraction',
-  multiview: 'B · Multi-View',
+  extraction: 'General Extraction',
+  multiview: 'Extract Jacket',
 };
 
 interface Props {
@@ -55,8 +52,8 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
   const [draftName, setDraftName] = useState(pipeline.name);
   const [splitView, setSplitView] = useState(false);
 
-  // Mode-specific node list. Mode A · Extraction omits the standalone Multi-View
-  // node since the Extract Jacket node already produces a 4-view sheet directly.
+  // Pipeline node list (both modes share the same list; the standalone Multi-View
+  // node was removed since Extract Jacket already produces the 4-view sheet).
   const partNodes = getPartNodes(pipeline.mode);
 
   // Extraction 节点历史版本（仅本 Pipeline 自己的，按 pipeline.name 前缀过滤）
@@ -239,12 +236,31 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       // Revoke previous result URL if any
       if (extraction.resultUrl) URL.revokeObjectURL(extraction.resultUrl);
 
+      // Post-process: 对 Banana Pro 输出的 4-view 做"分别等比放大撑满象限"，
+      // 让每个 view 的主体尺度更接近，再交给后续紧凑切分。
+      let processedBlob: Blob;
+      let processedUrl: string;
+      try {
+        const rawBlob = await (await fetch(url)).blob();
+        onStatus(`[${pipeline.name}] 等比放大每个视图…`, 'info');
+        processedBlob = await enlargeMultiViewToFill(rawBlob);
+        processedUrl = URL.createObjectURL(processedBlob);
+        // 释放 Banana Pro 返回的原始 blob URL
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        onStatus(
+          `[${pipeline.name}] 等比放大失败，回退使用原图：${e instanceof Error ? e.message : String(e)}`,
+          'warning',
+        );
+        processedBlob = await (await fetch(url)).blob();
+        processedUrl = url;
+      }
+
       // Save to project (full 4-view PNG)
       let savedFile: string | null = null;
       if (project) {
         try {
-          const blob = await (await fetch(url)).blob();
-          const v = await saveAsset('page2.extraction', blob, 'png', noteForMode, pipeline.name);
+          const v = await saveAsset('page2.extraction', processedBlob, 'png', noteForMode, pipeline.name);
           if (v) {
             savedFile = v.file;
             onStatus(`[${pipeline.name}] 已保存到工程：${v.file}`, 'success');
@@ -253,7 +269,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
             // mirroring page1.multiview's behaviour. Stored under
             // <basename>_v0001/{view}_v0001.png plus segments.json.
             try {
-              const slices = await splitMultiView(blob);
+              const slices = await splitMultiView(processedBlob);
               const baseName = v.file.replace(/\.[^.]+$/, '');
               const setHandle = await saveSegments(
                 'page2.extraction',
@@ -291,19 +307,19 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
         nodeStates: pipeline.nodeStates.map((v, idx) => {
           if (idx === 1) return 'complete';
           if (idx === 2) {
-            // Promote next node to ready (Multi-View in mode B, Modify in mode A)
+            // Promote next node to ready (Modify, optional)
             const cfg = partNodes[idx];
             if (cfg?.optional) return v === 'idle' ? 'optional' : v;
             return v === 'idle' ? 'ready' : v;
           }
           return v;
         }),
-        extraction: { ...extraction, resultUrl: url, resultFile: savedFile, error: undefined },
+        extraction: { ...extraction, resultUrl: processedUrl, resultFile: savedFile, error: undefined },
       });
       onStatus(`[${pipeline.name}] Extract Jacket 完成`, 'success');
       // Reload the per-pipeline history dropdown.
       void refreshExtractionHistory();
-      return url;
+      return processedUrl;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[PartPipeline] extract jacket failed:', err);

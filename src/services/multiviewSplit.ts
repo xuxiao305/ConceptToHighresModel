@@ -106,6 +106,176 @@ export async function splitMultiView(
 }
 
 // ---------------------------------------------------------------------------
+// 等比放大撑满（移植自 D:\AI\MyComfyuiNodes\SmartCropAndEnlarge nodes.py）
+// ---------------------------------------------------------------------------
+
+export interface EnlargeToFillOptions {
+  /** 网格行数，默认 2（适配 2x2 多视图布局） */
+  rows?: number;
+  /** 网格列数，默认 2 */
+  cols?: number;
+  /** 在每个单元内、围绕 tight bbox 的外扩像素数，默认 8 */
+  padding?: number;
+  /** 视为"白底背景"的阈值：r/g/b 任一 < 该值即视为前景，默认 240 */
+  whiteThreshold?: number;
+  /** 若图像带 alpha，是否按 alpha>8 来判定前景（默认 false，按白底判定） */
+  useAlpha?: boolean;
+  /** 内容相对单元的最大占比，1.0 = 完全撑满。默认 1.0 */
+  fillRatio?: number;
+  /** 背景填充色，默认 '#ffffff'（白）。可用 'transparent' 关键字。 */
+  background?: string;
+}
+
+/**
+ * 把一张图按 rows × cols 网格切分，每个单元内：
+ *   1. 找前景的紧凑包围盒（按 white_threshold 或 alpha 判定）
+ *   2. 围绕 bbox 加 `padding` 像素外扩
+ *   3. 把这块内容等比缩放到 (cell_w * fillRatio, cell_h * fillRatio) 的最大尺寸
+ *   4. 居中粘回相同的单元位置
+ *
+ * 输出尺寸与输入一致，每个单元的主体都被"撑满"。
+ *
+ * 算法严格对照 ComfyUI 节点 SmartCropAndEnlargeGrid 的实现，便于结果一致。
+ */
+export async function enlargeMultiViewToFill(
+  source: Blob | string,
+  opts: EnlargeToFillOptions = {},
+): Promise<Blob> {
+  const rows = Math.max(1, Math.floor(opts.rows ?? 2));
+  const cols = Math.max(1, Math.floor(opts.cols ?? 2));
+  const padding = Math.max(0, Math.floor(opts.padding ?? 8));
+  const whiteThr = opts.whiteThreshold ?? 240;
+  const useAlpha = opts.useAlpha ?? false;
+  const fillRatio = Math.max(0.05, Math.min(1.0, opts.fillRatio ?? 1.0));
+  const bgColor = opts.background ?? '#ffffff';
+  const transparent = bgColor.toLowerCase() === 'transparent' || bgColor.toLowerCase() === 'none';
+
+  const img = await loadImage(source);
+  const W = img.naturalWidth;
+  const H = img.naturalHeight;
+
+  // 把源图绘到一张 canvas，方便逐像素读取。
+  const srcCanvas = makeCanvas(W, H);
+  const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true });
+  if (!srcCtx) throw new Error('无法获取 2D Canvas 上下文');
+  srcCtx.drawImage(img, 0, 0);
+  const srcData = srcCtx.getImageData(0, 0, W, H).data;
+
+  // 输出画布
+  const outCanvas = makeCanvas(W, H);
+  const outCtx = outCanvas.getContext('2d');
+  if (!outCtx) throw new Error('无法获取 2D Canvas 上下文');
+  if (!transparent) {
+    outCtx.fillStyle = bgColor;
+    outCtx.fillRect(0, 0, W, H);
+  } else {
+    outCtx.clearRect(0, 0, W, H);
+  }
+  outCtx.imageSmoothingEnabled = true;
+  outCtx.imageSmoothingQuality = 'high';
+
+  // 单元尺寸（最后一行/列吸收余数，避免边缘 1px 黑线）
+  const cellWBase = Math.floor(W / cols);
+  const cellHBase = Math.floor(H / rows);
+
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const x0 = c * cellWBase;
+      const y0 = r * cellHBase;
+      const x1 = c === cols - 1 ? W : (c + 1) * cellWBase;
+      const y1 = r === rows - 1 ? H : (r + 1) * cellHBase;
+      const cellW = x1 - x0;
+      const cellH = y1 - y0;
+      if (cellW <= 0 || cellH <= 0) continue;
+
+      // 在单元内找 tight bbox（绝对坐标，end 不包含）
+      const bb = tightBBoxFG(srcData, W, x0, y0, x1, y1, whiteThr, useAlpha);
+      if (!bb) continue;
+
+      // 把 bbox 向外扩 padding（限制在单元范围内）
+      const bx0 = Math.max(x0, bb.x0 - padding);
+      const by0 = Math.max(y0, bb.y0 - padding);
+      const bx1 = Math.min(x1, bb.x1 + padding);
+      const by1 = Math.min(y1, bb.y1 + padding);
+      const fgW = bx1 - bx0;
+      const fgH = by1 - by0;
+      if (fgW <= 0 || fgH <= 0) continue;
+
+      // 等比缩放到 (cellW * fillRatio, cellH * fillRatio) 内部
+      const targetW = Math.max(1, Math.round(cellW * fillRatio));
+      const targetH = Math.max(1, Math.round(cellH * fillRatio));
+      const scale = Math.min(targetW / fgW, targetH / fgH);
+      const newW = Math.max(1, Math.round(fgW * scale));
+      const newH = Math.max(1, Math.round(fgH * scale));
+
+      // 在单元内居中
+      const dx = x0 + Math.floor((cellW - newW) / 2);
+      const dy = y0 + Math.floor((cellH - newH) / 2);
+
+      outCtx.drawImage(
+        img,
+        bx0, by0, fgW, fgH,  // src
+        dx, dy, newW, newH,   // dst
+      );
+    }
+  }
+
+  return await canvasToBlob(outCanvas, 'image/png');
+}
+
+/**
+ * 在指定矩形区域内找前景的紧凑 bbox（绝对坐标）。
+ *   - useAlpha=true 且像素有 alpha：alpha > 8 即视为前景
+ *   - 否则：r,g,b 任一 < whiteThr 即视为前景（同时 alpha < 8 视为背景）
+ */
+function tightBBoxFG(
+  data: Uint8ClampedArray,
+  imgW: number,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  whiteThr: number,
+  useAlpha: boolean,
+): { x0: number; y0: number; x1: number; y1: number } | null {
+  let minX = x1;
+  let minY = y1;
+  let maxX = x0 - 1;
+  let maxY = y0 - 1;
+  let found = false;
+
+  for (let y = y0; y < y1; y++) {
+    const rowBase = y * imgW * 4;
+    for (let x = x0; x < x1; x++) {
+      const i = rowBase + x * 4;
+      const a = data[i + 3];
+      let isFg: boolean;
+      if (useAlpha) {
+        isFg = a > 8;
+      } else {
+        if (a < 8) {
+          isFg = false;
+        } else {
+          const r = data[i];
+          const g = data[i + 1];
+          const b = data[i + 2];
+          isFg = r < whiteThr || g < whiteThr || b < whiteThr;
+        }
+      }
+      if (!isFg) continue;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      found = true;
+    }
+  }
+  if (!found) return null;
+  // 返回 end-exclusive
+  return { x0: minX, y0: minY, x1: maxX + 1, y1: maxY + 1 };
+}
+
+// ---------------------------------------------------------------------------
 // 内部工具
 // ---------------------------------------------------------------------------
 

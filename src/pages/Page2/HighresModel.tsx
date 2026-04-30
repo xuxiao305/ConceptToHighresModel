@@ -5,12 +5,12 @@ import { getPartNodes, PartPipeline } from './PartPipeline';
 
 const PIPELINE_MODE_LABEL: Record<PipelineMode, string> = {
   extraction: '基于 Extraction',
-  multiview: '基于 Multi-View',
+  multiview: 'Extract Jacket',
 };
 
 const PIPELINE_MODE_DESC: Record<PipelineMode, string> = {
   extraction: '使用 Page1 的 Extraction 输出作为源图片',
-  multiview: '使用 Page1 的 Multi-View 输出作为源图片',
+  multiview: '使用 Page1 的 Multi-View 输出作为源图片，由 Extract Jacket 节点重新生成 4 视图',
 };
 
 interface Props {
