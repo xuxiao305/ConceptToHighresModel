@@ -44,7 +44,10 @@ export interface IcpOptions {
   rejectMultiplier?: number;
   /** Alignment mode for the first iteration (default 'similarity'). */
   firstIterMode?: AlignmentMode;
-  /** Alignment mode for subsequent iterations (default 'rigid'). */
+  /** Alignment mode for subsequent iterations (default 'rigid').
+   *  Rigid prevents scale drift in subsequent iterations once the
+   *  initial similarity fit has set the scale.
+   */
   subsequentMode?: AlignmentMode;
   /** Optional deterministic seed for source sub-sampling. */
   seed?: number;
@@ -99,7 +102,15 @@ export function icpRefine(
   const subMode = options.subsequentMode ?? 'rigid';
   const rng = options.seed !== undefined ? mulberry32(options.seed) : Math.random;
 
-  const tarHash = buildSpatialHash(tarVertices, estimateCellSize(tarVertices));
+  // Build spatial hash for NN search.  When tarRestrictVertices is
+  // provided, we build the hash ONLY over those vertices so that NN
+  // queries never reach geometry outside the allowed region.
+  const tarRestrict = options.tarRestrictVertices ?? null;
+  const effectiveTarVertices: Vec3[] = tarRestrict
+    ? Array.from(tarRestrict, (i) => tarVertices[i])
+    : tarVertices;
+  const tarHash = buildSpatialHash(effectiveTarVertices, estimateCellSize(effectiveTarVertices));
+
   const srcSampleIdx = uniformSubsample(srcVertices.length, sampleCount, rng);
 
   const iterations: IcpIteration[] = [];
@@ -113,20 +124,28 @@ export function icpRefine(
       applyTransform(srcVertices[i], currentMatrix),
     );
 
-    // 2. Nearest target vertex for each.
-    const dists: number[] = new Array(transformed.length);
-    const matchedTar: Vec3[] = new Array(transformed.length);
+    // 2. Nearest target vertex for each (restricted to effectiveTarVertices).
+    //    Pairs whose NN search failed (nn.index < 0, distance == +Infinity)
+    //    are dropped here — leaving them in would poison the median used
+    //    for outlier rejection (median of {... , Infinity, Infinity, ...}
+    //    is Infinity, cutoff is Infinity, EVERY pair becomes an "inlier"
+    //    and the SVD fits to garbage).
+    const validSrcOrig: Vec3[] = [];
+    const validTar: Vec3[] = [];
+    const validDists: number[] = [];
     for (let i = 0; i < transformed.length; i++) {
-      const nn = nearestNeighbor(tarHash, tarVertices, transformed[i]);
-      dists[i] = nn.distance;
-      matchedTar[i] = tarVertices[nn.index];
+      const nn = nearestNeighbor(tarHash, effectiveTarVertices, transformed[i]);
+      if (nn.index < 0 || !Number.isFinite(nn.distance)) continue;
+      validSrcOrig.push(srcVertices[srcSampleIdx[i]]);
+      validTar.push(effectiveTarVertices[nn.index]);
+      validDists.push(nn.distance);
     }
 
-    if (transformed.length < 4) {
-      iterations.push({ matrix4x4: currentMatrix, rmse: Infinity, pairsKept: 0, improvement: 0 });
+    if (validDists.length < 4) {
+      iterations.push({ matrix4x4: currentMatrix, rmse: prevRmse, pairsKept: validDists.length, improvement: 0 });
       return {
         matrix4x4: currentMatrix,
-        rmse: Infinity,
+        rmse: prevRmse,
         bestIteration,
         iterations,
         stopReason: 'no-pairs',
@@ -134,20 +153,20 @@ export function icpRefine(
     }
 
     // 3. Outlier rejection by median distance.
-    const sortedD = dists.slice().sort((a, b) => a - b);
+    const sortedD = validDists.slice().sort((a, b) => a - b);
     const med = sortedD[sortedD.length >> 1];
     const cutoff = Math.max(med * rejectMul, 1e-9);
 
     const keptSrc: Vec3[] = [];
     const keptTar: Vec3[] = [];
-    for (let i = 0; i < transformed.length; i++) {
-      if (dists[i] <= cutoff) {
+    for (let i = 0; i < validDists.length; i++) {
+      if (validDists[i] <= cutoff) {
         // Use the ORIGINAL source vertex (not the transformed one) so
         // each iteration computes an absolute transform from source
         // space rather than composing many small transforms (which
         // accumulates drift).
-        keptSrc.push(srcVertices[srcSampleIdx[i]]);
-        keptTar.push(matchedTar[i]);
+        keptSrc.push(validSrcOrig[i]);
+        keptTar.push(validTar[i]);
       }
     }
 

@@ -9,7 +9,7 @@ const PIPELINE_MODE_LABEL: Record<PipelineMode, string> = {
 };
 
 const PIPELINE_MODE_DESC: Record<PipelineMode, string> = {
-  extraction: '使用 Page1 的 Extraction 输出作为源图片',
+  extraction: '使用 Page1 的 Extraction 输出作为源图片，由 SAM3 交互式分割 + Banana Pro 重组 4 视图',
   multiview: '使用 Page1 的 Multi-View 输出作为源图片，由 Extract Jacket 节点重新生成 4 视图',
 };
 

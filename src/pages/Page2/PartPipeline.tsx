@@ -9,33 +9,39 @@ import { useProject } from '../../contexts/ProjectContext';
 import {
   EXTRACT_JACKET_PROMPT,
   extractWithPrompt,
+  extractWithSAM3,
+  SAM3CancelledError,
+  SAM3NotWiredError,
 } from '../../services/extraction';
 import { type AssetVersion } from '../../services/projectStore';
 import { splitMultiView, enlargeMultiViewToFill } from '../../services/multiviewSplit';
 
 /**
- * Pipeline node list. The standalone `multiview` node was removed once the
- * Extract Jacket node started producing a 4-view sheet (+ split per-view
- * sub-set + 等比放大撑满) directly. Both pipeline modes now share the same
- * node list — the only difference is which Page1 asset is loaded as source.
+ * Full node list (Mode B · Multi-View). Mode A · Extraction omits the standalone
+ * `multiview` node since the Extract Jacket node already produces a 4-view sheet
+ * directly. Use {@link getPartNodes} to obtain the mode-specific list.
  */
 export const PART_NODES: NodeConfig[] = [
   { id: 'imageInput', title: 'Image Input', display: 'image' },
   { id: 'extraction', title: 'Extract Jacket', display: 'image' },
+  { id: 'multiview', title: 'Multi-View', display: 'multiview' },
   { id: 'modify', title: 'Modify', display: 'image', optional: true },
   { id: 'highres', title: 'Highres Model 3D', display: '3d' },
   { id: 'retex', title: 'Re-Texturing', display: '3d', optional: true },
   { id: 'region', title: 'Region Define', display: '3d', optional: true },
 ];
 
-/** Returns the node list for a given pipeline mode (currently mode-agnostic). */
-export function getPartNodes(_mode: PipelineMode): NodeConfig[] {
+/** Returns the node list for a given pipeline mode. */
+export function getPartNodes(mode: PipelineMode): NodeConfig[] {
+  if (mode === 'extraction') {
+    return PART_NODES.filter((n) => n.id !== 'multiview');
+  }
   return PART_NODES;
 }
 
 const PIPELINE_MODE_LABEL: Record<PipelineMode, string> = {
-  extraction: 'General Extraction',
-  multiview: 'Extract Jacket',
+  extraction: 'A · Extraction',
+  multiview: 'B · Multi-View',
 };
 
 interface Props {
@@ -52,8 +58,8 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
   const [draftName, setDraftName] = useState(pipeline.name);
   const [splitView, setSplitView] = useState(false);
 
-  // Pipeline node list (both modes share the same list; the standalone Multi-View
-  // node was removed since Extract Jacket already produces the 4-view sheet).
+  // Mode-specific node list. Mode A · Extraction omits the standalone Multi-View
+  // node since the Extract Jacket node already produces a 4-view sheet directly.
   const partNodes = getPartNodes(pipeline.mode);
 
   // Extraction 节点历史版本（仅本 Pipeline 自己的，按 pipeline.name 前缀过滤）
@@ -207,16 +213,22 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     [pipeline, onUpdate]
   );
 
-  // Real Extraction runner. Calls Banana Pro with the fixed "Extract Jacket"
-  // prompt and writes the final 4-view PNG (+ split per-view sub-set) to the
-  // project, exactly like Page1's Multi-View node.
+  // Real Extraction runner. Two modes:
+  //   - pipeline.mode === 'multiview' (Extract Jacket pipeline): Banana Pro
+  //     with the fixed "Extract Jacket" prompt directly produces a 4-view sheet.
+  //   - pipeline.mode === 'extraction' (General Extraction pipeline): SAM3
+  //     bridge spawns the standalone GUI for interactive segmentation, then
+  //     Banana Pro recomposes the masked subject into a 4-view sheet.
+  // Both paths converge on the same post-processing (enlarge → save → split).
   const runExtraction = useCallback(async (): Promise<string | null> => {
     if (!sourceFile) {
       onStatus(`[${pipeline.name}] 缺少源图片：请先在 Page1 生成 Extraction 或 Multi-View`, 'error');
       return null;
     }
 
-    const noteForMode = `${pipeline.name} · Extract Jacket`;
+    const useSAM3 = pipeline.mode === 'extraction';
+    const modeLabel = useSAM3 ? 'SAM3 提取' : 'Extract Jacket';
+    const noteForMode = `${pipeline.name} · ${modeLabel}`;
 
     // Set running
     onUpdate(pipeline.id, {
@@ -224,14 +236,19 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'running' : v)),
       extraction: { ...extraction, error: undefined },
     });
-    onStatus(`[${pipeline.name}] Extract Jacket 提取中…`, 'info');
+    onStatus(`[${pipeline.name}] ${modeLabel} 提取中…`, 'info');
 
     try {
-      const url = await extractWithPrompt({
-        source: sourceFile,
-        prompt: EXTRACT_JACKET_PROMPT,
-        onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
-      });
+      const url = useSAM3
+        ? await extractWithSAM3({
+            source: sourceFile,
+            onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
+          })
+        : await extractWithPrompt({
+            source: sourceFile,
+            prompt: EXTRACT_JACKET_PROMPT,
+            onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
+          });
 
       // Revoke previous result URL if any
       if (extraction.resultUrl) URL.revokeObjectURL(extraction.resultUrl);
@@ -307,7 +324,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
         nodeStates: pipeline.nodeStates.map((v, idx) => {
           if (idx === 1) return 'complete';
           if (idx === 2) {
-            // Promote next node to ready (Modify, optional)
+            // Promote next node to ready (Multi-View in mode B, Modify in mode A)
             const cfg = partNodes[idx];
             if (cfg?.optional) return v === 'idle' ? 'optional' : v;
             return v === 'idle' ? 'ready' : v;
@@ -316,26 +333,40 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
         }),
         extraction: { ...extraction, resultUrl: processedUrl, resultFile: savedFile, error: undefined },
       });
-      onStatus(`[${pipeline.name}] Extract Jacket 完成`, 'success');
+      onStatus(`[${pipeline.name}] ${modeLabel} 完成`, 'success');
       // Reload the per-pipeline history dropdown.
       void refreshExtractionHistory();
       return processedUrl;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      // SAM3CancelledError → soft revert to "ready" with a warning toast.
+      if (err instanceof SAM3CancelledError) {
+        console.warn('[PartPipeline] SAM3 cancelled:', err);
+        onUpdate(pipeline.id, {
+          ...pipeline,
+          nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'ready' : v)),
+          extraction: { ...extraction, error: undefined },
+        });
+        onStatus(`[${pipeline.name}] 已取消 SAM3 标注`, 'warning');
+        return null;
+      }
+      const friendlyMsg =
+        err instanceof SAM3NotWiredError ? `SAM3 子进程桥接异常（${msg}）` : msg;
       console.error('[PartPipeline] extract jacket failed:', err);
       onUpdate(pipeline.id, {
         ...pipeline,
         nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'error' : v)),
-        extraction: { ...extraction, error: msg },
+        extraction: { ...extraction, error: friendlyMsg },
       });
-      onStatus(`[${pipeline.name}] Extract Jacket 失败：${msg}`, 'error');
+      onStatus(`[${pipeline.name}] ${modeLabel} 失败：${friendlyMsg}`, 'error');
       return null;
     }
   }, [pipeline, extraction, sourceFile, onStatus, onUpdate, project, saveAsset, saveSegments, refreshExtractionHistory]);
 
   const runNode = useCallback(
     (i: number) => {
-      // Extraction node: real Banana Pro call
+      // Extraction node: dispatches to SAM3 (General Extraction) or Banana
+      // Pro (Extract Jacket) based on pipeline.mode — see runExtraction().
       if (i === 1) {
         void runExtraction();
         return;

@@ -170,7 +170,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [partialThresholdPct, setPartialThresholdPct] = useState(5);
   const [partialIterations, setPartialIterations] = useState(600);
   const [partialDescriptor, setPartialDescriptor] = useState<'curvature' | 'fpfh'>('fpfh');
-  const [partialSeedWeight, setPartialSeedWeight] = useState(2.0);
+  const [partialSeedWeight, setPartialSeedWeight] = useState(5.0);
   // PCA axial+radial feature weight. Critical for cylindrical parts
   // like arms / legs where pure FPFH collapses to a single feature.
   const [partialAxialWeight, setPartialAxialWeight] = useState(5.0);
@@ -1141,6 +1141,18 @@ export function ModelAssemble({ onStatusChange }: Props) {
       onStatusChange('Source/Target 尚未加载', 'warning');
       return;
     }
+    // Without a SAM3-reprojected target region, the geometry-only
+    // partial-match is structurally unstable on humanoid bodies (any
+    // self-similar part can satisfy the inlier consistency). Offline
+    // testing showed scale spread 0.245-0.509 and dist→target spread
+    // 0.4-6.0 across 5 RANSAC seeds in this case. Warn the user but
+    // still let them try.
+    if (!tarRegion) {
+      onStatusChange(
+        '提示：未标记 Target seed（SAM3 区域）— 自动对齐结果可能不稳定。建议先在 “SAM3 重投影” 面板标定一个目标区域。',
+        'warning',
+      );
+    }
     setPartialLoading(true);
     setAligning(true);
     setTimeout(() => {
@@ -1184,13 +1196,37 @@ export function ModelAssemble({ onStatusChange }: Props) {
         );
 
         // 3. ICP refine starting from the SVD initial transform.
+        //    Note: we intentionally do NOT pass tarRestrictVertices
+        //    here. The SAM3-reprojected region is already used as a
+        //    soft seed inside partial-match (tarSeedCentroid +
+        //    tarConstraintVertices); hard-restricting NN to that
+        //    region during ICP causes scale collapse and biased fits
+        //    when the region has holes or the source is partial.
         const icp = icpRefine(srcMesh.vertices, tarMesh.vertices, lmFit.matrix4x4);
 
-        // Pick the best of {SVD-only, ICP-best}. ICP can occasionally
-        // diverge on tricky overlaps; this comparison guards that.
-        const useIcp = icp.rmse < lmFit.rmse;
+        // Pick the best of {SVD-only, ICP-best} using a COMMON metric
+        // — RMSE on the partial-match landmark pairs under each
+        // transform.  We can't compare `lmFit.rmse` to `icp.rmse`
+        // directly: lmFit's RMSE is on ~30 landmark pairs while
+        // icp.rmse is on its sampled inlier subset (different point
+        // sets, different counts).  Re-evaluating both transforms on
+        // the landmark pairs gives an apples-to-apples comparison.
+        const evalRmseOnLandmarks = (m: number[][]): number => {
+          let s = 0;
+          for (const p of pm.pairs) {
+            const t = applyTransform(p.srcPosition, m);
+            const dx = t[0] - p.tarPosition[0];
+            const dy = t[1] - p.tarPosition[1];
+            const dz = t[2] - p.tarPosition[2];
+            s += dx * dx + dy * dy + dz * dz;
+          }
+          return Math.sqrt(s / pm.pairs.length);
+        };
+        const lmFitLandmarkRmse = evalRmseOnLandmarks(lmFit.matrix4x4);
+        const icpLandmarkRmse = evalRmseOnLandmarks(icp.matrix4x4);
+        const useIcp = icpLandmarkRmse < lmFitLandmarkRmse;
         const finalMatrix = useIcp ? icp.matrix4x4 : lmFit.matrix4x4;
-        const finalRmse = useIcp ? icp.rmse : lmFit.rmse;
+        const finalRmse = useIcp ? icpLandmarkRmse : lmFitLandmarkRmse;
 
         const transformedVertices = srcMesh.vertices.map((v) =>
           applyTransform(v, finalMatrix),
@@ -1301,7 +1337,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
     const srcUrl = '/demo/alignmenttest_arm_hires.glb';
     const tarUrl = '/demo/alignmenttest_bot.glb';
     try {
-      onStatusChange('正在加载 Demo: alignmenttest_arm_hires (源 + 形变)…', 'info');
+      onStatusChange('正在加载 Demo: arm_hires (源) + bot (目标整身)…', 'info');
       const [srcLoaded, tarLoaded] = await Promise.all([
         loadGlbAsMesh(srcUrl),
         loadGlbAsMesh(tarUrl),
@@ -1312,7 +1348,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         faces: srcLoaded.faces,
       });
       setTarMesh({
-        name: 'alignmenttest_arm_hires_Deformed.glb',
+        name: 'alignmenttest_bot.glb',
         vertices: tarLoaded.vertices,
         faces: tarLoaded.faces,
       });

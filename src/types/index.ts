@@ -36,6 +36,14 @@ export interface NodeConfig {
  */
 export type ExtractionMode = 'banana' | 'sam3';
 
+/**
+ * Pipeline source mode — controls which Page1 node feeds Image Input:
+ *   - extraction: 使用 Page1 的 Extraction 输出作为源图片
+ *                 （若不存在则回退到 Multi-View）
+ *   - multiview:  使用 Page1 的 Multi-View 输出作为源图片
+ */
+export type PipelineMode = 'extraction' | 'multiview';
+
 export interface ExtractionState {
   mode: ExtractionMode;
   /** Banana Pro 当前选中的提示词预设索引 */
@@ -58,6 +66,8 @@ export interface ImageInputState {
 export interface PartPipelineState {
   id: string;
   name: string;
+  /** Pipeline source mode: 'extraction' uses Page1 Extraction, 'multiview' uses Page1 Multi-View */
+  mode: PipelineMode;
   nodeStates: NodeState[];
   /** Optional nodes expanded flag, keyed by node index */
   expanded: Record<number, boolean>;

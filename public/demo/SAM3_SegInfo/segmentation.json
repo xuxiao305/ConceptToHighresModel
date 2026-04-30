@@ -1,0 +1,60 @@
+{
+  "image": "Bot.png",
+  "mask_png": "segmentation_mask.png",
+  "objects": [
+    {
+      "label": "RightArm",
+      "mask_value": 85,
+      "bbox": {
+        "xyxy": [
+          185,
+          146,
+          269,
+          465
+        ],
+        "xywh": [
+          185,
+          146,
+          85,
+          320
+        ]
+      }
+    },
+    {
+      "label": "Body",
+      "mask_value": 170,
+      "bbox": {
+        "xyxy": [
+          222,
+          33,
+          447,
+          718
+        ],
+        "xywh": [
+          222,
+          33,
+          226,
+          686
+        ]
+      }
+    },
+    {
+      "label": "LeftArm",
+      "mask_value": 255,
+      "bbox": {
+        "xyxy": [
+          396,
+          149,
+          475,
+          465
+        ],
+        "xywh": [
+          396,
+          149,
+          80,
+          317
+        ]
+      }
+    }
+  ]
+}

@@ -35,6 +35,8 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [react(), sam3ExtractPlugin({ python: SAM3_PYTHON, projectDir: SAM3_PROJECT_DIR })],
+    // Allow the test_align_e2e.html page to be served as a second entry.
+    appType: 'mpa',
     server: {
       // Listen on IPv4 explicitly to avoid Edge multipart upload bugs over IPv6/::1
       host: '127.0.0.1',
