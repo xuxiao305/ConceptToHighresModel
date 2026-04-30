@@ -17,6 +17,7 @@ import {
   type Trellis2Params,
 } from '../../services/trellis2';
 import { splitMultiView } from '../../services/multiviewSplit';
+import { extractWithPrompt, EXTRACTION_PROMPT_PRESETS } from '../../services/extraction';
 import { useProject } from '../../contexts/ProjectContext';
 import type { AssetVersion } from '../../services/projectStore';
 
@@ -26,6 +27,8 @@ const NODES: NodeConfig[] = [
   { id: 'multiview', title: 'Multi-View', display: 'multiview', description: '生成多角度视图' },
   { id: 'rough', title: 'Rough Model', display: '3d', description: 'Tripo AI 生成 3D 粗模 (GLB)' },
   { id: 'rigging', title: 'Rough Model Rigging', display: '3d', description: '骨骼绑定' },
+  // 独立节点，与上游不走连线（输入从 Multi-View 读，输出单独供 Page 2 使用）
+  { id: 'extraction', title: 'Extraction (Banana)', display: 'image', description: '基于 Multi-View，提示词提取部件' },
 ];
 
 /** 节点索引 → projectStore 中的 nodeKey（用于历史读写） */
@@ -35,6 +38,7 @@ const NODE_KEYS = [
   'page1.multiview',
   'page1.rough',
   'page1.rigging',
+  'page1.extraction',
 ];
 
 // ----------------------------------------------------------------------------
@@ -86,13 +90,16 @@ interface NodeOutputs {
   roughUrl: string | null;
   /** Rough model 工程文件名（用于显示） */
   roughFile: string | null;
+  /** Extraction（Banana Pro）输出 */
+  extractionUrl: string | null;
+  extractionFile: string | null;
   errors: Record<number, string>;
 }
 
 export function ConceptToRoughModel({ onStatusChange }: Props) {
   const { project, saveAsset, loadLatest, listHistory, loadByName, saveSegments, loadLatestSegments } = useProject();
   const [states, setStates] = useState<NodeState[]>([
-    'idle', 'idle', 'idle', 'idle', 'idle',
+    'idle', 'idle', 'idle', 'idle', 'idle', 'idle',
   ]);
   const [outputs, setOutputs] = useState<NodeOutputs>({
     conceptFile: null,
@@ -101,6 +108,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     multiviewUrl: null,
     roughUrl: null,
     roughFile: null,
+    extractionUrl: null,
+    extractionFile: null,
     errors: {},
   });
   const roughAbortRef = useRef<AbortController | null>(null);
@@ -118,6 +127,21 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
   useEffect(() => {
     try { localStorage.setItem(TRELLIS2_PARAMS_LS_KEY, JSON.stringify(trellis2Params)); } catch { /* ignore */ }
   }, [trellis2Params]);
+
+  // Extraction (Banana Pro) 提示词索引（持久化到 localStorage）
+  const EXTRACTION_PROMPT_LS_KEY = 'page1.extraction.promptIndex';
+  const [extractionPromptIndex, setExtractionPromptIndex] = useState<number>(() => {
+    try {
+      const v = localStorage.getItem(EXTRACTION_PROMPT_LS_KEY);
+      const n = v ? parseInt(v, 10) : 0;
+      return Number.isFinite(n) && n >= 0 && n < EXTRACTION_PROMPT_PRESETS.length ? n : 0;
+    } catch {
+      return 0;
+    }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(EXTRACTION_PROMPT_LS_KEY, String(extractionPromptIndex)); } catch { /* ignore */ }
+  }, [extractionPromptIndex]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -175,6 +199,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       const tpose = await loadLatest('page1.tpose');
       const multiview = await loadLatest('page1.multiview');
       const rough = await loadLatest('page1.rough');
+      const extraction = await loadLatest('page1.extraction');
       if (cancelled) return;
 
       // 用读出的 Blob 构造一个 File 对象，使后续 T Pose 节点可直接复用
@@ -187,6 +212,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         if (prev.tposeUrl) URL.revokeObjectURL(prev.tposeUrl);
         if (prev.multiviewUrl) URL.revokeObjectURL(prev.multiviewUrl);
         if (prev.roughUrl) URL.revokeObjectURL(prev.roughUrl);
+        if (prev.extractionUrl) URL.revokeObjectURL(prev.extractionUrl);
         return {
           conceptFile,
           conceptUrl: concept?.url ?? null,
@@ -194,11 +220,13 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           multiviewUrl: multiview?.url ?? null,
           roughUrl: rough?.url ?? null,
           roughFile: rough?.version.file ?? null,
+          extractionUrl: extraction?.url ?? null,
+          extractionFile: extraction?.version.file ?? null,
           errors: {},
         };
       });
       setStates(() => {
-        const next: NodeState[] = ['idle', 'idle', 'idle', 'idle', 'idle'];
+        const next: NodeState[] = ['idle', 'idle', 'idle', 'idle', 'idle', 'idle'];
         if (concept) next[0] = 'complete';
         if (tpose) next[1] = 'complete';
         else if (concept) next[1] = 'ready';
@@ -206,6 +234,9 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         else if (tpose) next[2] = 'ready';
         if (rough) next[3] = 'complete';
         else if (multiview) next[3] = 'ready';
+        // Extraction 是独立节点：源是 Multi-View，但不阻塞 Rough Model 链路。
+        if (extraction) next[5] = 'complete';
+        else if (multiview) next[5] = 'ready';
         return next;
       });
 
@@ -214,6 +245,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (tpose) loaded.push('T Pose');
       if (multiview) loaded.push('Multi-View');
       if (rough) loaded.push('Rough Model');
+      if (extraction) loaded.push('Extraction');
       onStatusChange(
         loaded.length
           ? `已从工程加载：${loaded.join(' / ')}`
@@ -229,6 +261,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (tpose) sel[1] = tpose.version.file;
       if (multiview) sel[2] = multiview.version.file;
       if (rough) sel[3] = rough.version.file;
+      if (extraction) sel[5] = extraction.version.file;
       setSelectedFiles(sel);
     })().catch((err) => {
       if (cancelled) return;
@@ -259,6 +292,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (prev.tposeUrl) URL.revokeObjectURL(prev.tposeUrl);
       if (prev.multiviewUrl) URL.revokeObjectURL(prev.multiviewUrl);
       if (prev.roughUrl) URL.revokeObjectURL(prev.roughUrl);
+      if (prev.extractionUrl) URL.revokeObjectURL(prev.extractionUrl);
       return {
         conceptFile: file,
         conceptUrl: URL.createObjectURL(file),
@@ -266,6 +300,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         multiviewUrl: null,
         roughUrl: null,
         roughFile: null,
+        extractionUrl: null,
+        extractionFile: null,
         errors: {},
       };
     });
@@ -300,6 +336,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (prev.tposeUrl) URL.revokeObjectURL(prev.tposeUrl);
       if (prev.multiviewUrl) URL.revokeObjectURL(prev.multiviewUrl);
       if (prev.roughUrl) URL.revokeObjectURL(prev.roughUrl);
+      if (prev.extractionUrl) URL.revokeObjectURL(prev.extractionUrl);
       return {
         conceptFile: null,
         conceptUrl: null,
@@ -307,10 +344,12 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         multiviewUrl: null,
         roughUrl: null,
         roughFile: null,
+        extractionUrl: null,
+        extractionFile: null,
         errors: {},
       };
     });
-    setStates(['idle', 'idle', 'idle', 'idle', 'idle']);
+    setStates(['idle', 'idle', 'idle', 'idle', 'idle', 'idle']);
     onStatusChange('已清除', 'info');
   };
 
@@ -642,6 +681,95 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     roughAbortRef.current = null;
   }, []);
 
+  // ---- Extraction node (Banana Pro on Multi-View) -------------------------
+  // 独立节点，不与上游链路绑定，输出会被 Page 2 的 PartPipeline 当作部件源图使用。
+  const runExtraction = useCallback(async (): Promise<string | null> => {
+    const mvUrl = outputsRef.current.multiviewUrl;
+    if (!mvUrl) {
+      onStatusChange('请先生成 Multi-View', 'error');
+      return null;
+    }
+    const preset =
+      EXTRACTION_PROMPT_PRESETS[extractionPromptIndex] ?? EXTRACTION_PROMPT_PRESETS[0];
+
+    setNodeState(5, 'running');
+    setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 5: '' } }));
+    try {
+      // 把 Multi-View blob URL 转成 File 喂给 Banana Pro
+      const mvBlob = await (await fetch(mvUrl)).blob();
+      const sourceFile = new File([mvBlob], 'multiview.png', { type: mvBlob.type || 'image/png' });
+
+      const url = await extractWithPrompt({
+        source: sourceFile,
+        prompt: preset.prompt,
+        onStatus: (m) => onStatusChange(`Extraction · ${m}`, 'info'),
+      });
+
+      // 持久化 + 4 视图切分（与 Multi-View 节点完全一致的命名）
+      let savedFile: string | null = null;
+      if (project) {
+        try {
+          const blob = await (await fetch(url)).blob();
+          const v = await saveAsset(
+            'page1.extraction',
+            blob,
+            'png',
+            preset.label,
+          );
+          if (v) {
+            savedFile = v.file;
+            onStatusChange(`Extraction 已保存到工程：${v.file}`, 'success');
+
+            try {
+              const slices = await splitMultiView(blob);
+              const baseName = v.file.replace(/\.[^.]+$/, '');
+              const setHandle = await saveSegments(
+                'page1.extraction',
+                baseName,
+                v.file,
+                slices.map((s) => ({
+                  name: `${s.view}_{v}.png`,
+                  blob: s.blob,
+                  meta: { view: s.view, bbox: s.bbox, size: s.size },
+                })),
+              );
+              if (setHandle) {
+                onStatusChange(`已切分 4 视图 → ${setHandle.dirName}/`, 'success');
+              }
+            } catch (e) {
+              onStatusChange(
+                `Extraction 4 视图切分失败：${e instanceof Error ? e.message : String(e)}`,
+                'warning',
+              );
+            }
+            setSelectedFiles((prev) => ({ ...prev, 5: v.file }));
+            refreshHistory(5);
+          }
+        } catch (e) {
+          onStatusChange(
+            `Extraction 保存失败：${e instanceof Error ? e.message : String(e)}`,
+            'error',
+          );
+        }
+      }
+
+      setOutputs((prev) => {
+        if (prev.extractionUrl) URL.revokeObjectURL(prev.extractionUrl);
+        return { ...prev, extractionUrl: url, extractionFile: savedFile };
+      });
+      setNodeState(5, 'complete');
+      onStatusChange('Extraction 生成完成', 'success');
+      return url;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[Extraction] failed:', err);
+      setNodeState(5, 'error');
+      setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 5: msg } }));
+      onStatusChange(`Extraction 生成失败：${msg}`, 'error');
+      return null;
+    }
+  }, [onStatusChange, setNodeState, project, saveAsset, saveSegments, refreshHistory, extractionPromptIndex]);
+
   // ---- Mock runner for nodes 3..4 (Rough Model / Rigging) -----------------
   const runMockNode = useCallback(
     (idx: number): Promise<boolean> => {
@@ -758,6 +886,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (prev.tposeUrl) URL.revokeObjectURL(prev.tposeUrl);
       if (prev.multiviewUrl) URL.revokeObjectURL(prev.multiviewUrl);
       if (prev.roughUrl) URL.revokeObjectURL(prev.roughUrl);
+      if (prev.extractionUrl) URL.revokeObjectURL(prev.extractionUrl);
       return {
         conceptFile: null,
         conceptUrl: null,
@@ -765,10 +894,12 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         multiviewUrl: null,
         roughUrl: null,
         roughFile: null,
+        extractionUrl: null,
+        extractionFile: null,
         errors: {},
       };
     });
-    setStates(['idle', 'idle', 'idle', 'idle', 'idle']);
+    setStates(['idle', 'idle', 'idle', 'idle', 'idle', 'idle']);
     onStatusChange('已重置 Pipeline', 'info');
   };
 
@@ -891,6 +1022,32 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                     disabled={state === 'running'}
                   />
                 )}
+                {node.id === 'extraction' && (
+                  <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 3 }}>
+                    <label style={{ fontSize: 10, color: 'var(--text-muted)' }}>提取提示词</label>
+                    <select
+                      value={extractionPromptIndex}
+                      onChange={(e) => setExtractionPromptIndex(Number(e.target.value))}
+                      onClick={(ev) => ev.stopPropagation()}
+                      onDoubleClick={(ev) => ev.stopPropagation()}
+                      disabled={state === 'running'}
+                      title={EXTRACTION_PROMPT_PRESETS[extractionPromptIndex]?.prompt}
+                      style={{
+                        background: 'var(--bg-app)',
+                        color: 'var(--text-primary)',
+                        border: '1px solid var(--border-default)',
+                        fontSize: 11,
+                        padding: '3px 4px',
+                        borderRadius: 2,
+                        width: '100%',
+                      }}
+                    >
+                      {EXTRACTION_PROMPT_PRESETS.map((p, i) => (
+                        <option key={i} value={i}>{p.label}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
               </>
             );
 
@@ -912,10 +1069,12 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
               },
               onRunMock: runMockNode,
               onCancelMock: () => setNodeState(idx, 'idle'),
+              onRunExtraction: runExtraction,
               conceptReady: !!outputs.conceptFile,
               tposeReady: !!outputs.tposeUrl,
               multiviewReady: !!outputs.multiviewUrl,
               roughReady: !!outputs.roughUrl,
+              extractionReady: !!outputs.extractionUrl,
             });
 
             return (
@@ -934,7 +1093,9 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                     ) : undefined
                   }
                   onBodyClick={
-                    idx === 0 ? undefined : () => { void runUpToNode(idx); }
+                    // Concept (idx 0) 不支持单击运行链；
+                    // Extraction (idx 5) 是独立节点，不参与上游链式运行
+                    idx === 0 || idx === 5 ? undefined : () => { void runUpToNode(idx); }
                   }
                   onBodyDoubleClick={(() => {
                     // 3D 节点：双击送入下方 3D Mesh Viewer
@@ -955,8 +1116,15 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                 >
                   {body}
                 </NodeCard>
-                {idx < NODES.length - 1 && (
+                {/* 不渲染连接线：
+                    1) 最后一个节点之后
+                    2) Extraction 节点（idx=5）是独立节点，与上游 rigging（idx=4）之间不画箭头 */}
+                {idx < NODES.length - 1 && idx + 1 !== 5 && (
                   <NodeConnector fromState={state} toState={states[idx + 1]} />
+                )}
+                {/* Extraction 之前用一个视觉间隔代替连接线 */}
+                {idx + 1 === 5 && (
+                  <div style={{ width: 32, flex: '0 0 auto' }} aria-hidden />
                 )}
               </div>
             );
@@ -984,6 +1152,7 @@ function imageForNode(idx: number, outputs: NodeOutputs): string | undefined {
   if (idx === 0) return outputs.conceptUrl ?? undefined;
   if (idx === 1) return outputs.tposeUrl ?? undefined;
   if (idx === 2) return outputs.multiviewUrl ?? undefined;
+  if (idx === 5) return outputs.extractionUrl ?? undefined;
   return undefined;
 }
 
@@ -997,10 +1166,12 @@ interface ActionHandlers {
   onDownloadRough: () => void;
   onRunMock: (idx: number) => void | Promise<boolean>;
   onCancelMock: () => void;
+  onRunExtraction: () => void;
   conceptReady: boolean;
   tposeReady: boolean;
   multiviewReady: boolean;
   roughReady: boolean;
+  extractionReady: boolean;
 }
 
 function renderActions(
@@ -1092,6 +1263,28 @@ function renderActions(
             size="sm"
             disabled={!h.multiviewReady}
             onClick={h.onRunRoughModel}
+          >
+            {isComplete ? '重新生成' : '生成'}
+          </Button>
+        )}
+      </>
+    );
+  }
+
+  if (node.id === 'extraction') {
+    return (
+      <>
+        <Button size="sm" disabled={!isComplete}>导出</Button>
+        {isError ? (
+          <Button variant="primary" size="sm" onClick={h.onRunExtraction}>重试</Button>
+        ) : isRunning ? (
+          <Button variant="danger" size="sm" disabled title="生成中…">生成中…</Button>
+        ) : (
+          <Button
+            variant="primary"
+            size="sm"
+            disabled={!h.multiviewReady}
+            onClick={h.onRunExtraction}
           >
             {isComplete ? '重新生成' : '生成'}
           </Button>

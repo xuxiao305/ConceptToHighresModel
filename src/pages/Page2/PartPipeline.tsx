@@ -20,7 +20,6 @@ export const PART_NODES: NodeConfig[] = [
   { id: 'extraction', title: 'Extraction', display: 'image' },
   { id: 'multiview', title: 'Multi-View', display: 'multiview' },
   { id: 'modify', title: 'Modify', display: 'image', optional: true },
-  { id: 'rough', title: 'Rough Model 3D', display: '3d' },
   { id: 'highres', title: 'Highres Model 3D', display: '3d' },
   { id: 'model', title: 'Final Model', display: '3d' },
   { id: 'retex', title: 'Re-Texturing', display: '3d', optional: true },
@@ -64,7 +63,10 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     if (sourceUrlRef.current) URL.revokeObjectURL(sourceUrlRef.current);
   }, []);
 
-  // Load Multi-View image whenever the active project changes.
+  // Load source image whenever the active project changes.
+  // Prefer page1.extraction (Page1 的"提取"节点输出) — it's already a 4-view
+  // sheet of the isolated subject. Fall back to page1.multiview if no
+  // extraction has been generated yet.
   useEffect(() => {
     let cancelled = false;
     if (!project) {
@@ -74,7 +76,8 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       return;
     }
     (async () => {
-      const r = await loadLatest('page1.multiview');
+      let r = await loadLatest('page1.extraction');
+      if (!r) r = await loadLatest('page1.multiview');
       if (cancelled) {
         if (r?.url) URL.revokeObjectURL(r.url);
         return;
@@ -89,7 +92,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       }
     })().catch((err) => {
       if (cancelled) return;
-      console.warn('[PartPipeline] load page1.multiview failed:', err);
+      console.warn('[PartPipeline] load source image failed:', err);
     });
     return () => { cancelled = true; };
   }, [project, loadLatest]);
@@ -204,7 +207,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
   // Multi-View node.
   const runExtraction = useCallback(async (): Promise<string | null> => {
     if (!sourceFile) {
-      onStatus(`[${pipeline.name}] 缺少源图片：请先在 Page1 生成 Multi-View`, 'error');
+      onStatus(`[${pipeline.name}] 缺少源图片：请先在 Page1 生成 Extraction 或 Multi-View`, 'error');
       return null;
     }
 
@@ -724,7 +727,7 @@ function ExtractionBody({
           </select>
           {!sourceUrl && (
             <div style={{ fontSize: 10, color: 'var(--accent-yellow, #d49b3b)' }}>
-              未检测到源图片：请先在 Page1 生成 Multi-View
+              未检测到源图片：请先在 Page1 生成 Extraction 或 Multi-View
             </div>
           )}
         </div>
@@ -746,12 +749,12 @@ function ExtractionBody({
             SAM3 切割模式
           </div>
           <div>
-            点击下方"生成"按钮，会弹出 SAM3 标注窗口并自动加载源 Multi-View 图。
-            在窗口中完成点选/框选后点"导出 JSON"，窗口会自动关闭并把结果回传到这里。
+            点击下方“生成”按钮，会弹出 SAM3 标注窗口并自动加载源图（优先 Page1 Extraction，其次 Multi-View）。
+            在窗口中完成点选/框选后点“导出 JSON”，窗口会自动关闭并把结果回传到这里。
           </div>
           {!sourceUrl && (
             <div style={{ color: 'var(--accent-yellow, #d49b3b)', marginTop: 2 }}>
-              未检测到源图片：请先在 Page1 生成 Multi-View
+              未检测到源图片：请先在 Page1 生成 Extraction 或 Multi-View
             </div>
           )}
         </div>

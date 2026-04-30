@@ -21,6 +21,9 @@ export interface ProjectMeta {
   createdAt: string;     // ISO timestamp
   updatedAt: string;
   version: 1;
+  /** 工程根目录的本地绝对路径（如 D:\AI\Prototypes\.../GirlOrangeJacket）。
+   *  浏览器无法直接获取，需用户首次打开工程时人工提供，存盘后复用。 */
+  absolutePath?: string;
 }
 
 export interface AssetVersion {
@@ -47,6 +50,7 @@ export const NODE_DIRS: Record<string, NodeDir> = {
   'page1.multiview': { pageDir: 'page1_concept_to_rough', nodeDir: '03_multiview' },
   'page1.rough':     { pageDir: 'page1_concept_to_rough', nodeDir: '04_rough' },
   'page1.rigging':   { pageDir: 'page1_concept_to_rough', nodeDir: '05_rigging' },
+  'page1.extraction': { pageDir: 'page1_concept_to_rough', nodeDir: '06_extraction' },
   // Page 2
   'page2.extraction': { pageDir: 'page2_highres', nodeDir: '01_extraction' },
   'page2.highres':   { pageDir: 'page2_highres', nodeDir: '02_highres' },
@@ -170,6 +174,17 @@ export async function touchProject(handle: ProjectHandle): Promise<void> {
 /** 重命名工程 */
 export async function renameProject(handle: ProjectHandle, newName: string): Promise<void> {
   handle.meta.name = newName;
+  await touchProject(handle);
+}
+
+/** 设置/更新工程根目录的本地绝对路径（用户人工提供，便于"复制路径"功能） */
+export async function setProjectAbsolutePath(
+  handle: ProjectHandle,
+  absolutePath: string,
+): Promise<void> {
+  // 标准化分隔符：保留用户原样（Windows 反斜杠 / POSIX 正斜杠均可）
+  const trimmed = absolutePath.trim().replace(/[\\/]+$/, '');
+  handle.meta.absolutePath = trimmed || undefined;
   await touchProject(handle);
 }
 
