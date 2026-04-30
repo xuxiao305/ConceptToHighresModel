@@ -21,7 +21,6 @@ export const PART_NODES: NodeConfig[] = [
   { id: 'multiview', title: 'Multi-View', display: 'multiview' },
   { id: 'modify', title: 'Modify', display: 'image', optional: true },
   { id: 'highres', title: 'Highres Model 3D', display: '3d' },
-  { id: 'model', title: 'Final Model', display: '3d' },
   { id: 'retex', title: 'Re-Texturing', display: '3d', optional: true },
   { id: 'region', title: 'Region Define', display: '3d', optional: true },
 ];
@@ -585,13 +584,7 @@ function renderPartActions(
   const isComplete = state === 'complete';
   const isError = state === 'error';
 
-  const primaryLabel = isComplete
-    ? node.id === 'model'
-      ? '已确认'
-      : '重新生成'
-    : node.id === 'model'
-    ? '确认'
-    : '生成';
+  const primaryLabel = isComplete ? '重新生成' : '生成';
 
   const extraButtons: ReactNode[] = [];
   if (node.id === 'highres' && isComplete) {
