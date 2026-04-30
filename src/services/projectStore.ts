@@ -52,6 +52,7 @@ export const NODE_DIRS: Record<string, NodeDir> = {
   'page1.rigging':   { pageDir: 'page1_concept_to_rough', nodeDir: '05_rigging' },
   'page1.extraction': { pageDir: 'page1_concept_to_rough', nodeDir: '06_extraction' },
   // Page 2
+  'page2.imageInput': { pageDir: 'page2_highres', nodeDir: '00_image_input' },
   'page2.extraction': { pageDir: 'page2_highres', nodeDir: '01_extraction' },
   'page2.highres':   { pageDir: 'page2_highres', nodeDir: '02_highres' },
   // Page 3 占位（后续节点接入时按需追加）

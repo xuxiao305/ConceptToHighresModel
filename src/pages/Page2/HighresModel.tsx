@@ -15,10 +15,13 @@ const makePart = (idx: number): PartPipelineState => ({
   name: `Part ${idx + 1}`,
   nodeStates: (() => {
     const arr = makeInitialNodeStates();
-    arr[0] = 'ready'; // first node always starts ready
+    arr[0] = 'ready'; // Image Input node always starts ready
     return arr;
   })(),
   expanded: {},
+  imageInput: {
+    imageUrl: null,
+  },
   extraction: {
     mode: 'banana',
     promptIndex: 0,

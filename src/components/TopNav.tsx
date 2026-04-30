@@ -15,7 +15,7 @@ const tabs: { id: PageId; label: string; subtitle: string }[] = [
 ];
 
 export function TopNav({ active, onChange, onProjectStatus }: TopNavProps) {
-  const { project, supported, newOrOpenProject, closeProject } = useProject();
+  const { project, supported, newOrOpenProject, closeProject, setAbsolutePath } = useProject();
 
   const handleOpen = async () => {
     if (!supported) {
@@ -36,6 +36,58 @@ export function TopNav({ active, onChange, onProjectStatus }: TopNavProps) {
   const handleClose = () => {
     closeProject();
     onProjectStatus?.('已关闭工程', 'info');
+  };
+
+  // 浏览器无法直接打开 OS 资源管理器，只能把工程根目录的绝对路径复制到剪贴板。
+  // 首次使用时弹一次 prompt 让用户粘贴绝对路径，存到 project.json 后续复用。
+  const ensureAbsolutePath = async (): Promise<string | null> => {
+    if (!project) return null;
+    if (project.meta.absolutePath) return project.meta.absolutePath;
+    const input = window.prompt(
+      `请粘贴工程根目录的本地绝对路径（一次性设置，会保存到 project.json）：\n例如：D:\\AI\\Prototypes\\ConceptToHighresModel\\Projects\\${project.meta.name}`,
+      '',
+    );
+    if (!input) return null;
+    try {
+      await setAbsolutePath(input);
+      onProjectStatus?.(`已记录工程绝对路径：${input}`, 'success');
+      return input.trim().replace(/[\\/]+$/, '');
+    } catch (err) {
+      onProjectStatus?.(
+        `保存失败：${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+      return null;
+    }
+  };
+
+  const handleCopyProjectPath = async () => {
+    const path = await ensureAbsolutePath();
+    if (!path) return;
+    try {
+      await navigator.clipboard.writeText(path);
+      onProjectStatus?.(`已复制工程目录路径：${path}`, 'success');
+    } catch {
+      onProjectStatus?.(`复制失败 — 路径：${path}`, 'error');
+    }
+  };
+
+  const handleEditAbsolutePath = async () => {
+    if (!project) return;
+    const input = window.prompt(
+      '修改工程根目录的本地绝对路径：',
+      project.meta.absolutePath ?? '',
+    );
+    if (input == null) return;
+    try {
+      await setAbsolutePath(input);
+      onProjectStatus?.(`已更新工程绝对路径：${input}`, 'success');
+    } catch (err) {
+      onProjectStatus?.(
+        `保存失败：${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    }
   };
 
   return (
@@ -144,6 +196,24 @@ export function TopNav({ active, onChange, onProjectStatus }: TopNavProps) {
             >
               {project.meta.name}
             </span>
+            <button
+              onClick={handleCopyProjectPath}
+              style={topNavBtnStyle}
+              title={
+                project.meta.absolutePath
+                  ? `复制工程目录绝对路径到剪贴板\n当前：${project.meta.absolutePath}`
+                  : '首次使用会询问绝对路径，之后保存到 project.json 复用'
+              }
+            >
+              📋 路径
+            </button>
+            <button
+              onClick={handleEditAbsolutePath}
+              style={topNavBtnStyle}
+              title="修改记录的工程绝对路径"
+            >
+              ✎
+            </button>
             <button
               onClick={handleOpen}
               style={topNavBtnStyle}

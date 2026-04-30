@@ -198,15 +198,21 @@ export function matchPartialToWhole(
   const srcFrame = useAxial ? computeAxialFrame(src.vertices, srcPool) : null;
   const tarFrame = useAxial ? computeAxialFrame(tar.vertices, tarPool) : null;
 
-  // Inner pipeline: given a chosen target axial direction (forward or
-  // reversed), build descriptors, do top-K, run RANSAC, refit, return
-  // the result. Called once for the forward direction; if axial features
-  // are active and the forward result is weak, called again with the
-  // reverse direction. Whichever has more inliers wins.
-  const runPipeline = (flipTarAxial: boolean): PartialMatchResult => {
+  // Inner pipeline: given a chosen target frame orientation (axis
+  // direction + cross-section basis sign), build descriptors, do top-K,
+  // run RANSAC, refit, return the result.  Axis-direction is one bit
+  // (axial vs 1 - axial); cross-section basis has two sign bits because
+  // axis2 / axis3 = axis × axis2 are arbitrary up to mirror.  Total = 8
+  // combinations; we run them all and keep whichever yields the most
+  // RANSAC inliers.
+  const runPipeline = (
+    flipTarAxial: boolean,
+    flipTarAxis2: boolean,
+    flipTarAxis3: boolean,
+  ): PartialMatchResult => {
     const axialOpts =
       useAxial && srcFrame && tarFrame
-        ? { srcFrame, tarFrame, flipTarAxial }
+        ? { srcFrame, tarFrame, flipTarAxial, flipTarAxis2, flipTarAxis3 }
         : undefined;
     const { srcDesc, tarDesc, descDim } = buildDescriptors(
       srcSamples, tarSamples, src, tar, srcBboxDiag, opt, axialOpts,
@@ -218,13 +224,19 @@ export function matchPartialToWhole(
     );
   };
 
-  const forward = runPipeline(false);
-  if (!useAxial) return forward;
-  const reverse = runPipeline(true);
-  // Pick whichever direction yielded more inliers (RANSAC consensus is
-  // the only honest signal here — descriptor distance alone could be
-  // gamed by the axial penalty itself).
-  return reverse.bestInlierCount > forward.bestInlierCount ? reverse : forward;
+  if (!useAxial) {
+    return runPipeline(false, false, false);
+  }
+  let best: PartialMatchResult | null = null;
+  for (const fa of [false, true]) {
+    for (const f2 of [false, true]) {
+      for (const f3 of [false, true]) {
+        const r = runPipeline(fa, f2, f3);
+        if (!best || r.bestInlierCount > best.bestInlierCount) best = r;
+      }
+    }
+  }
+  return best!;
 }
 
 /**
@@ -493,7 +505,7 @@ export function computePartialDebug(
   const tarFrame = useAxial ? computeAxialFrame(tar.vertices, tarSaliencyTop) : null;
   const axialOpts =
     useAxial && srcFrame && tarFrame
-      ? { srcFrame, tarFrame, flipTarAxial: false }
+      ? { srcFrame, tarFrame, flipTarAxial: false, flipTarAxis2: false, flipTarAxis3: false }
       : undefined;
   const { srcDesc, tarDesc, descDim: _dim } = buildDescriptors(
     srcFPS, tarFPS, src, tar, srcBboxDiag, opt, axialOpts,
@@ -567,7 +579,12 @@ function buildDescriptors(
   axialOpts?: {
     srcFrame: AxialFrame;
     tarFrame: AxialFrame;
+    /** Flip the target's axial coordinate (axial → 1 - axial). */
     flipTarAxial: boolean;
+    /** Negate the target's cosAz channel (mirror axis2 direction). */
+    flipTarAxis2: boolean;
+    /** Negate the target's sinAz channel (mirror axis3 direction). */
+    flipTarAxis3: boolean;
   },
 ): { srcDesc: Float32Array; tarDesc: Float32Array; descDim: number } {
   const radii = opt.radiusFractions.map((f) => f * srcBboxDiag);
@@ -601,9 +618,10 @@ function buildDescriptors(
     }
   }
 
-  // 2) Optional axial+radial channels appended at the end.
+  // 2) Optional axial+radial+azimuth channels appended at the end.
+  // Layout per sample: [axial, radial, cosAz, sinAz] all weighted.
   const useAxial = !!axialOpts && opt.axialWeight > 0;
-  const extraDim = useAxial ? 2 : 0;
+  const extraDim = useAxial ? 4 : 0;
   const totalDim = geomDim + extraDim;
   if (!useAxial) {
     return { srcDesc: geomSrc, tarDesc: geomTar, descDim: geomDim };
@@ -623,17 +641,24 @@ function buildDescriptors(
       tarDesc[j * totalDim + c] = geomTar[j * geomDim + c];
     }
   }
-  // Append axial+radial * weight.
+  // Append axial+radial+azimuth, each weighted by `axialWeight`.
   const srcAR = computeAxialRadialBatch(srcIndices, src.vertices, axialOpts.srcFrame);
   const tarAR = computeAxialRadialBatch(tarIndices, tar.vertices, axialOpts.tarFrame);
   for (let i = 0; i < srcIndices.length; i++) {
-    srcDesc[i * totalDim + geomDim] = srcAR[i * 2] * w;
-    srcDesc[i * totalDim + geomDim + 1] = srcAR[i * 2 + 1] * w;
+    srcDesc[i * totalDim + geomDim] = srcAR[i * 4] * w;
+    srcDesc[i * totalDim + geomDim + 1] = srcAR[i * 4 + 1] * w;
+    srcDesc[i * totalDim + geomDim + 2] = srcAR[i * 4 + 2] * w;
+    srcDesc[i * totalDim + geomDim + 3] = srcAR[i * 4 + 3] * w;
   }
+  const flipA = axialOpts.flipTarAxial;
+  const sCos = axialOpts.flipTarAxis2 ? -1 : 1;
+  const sSin = axialOpts.flipTarAxis3 ? -1 : 1;
   for (let j = 0; j < tarIndices.length; j++) {
-    const a = axialOpts.flipTarAxial ? 1 - tarAR[j * 2] : tarAR[j * 2];
+    const a = flipA ? 1 - tarAR[j * 4] : tarAR[j * 4];
     tarDesc[j * totalDim + geomDim] = a * w;
-    tarDesc[j * totalDim + geomDim + 1] = tarAR[j * 2 + 1] * w;
+    tarDesc[j * totalDim + geomDim + 1] = tarAR[j * 4 + 1] * w;
+    tarDesc[j * totalDim + geomDim + 2] = sCos * tarAR[j * 4 + 2] * w;
+    tarDesc[j * totalDim + geomDim + 3] = sSin * tarAR[j * 4 + 3] * w;
   }
   return { srcDesc, tarDesc, descDim: totalDim };
 }

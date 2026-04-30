@@ -17,3 +17,7 @@ tripo_test_*.glb
 Data/trellis2_test/
 Data/multiview_test_*.png
 
+
+# SAM3 / 反投影测试数据
+Data/SAM3_SegInfo/
+Data/mask.png

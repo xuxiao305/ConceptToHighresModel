@@ -16,6 +16,7 @@ import {
   renameProject as renameProjectApi,
   saveNodeAsset,
   saveSegmentSet,
+  setProjectAbsolutePath,
   type AssetVersion,
   type ProjectHandle,
   type SegmentSetHandle,
@@ -31,6 +32,8 @@ interface ProjectContextValue {
   newOrOpenProject: () => Promise<ProjectHandle>;
   closeProject: () => void;
   rename: (name: string) => Promise<void>;
+  /** 保存工程根目录的本地绝对路径（用户人工提供） */
+  setAbsolutePath: (path: string) => Promise<void>;
 
   /** 保存节点产物，工程未打开时静默跳过并返回 null */
   saveAsset: (
@@ -89,6 +92,15 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       if (!project) return;
       await renameProjectApi(project, name);
       // 触发 React 重渲染（meta 是 mutable，但要让消费者刷新）
+      setProject({ ...project, meta: { ...project.meta } });
+    },
+    [project]
+  );
+
+  const setAbsolutePath = useCallback(
+    async (path: string) => {
+      if (!project) return;
+      await setProjectAbsolutePath(project, path);
       setProject({ ...project, meta: { ...project.meta } });
     },
     [project]
@@ -160,6 +172,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       newOrOpenProject,
       closeProject,
       rename,
+      setAbsolutePath,
       saveAsset,
       loadLatest,
       listHistory,
@@ -167,7 +180,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       saveSegments,
       loadLatestSegments,
     }),
-    [project, supported, newOrOpenProject, closeProject, rename, saveAsset, loadLatest, listHistory, loadByName, saveSegments, loadLatestSegments]
+    [project, supported, newOrOpenProject, closeProject, rename, setAbsolutePath, saveAsset, loadLatest, listHistory, loadByName, saveSegments, loadLatestSegments]
   );
 
   return <ProjectContext.Provider value={value}>{children}</ProjectContext.Provider>;

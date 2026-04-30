@@ -13,10 +13,11 @@ import {
   SAM3CancelledError,
   SAM3NotWiredError,
 } from '../../services/extraction';
-import { NODE_DIRS, type AssetVersion } from '../../services/projectStore';
+import { type AssetVersion } from '../../services/projectStore';
 import { splitMultiView } from '../../services/multiviewSplit';
 
 export const PART_NODES: NodeConfig[] = [
+  { id: 'imageInput', title: 'Image Input', display: 'image' },
   { id: 'extraction', title: 'Extraction', display: 'image' },
   { id: 'multiview', title: 'Multi-View', display: 'multiview' },
   { id: 'modify', title: 'Modify', display: 'image', optional: true },
@@ -85,6 +86,16 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       if (r) {
         setSourceFile(new File([r.blob], r.version.file, { type: r.blob.type || 'image/png' }));
         setSourceUrl(r.url);
+        // Mark Image Input node (idx 0) as complete and Extraction (idx 1) as ready
+        // only if they haven't been manually set to something more advanced.
+        onUpdate(pipeline.id, {
+          ...pipeline,
+          nodeStates: pipeline.nodeStates.map((v, idx) => {
+            if (idx === 0 && v !== 'complete') return 'complete';
+            if (idx === 1 && v === 'idle') return 'ready';
+            return v;
+          }),
+        });
       } else {
         setSourceFile(null);
         setSourceUrl(null);
@@ -107,6 +118,20 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       onUpdate(pipeline.id, next);
     },
     [pipeline, extraction, onUpdate]
+  );
+
+  // Helpers to update imageInput sub-state immutably.
+  const imageInput = pipeline.imageInput ?? { imageUrl: null };
+  // @ts-expect-error — will be used when Image Input source selection is implemented
+  const updateImageInput = useCallback(
+    (patch: Partial<NonNullable<PartPipelineState['imageInput']>>) => {
+      const next: PartPipelineState = {
+        ...pipeline,
+        imageInput: { ...imageInput, ...patch },
+      };
+      onUpdate(pipeline.id, next);
+    },
+    [pipeline, imageInput, onUpdate]
   );
 
   // 加载本 Pipeline 的 Extraction 历史（按 pipeline.name 前缀过滤）。
@@ -153,7 +178,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       if (extraction.resultUrl) URL.revokeObjectURL(extraction.resultUrl);
       onUpdate(pipeline.id, {
         ...pipeline,
-        nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 0 ? 'complete' : v)),
+        nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'complete' : v)),
         extraction: { ...extraction, resultUrl: r.url, resultFile: fileName, error: undefined },
       });
       onStatus(`[${pipeline.name}] 已切换到 ${fileName}`, 'success');
@@ -164,31 +189,6 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       );
     }
   }, [project, loadByName, pipeline, extraction, onUpdate, onStatus]);
-
-  // "复制图片所在路径"：浏览器无法直接打开资源管理器，只能把绝对路径放剪贴板。
-  // 路径精确到文件夹一级（不含文件名），便于直接粘贴到资源管理器地址栏。
-  const handleCopyExtractionPath = useCallback(async () => {
-    if (!project) {
-      onStatus(`[${pipeline.name}] 未打开工程`, 'warning');
-      return;
-    }
-    if (!project.meta.absolutePath) {
-      onStatus(
-        `[${pipeline.name}] 未配置工程绝对路径，请先点击右上角"📋 路径"按钮设置`,
-        'warning',
-      );
-      return;
-    }
-    const dirs = NODE_DIRS['page2.extraction'];
-    const sep = /[\\]/.test(project.meta.absolutePath) ? '\\' : '/';
-    const fullDir = [project.meta.absolutePath, dirs.pageDir, dirs.nodeDir].join(sep);
-    try {
-      await navigator.clipboard.writeText(fullDir);
-      onStatus(`[${pipeline.name}] 已复制目录路径：${fullDir}`, 'success');
-    } catch {
-      onStatus(`[${pipeline.name}] 复制失败 — 路径：${fullDir}`, 'warning');
-    }
-  }, [pipeline.name, project, onStatus]);
 
   const setStateAt = useCallback(
     (i: number, s: NodeState) => {
@@ -219,7 +219,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     // Set running
     onUpdate(pipeline.id, {
       ...pipeline,
-      nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 0 ? 'running' : v)),
+      nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'running' : v)),
       extraction: { ...extraction, error: undefined },
     });
     onStatus(
@@ -293,8 +293,8 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       onUpdate(pipeline.id, {
         ...pipeline,
         nodeStates: pipeline.nodeStates.map((v, idx) => {
-          if (idx === 0) return 'complete';
-          if (idx === 1) {
+          if (idx === 1) return 'complete';
+          if (idx === 2) {
             // Promote Multi-View to ready
             const cfg = PART_NODES[idx];
             if (cfg.optional) return v === 'idle' ? 'optional' : v;
@@ -315,7 +315,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
         console.warn('[PartPipeline] SAM3 cancelled:', err);
         onUpdate(pipeline.id, {
           ...pipeline,
-          nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 0 ? 'ready' : v)),
+          nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'ready' : v)),
           extraction: { ...extraction, error: undefined },
         });
         onStatus(`[${pipeline.name}] 已取消 SAM3 标注`, 'warning');
@@ -328,7 +328,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       console.error('[PartPipeline] extraction failed:', err);
       onUpdate(pipeline.id, {
         ...pipeline,
-        nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 0 ? 'error' : v)),
+        nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'error' : v)),
         extraction: { ...extraction, error: friendlyMsg },
       });
       onStatus(`[${pipeline.name}] Extraction 失败：${friendlyMsg}`, 'error');
@@ -339,7 +339,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
   const runNode = useCallback(
     (i: number) => {
       // Extraction node: real Banana Pro call
-      if (i === 0) {
+      if (i === 1) {
         void runExtraction();
         return;
       }
@@ -486,7 +486,14 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
 
             const body: ReactNode = (
               <>
-                {node.id === 'extraction' ? (
+                {node.id === 'imageInput' ? (
+                  <ImageInputBody
+                    state={state}
+                    imageUrl={imageInput.imageUrl}
+                    sourceUrl={sourceUrl}
+                    label={`${pipeline.name} · ${node.title}`}
+                  />
+                ) : node.id === 'extraction' ? (
                   <ExtractionBody
                     state={state}
                     mode={extraction.mode}
@@ -497,7 +504,6 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
                     error={extraction.error}
                     onModeChange={(m) => updateExtraction({ mode: m })}
                     onPromptChange={(idx) => updateExtraction({ promptIndex: idx })}
-                    onCopyPath={handleCopyExtractionPath}
                     label={`${pipeline.name} · ${node.title}`}
                   />
                 ) : (
@@ -515,9 +521,11 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
 
             // 双击节点正文：图像类节点弹大图预览。
             const previewImageUrl =
-              node.id === 'extraction'
-                ? extraction.resultUrl ?? sourceUrl
-                : undefined;
+              node.id === 'imageInput'
+                ? imageInput.imageUrl ?? sourceUrl
+                : node.id === 'extraction'
+                  ? extraction.resultUrl ?? sourceUrl
+                  : undefined;
             const onBodyDoubleClick = previewImageUrl
               ? () => setPreview({ url: previewImageUrl, title: `${i + 1}. ${node.title} · ${pipeline.name}` })
               : undefined;
@@ -580,6 +588,11 @@ function renderPartActions(
     );
   }
 
+  // Image Input node: auto-loaded from Page1, no manual action needed.
+  if (node.id === 'imageInput') {
+    return null;
+  }
+
   const isRunning = state === 'running';
   const isComplete = state === 'complete';
   const isError = state === 'error';
@@ -626,6 +639,39 @@ function renderPartActions(
 }
 
 // ---------------------------------------------------------------------------
+// Image Input node body
+// ---------------------------------------------------------------------------
+
+interface ImageInputBodyProps {
+  state: NodeState;
+  imageUrl: string | null;
+  sourceUrl: string | null;
+  label: string;
+}
+
+function ImageInputBody({ state, imageUrl, sourceUrl, label }: ImageInputBodyProps) {
+  // Preview: user-set image > source image from Page1
+  const previewUrl = imageUrl ?? sourceUrl;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <Placeholder
+        type="image"
+        state={previewUrl && state !== 'running' && state !== 'error' ? 'complete' : state}
+        label={label}
+        imageUrl={previewUrl ?? undefined}
+        height={140}
+      />
+      {!previewUrl && (
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', textAlign: 'center' }}>
+          未检测到源图片
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Extraction node body
 // ---------------------------------------------------------------------------
 
@@ -639,7 +685,6 @@ interface ExtractionBodyProps {
   error?: string;
   onModeChange: (mode: ExtractionMode) => void;
   onPromptChange: (idx: number) => void;
-  onCopyPath: () => void;
   label: string;
 }
 
@@ -648,12 +693,11 @@ function ExtractionBody({
   mode,
   promptIndex,
   resultUrl,
-  resultFile,
+  resultFile: _resultFile,
   sourceUrl,
   error,
   onModeChange,
   onPromptChange,
-  onCopyPath,
   label,
 }: ExtractionBodyProps) {
   // Pick the image to preview: result if present, otherwise the source.
@@ -751,30 +795,6 @@ function ExtractionBody({
             </div>
           )}
         </div>
-      )}
-
-      {/* 复制路径（浏览器无法直接 reveal in folder） */}
-      {resultFile && (
-        <button
-          onClick={(e) => { e.stopPropagation(); onCopyPath(); }}
-          onDoubleClick={(e) => e.stopPropagation()}
-          title={`复制图片所在文件夹的绝对路径到剪贴板\n文件名：${resultFile}`}
-          style={{
-            background: 'var(--bg-app)',
-            color: 'var(--text-secondary)',
-            border: '1px solid var(--border-default)',
-            fontSize: 10,
-            padding: '2px 6px',
-            borderRadius: 2,
-            cursor: 'pointer',
-            textAlign: 'left',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          📋 复制所在文件夹路径
-        </button>
       )}
 
       {error && (

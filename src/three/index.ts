@@ -64,3 +64,5 @@ export type {
 } from './maskReproject';
 export { extractImageSubjectBBox } from './imageSubjectBBox';
 export type { SubjectBBox, ExtractOptions as SubjectExtractOptions } from './imageSubjectBBox';
+export { icpRefine } from './icpRefine';
+export type { IcpOptions, IcpResult, IcpIteration } from './icpRefine';

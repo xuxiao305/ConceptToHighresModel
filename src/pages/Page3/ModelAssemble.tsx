@@ -14,8 +14,6 @@ import {
   useLandmarkStore,
   loadGlbAsMesh,
   buildMeshAdjacency,
-  growRegion,
-  matchRegionCandidates,
   matchGlobalCandidates,
   ransacFilterCandidates,
   matchPartialToWhole,
@@ -25,6 +23,7 @@ import {
   loadMaskGray,
   reprojectMaskToVertices,
   extractImageSubjectBBox,
+  icpRefine,
   type Vec3,
   type Face3,
   type ViewMode,
@@ -140,15 +139,17 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [selectedGalleryPreviewUrl, setSelectedGalleryPreviewUrl] = useState<string | null>(null);
 
   // ── Phase 1 region-grow state ─────────────────────────────────────────
-  const [seedMode, setSeedMode] = useState(false);
-  const [growMaxSteps, setGrowMaxSteps] = useState(15);
-  const [growMaxVertices, setGrowMaxVertices] = useState(2000);
-  const [growCurvatureDeg, setGrowCurvatureDeg] = useState(60);
+  // NOTE: the manual seed-mode UI was removed in favour of SAM3 mask
+  // reprojection. `tarRegion` is still set programmatically by the
+  // "设为 seed" button on a SAM3 region; partial-match reads it for
+  // hard constraint + soft seed. `srcRegion` is currently unused but
+  // kept for future symmetry (source-side SAM3 region).
   const [srcRegion, setSrcRegion] = useState<MeshRegion | null>(null);
   const [tarRegion, setTarRegion] = useState<MeshRegion | null>(null);
 
-  // ── Phase 2 candidate matching state ──────────────────────────────────
-  const [numCandidates, setNumCandidates] = useState(5);
+  // ── Phase 2 candidate list state ────────────────────────────────────────────
+  // The "查找候选" UI for region-based local matching was removed; the
+  // candidate list itself is reused by partial-match results.
   const [candidates, setCandidates] = useState<LandmarkCandidate[]>([]);
   const [acceptedCandidateIds, setAcceptedCandidateIds] = useState<Set<number>>(
     () => new Set(),
@@ -248,40 +249,6 @@ export function ModelAssemble({ onStatusChange }: Props) {
     setCandidates([]);
     setAcceptedCandidateIds(new Set());
   }, []);
-
-  const handleFindCandidates = useCallback(() => {
-    if (!srcRegion || !tarRegion) {
-      onStatusChange('请先在 Source 和 Target 上各设置一个 Seed', 'warning');
-      return;
-    }
-    if (srcRegion.vertices.size < 3 || tarRegion.vertices.size < 3) {
-      onStatusChange('区域顶点过少（< 3），无法匹配候选', 'warning');
-      return;
-    }
-    const t0 = performance.now();
-    const result = matchRegionCandidates(
-      { region: srcRegion, vertices: srcMesh.vertices, adjacency: srcAdjacency },
-      { region: tarRegion, vertices: tarMesh.vertices, adjacency: tarAdjacency },
-      { numCandidates },
-    );
-    const dt = performance.now() - t0;
-    setCandidates(result);
-    setAcceptedCandidateIds(new Set());
-    const accepted = result.filter((c) => c.suggestAccept).length;
-    onStatusChange(
-      `已生成 ${result.length} 个候选（${accepted} 推荐接受）— ${dt.toFixed(1)}ms`,
-      'success',
-    );
-  }, [
-    srcRegion,
-    tarRegion,
-    srcMesh,
-    tarMesh,
-    srcAdjacency,
-    tarAdjacency,
-    numCandidates,
-    onStatusChange,
-  ]);
 
   const handleAcceptCandidate = useCallback(
     (i: number) => {
@@ -1076,19 +1043,6 @@ export function ModelAssemble({ onStatusChange }: Props) {
     modifiers: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean },
   ) => {
     if (!modifiers.ctrlKey) return;
-    if (seedMode) {
-      const region = growRegion(idx, srcMesh.vertices, srcAdjacency, {
-        maxSteps: growMaxSteps,
-        maxVertices: growMaxVertices,
-        curvatureThreshold: (growCurvatureDeg * Math.PI) / 180,
-      });
-      setSrcRegion(region);
-      onStatusChange(
-        `Source 区域：seed=${region.seedVertex} | 顶点=${region.vertices.size} | 步数=${region.finalSteps} | 停止=${region.stopReason}`,
-        'info',
-      );
-      return;
-    }
     const nextIndex = (srcLandmarks[srcLandmarks.length - 1]?.index ?? 0) + 1;
     addSrcLandmark(idx, pos);
     selectSourceLandmark(nextIndex);
@@ -1102,19 +1056,6 @@ export function ModelAssemble({ onStatusChange }: Props) {
     modifiers: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean },
   ) => {
     if (!modifiers.ctrlKey) return;
-    if (seedMode) {
-      const region = growRegion(idx, tarMesh.vertices, tarAdjacency, {
-        maxSteps: growMaxSteps,
-        maxVertices: growMaxVertices,
-        curvatureThreshold: (growCurvatureDeg * Math.PI) / 180,
-      });
-      setTarRegion(region);
-      onStatusChange(
-        `Target 区域：seed=${region.seedVertex} | 顶点=${region.vertices.size} | 步数=${region.finalSteps} | 停止=${region.stopReason}`,
-        'info',
-      );
-      return;
-    }
     const nextIndex = (tarLandmarks[tarLandmarks.length - 1]?.index ?? 0) + 1;
     addTarLandmark(idx, pos);
     selectTargetLandmark(nextIndex);
@@ -1192,6 +1133,149 @@ export function ModelAssemble({ onStatusChange }: Props) {
     }
   };
 
+  // Auto pipeline: partial-match → SVD landmark fit → ICP refine.
+  // One button does everything; result lands in resultPreview so the
+  // "重叠预览" button lights up immediately.
+  const handleAutoAlign = useCallback(() => {
+    if (srcMesh.vertices.length === 0 || tarMesh.vertices.length === 0) {
+      onStatusChange('Source/Target 尚未加载', 'warning');
+      return;
+    }
+    setPartialLoading(true);
+    setAligning(true);
+    setTimeout(() => {
+      try {
+        const t0 = performance.now();
+
+        // 1. Partial match
+        const pm = matchPartialToWhole(
+          { vertices: srcMesh.vertices, adjacency: srcAdjacency },
+          { vertices: tarMesh.vertices, adjacency: tarAdjacency },
+          {
+            numSrcSamples: partialSrcSamples,
+            numTarSamples: partialTarSamples,
+            topK: partialTopK,
+            iterations: partialIterations,
+            inlierThreshold: partialThresholdPct / 100,
+            descriptor: partialDescriptor,
+            tarSeedCentroid: tarRegion?.centroid,
+            tarSeedRadius: tarRegion?.boundingRadius,
+            tarSeedWeight: tarRegion ? partialSeedWeight : 0,
+            tarConstraintVertices: tarRegion?.vertices,
+            axialWeight: partialAxialWeight,
+          },
+        );
+        if (!pm.matrix4x4 || pm.pairs.length < 3) {
+          onStatusChange(
+            `自动对齐：partial-match 失败 (inliers=${pm.bestInlierCount})`,
+            'error',
+          );
+          setPartialLoading(false);
+          setAligning(false);
+          return;
+        }
+
+        // 2. SVD landmark fit on accepted pairs (similarity).
+        const lmFit = alignSourceMeshByLandmarks(
+          srcMesh.vertices,
+          pm.pairs.map((p) => p.srcPosition),
+          pm.pairs.map((p) => p.tarPosition),
+          'similarity',
+        );
+
+        // 3. ICP refine starting from the SVD initial transform.
+        const icp = icpRefine(srcMesh.vertices, tarMesh.vertices, lmFit.matrix4x4);
+
+        // Pick the best of {SVD-only, ICP-best}. ICP can occasionally
+        // diverge on tricky overlaps; this comparison guards that.
+        const useIcp = icp.rmse < lmFit.rmse;
+        const finalMatrix = useIcp ? icp.matrix4x4 : lmFit.matrix4x4;
+        const finalRmse = useIcp ? icp.rmse : lmFit.rmse;
+
+        const transformedVertices = srcMesh.vertices.map((v) =>
+          applyTransform(v, finalMatrix),
+        );
+        const alignedSrcLandmarks = pm.pairs.map((p) =>
+          applyTransform(p.srcPosition, finalMatrix),
+        );
+        const targetLandmarks = pm.pairs.map((p) => p.tarPosition);
+
+        const errs: number[] = [];
+        for (let i = 0; i < pm.pairs.length; i++) {
+          const a = alignedSrcLandmarks[i];
+          const b = targetLandmarks[i];
+          const dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+          errs.push(Math.sqrt(dx * dx + dy * dy + dz * dz));
+        }
+        const meanError = errs.reduce((s, v) => s + v, 0) / errs.length;
+        const maxError = Math.max(...errs);
+        const sx = Math.sqrt(
+          finalMatrix[0][0] ** 2 + finalMatrix[1][0] ** 2 + finalMatrix[2][0] ** 2,
+        );
+
+        setCandidates(pm.pairs);
+        setAcceptedCandidateIds(new Set(pm.pairs.map((_, i) => i)));
+        setAlignResult({
+          mode: 'similarity',
+          matrix4x4: finalMatrix,
+          transformedVertices,
+          alignedSrcLandmarks,
+          targetLandmarks,
+          rmse: finalRmse,
+          meanError,
+          maxError,
+          scale: sx,
+        });
+        setResultPreview({
+          mode: 'similarity',
+          originalVertices: srcMesh.vertices,
+          alignedVertices: transformedVertices,
+          alignedSrcLandmarks,
+          targetLandmarks,
+          faces: srcMesh.faces,
+          rmse: finalRmse,
+          meanError,
+          maxError,
+          scale: sx,
+        });
+        setCenterViewMode('result');
+        setResultViewMode('overlay');
+
+        const dt = performance.now() - t0;
+        const icpSummary = useIcp
+          ? `ICP 收敛于 ${icp.iterations.length} 轮 (${icp.stopReason}, best#${icp.bestIteration + 1})`
+          : `ICP 未改善 (lmFit RMSE=${lmFit.rmse.toFixed(4)} ≤ ICP=${icp.rmse.toFixed(4)})`;
+        onStatusChange(
+          `自动对齐完成 · partial=${pm.pairs.length} 对 · ${icpSummary} · 最终 RMSE=${finalRmse.toFixed(4)} · ${dt.toFixed(0)}ms`,
+          'success',
+        );
+      } catch (err) {
+        onStatusChange(
+          `自动对齐失败：${err instanceof Error ? err.message : '未知错误'}`,
+          'error',
+        );
+      } finally {
+        setPartialLoading(false);
+        setAligning(false);
+      }
+    }, 16);
+  }, [
+    srcMesh,
+    tarMesh,
+    srcAdjacency,
+    tarAdjacency,
+    partialSrcSamples,
+    partialTarSamples,
+    partialTopK,
+    partialIterations,
+    partialThresholdPct,
+    partialDescriptor,
+    partialSeedWeight,
+    partialAxialWeight,
+    tarRegion,
+    onStatusChange,
+  ]);
+
   const handleApplyAlignedTransform = () => {
     if (!alignResult) return;
     
@@ -1266,6 +1350,16 @@ export function ModelAssemble({ onStatusChange }: Props) {
       );
     }
   }, [clearAllLandmarks, demoTarget, onStatusChange]);
+
+  // 页面挂载时自动加载 Demo (arm hires)，作为初始模型
+  const initialDemoLoadedRef = useRef(false);
+  useEffect(() => {
+    if (initialDemoLoadedRef.current) return;
+    initialDemoLoadedRef.current = true;
+    void restoreDemo();
+    // 仅首次挂载执行，避免 restoreDemo 引用变化导致重复加载
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const debugLabelStyle: React.CSSProperties = {
     display: 'flex',
@@ -1649,7 +1743,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           </div>
         </PanelSection>
 
-        <PanelSection title="Mesh Gallery (Page2 Highres)">
+        <PanelSection title="Mesh Gallery (Page2 Highres)" defaultCollapsed>
           <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
             <Button
               size="sm"
@@ -1722,7 +1816,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           </div>
         </PanelSection>
 
-        <PanelSection title="对齐模式">
+        <PanelSection title="对齐模式" defaultCollapsed>
           <div style={{ display: 'flex', gap: 6 }}>
             <Button
               size="sm"
@@ -1746,263 +1840,6 @@ export function ModelAssemble({ onStatusChange }: Props) {
               ? 'Similarity: 旋转 + 平移 + 统一缩放'
               : 'Rigid: 仅旋转 + 平移'}
           </div>
-        </PanelSection>
-
-        <PanelSection title="Landmark 显示">
-          <input
-            type="range"
-            min={0.005}
-            max={0.05}
-            step={0.001}
-            value={landmarkSize}
-            onChange={(e) => setLandmarkSize(Number(e.target.value))}
-            style={{ width: '100%' }}
-          />
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6 }}>
-            Marker Size: {(landmarkSize * 100).toFixed(1)}%
-          </div>
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6, lineHeight: 1.5 }}>
-            Ctrl+左键点击网格添加点。左键拖拽 marker 可移动，右键 marker 可删除。
-          </div>
-        </PanelSection>
-
-        <PanelSection title="区域 Seed (Phase 1)">
-          <Button
-            size="sm"
-            variant={seedMode ? 'primary' : 'secondary'}
-            onClick={() => setSeedMode((v) => !v)}
-            style={{ width: '100%', justifyContent: 'center' }}
-          >
-            {seedMode ? '退出 Seed 模式' : '启用 Seed 模式'}
-          </Button>
-
-          <div style={{ marginTop: 10, fontSize: 11, color: 'var(--text-muted)' }}>
-            BFS 层数 (maxSteps)
-          </div>
-          <input
-            type="range"
-            min={1}
-            max={40}
-            step={1}
-            value={growMaxSteps}
-            onChange={(e) => setGrowMaxSteps(Number(e.target.value))}
-            style={{ width: '100%' }}
-          />
-          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-            {growMaxSteps} 层
-          </div>
-
-          <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-muted)' }}>
-            顶点上限 (maxVertices)
-          </div>
-          <input
-            type="range"
-            min={50}
-            max={5000}
-            step={50}
-            value={growMaxVertices}
-            onChange={(e) => setGrowMaxVertices(Number(e.target.value))}
-            style={{ width: '100%' }}
-          />
-          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-            {growMaxVertices}
-          </div>
-
-          <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-muted)' }}>
-            法线偏转阈值 (curvature)
-          </div>
-          <input
-            type="range"
-            min={10}
-            max={180}
-            step={5}
-            value={growCurvatureDeg}
-            onChange={(e) => setGrowCurvatureDeg(Number(e.target.value))}
-            style={{ width: '100%' }}
-          />
-          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-            {growCurvatureDeg}° {growCurvatureDeg >= 180 ? '(关闭曲率剪枝)' : ''}
-          </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginTop: 8 }}>
-            <Button
-              size="sm"
-              onClick={() => setSrcRegion(null)}
-              disabled={!srcRegion}
-              style={{ justifyContent: 'center' }}
-            >
-              清空 Src 区域
-            </Button>
-            <Button
-              size="sm"
-              onClick={() => setTarRegion(null)}
-              disabled={!tarRegion}
-              style={{ justifyContent: 'center' }}
-            >
-              清空 Tar 区域
-            </Button>
-          </div>
-
-          {(srcRegion || tarRegion) && (
-            <div
-              style={{
-                marginTop: 10,
-                padding: 8,
-                borderRadius: 3,
-                border: '1px solid var(--border-default)',
-                background: 'var(--bg-app)',
-                fontSize: 10,
-                color: 'var(--text-secondary)',
-                lineHeight: 1.5,
-              }}
-            >
-              {srcRegion && (
-                <div style={{ marginBottom: 4 }}>
-                  <span style={{ color: '#7df0ff' }}>Src</span>: seed={srcRegion.seedVertex} ·{' '}
-                  V={srcRegion.vertices.size} · steps={srcRegion.finalSteps} ·{' '}
-                  {srcRegion.stopReason}
-                </div>
-              )}
-              {tarRegion && (
-                <div>
-                  <span style={{ color: '#ffb066' }}>Tar</span>: seed={tarRegion.seedVertex} ·{' '}
-                  V={tarRegion.vertices.size} · steps={tarRegion.finalSteps} ·{' '}
-                  {tarRegion.stopReason}
-                </div>
-              )}
-            </div>
-          )}
-
-          <div style={{ marginTop: 8, fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>
-            启用后，Ctrl+Click 不再加 landmark，而是设定 seed 并扩张区域；蓝色=源区域，橙色=目标区域。
-          </div>
-        </PanelSection>
-
-        <PanelSection title="全网格查找 (Global)">
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
-            适用于 Source 与 Target 形态相近、但拓扑/transform 不同的情况。
-            从整个网格上挑显著点 → 空间 FPS 散开 → 多尺度曲率配对。
-          </div>
-
-          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-            采样数 (numSamples)
-          </div>
-          <input
-            type="range"
-            min={10}
-            max={200}
-            step={5}
-            value={globalSamples}
-            onChange={(e) => setGlobalSamples(Number(e.target.value))}
-            style={{ width: '100%' }}
-          />
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
-            {globalSamples}
-          </div>
-
-          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-            描述子尺度 (rings)
-          </div>
-          <input
-            type="range"
-            min={1}
-            max={6}
-            step={1}
-            value={globalRings}
-            onChange={(e) => setGlobalRings(Number(e.target.value))}
-            style={{ width: '100%' }}
-          />
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
-            {globalRings} 圈
-          </div>
-
-          <label
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 6,
-              fontSize: 11,
-              color: 'var(--text-muted)',
-              marginBottom: 6,
-              cursor: 'pointer',
-            }}
-          >
-            <input
-              type="checkbox"
-              checked={globalRequireMutual}
-              onChange={(e) => setGlobalRequireMutual(e.target.checked)}
-            />
-            互最近邻过滤（更稳，更少）
-          </label>
-
-          <label
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 6,
-              fontSize: 11,
-              color: 'var(--text-muted)',
-              marginBottom: 6,
-              cursor: 'pointer',
-            }}
-          >
-            <input
-              type="checkbox"
-              checked={ransacAutoApply}
-              onChange={(e) => setRansacAutoApply(e.target.checked)}
-            />
-            自动 RANSAC 几何一致性过滤（强烈推荐）
-          </label>
-
-          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-            RANSAC 阈值（% of bbox 对角线）
-          </div>
-          <input
-            type="range"
-            min={1}
-            max={20}
-            step={0.5}
-            value={ransacThresholdPct}
-            onChange={(e) => setRansacThresholdPct(Number(e.target.value))}
-            style={{ width: '100%' }}
-          />
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
-            {ransacThresholdPct.toFixed(1)}%
-          </div>
-
-          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-            RANSAC 迭代数
-          </div>
-          <input
-            type="range"
-            min={50}
-            max={2000}
-            step={50}
-            value={ransacIterations}
-            onChange={(e) => setRansacIterations(Number(e.target.value))}
-            style={{ width: '100%' }}
-          />
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
-            {ransacIterations}
-          </div>
-
-          <Button
-            size="sm"
-            variant="primary"
-            onClick={handleFindGlobalCandidates}
-            style={{ width: '100%', justifyContent: 'center' }}
-          >
-            全网格查找候选
-          </Button>
-          <Button
-            size="sm"
-            onClick={handleRansacRefine}
-            disabled={candidates.length < 4}
-            style={{ width: '100%', justifyContent: 'center', marginTop: 6 }}
-            title="用 RANSAC 在当前候选集合中筛出几何一致的子集"
-          >
-            RANSAC 精修当前候选
-          </Button>
         </PanelSection>
 
         <PanelSection title="部分匹配 (Partial → Whole)">
@@ -2157,6 +1994,18 @@ export function ModelAssemble({ onStatusChange }: Props) {
           <Button
             size="sm"
             variant="primary"
+            onClick={handleAutoAlign}
+            loading={partialLoading || aligning}
+            disabled={partialLoading || aligning}
+            style={{ width: '100%', justifyContent: 'center', marginBottom: 6 }}
+            title="一键：partial-match → SVD 对齐 → ICP refine。结果直接进入“重叠预览”。"
+          >
+            {(partialLoading || aligning) ? '计算中…' : '一键自动对齐 (partial + ICP)'}
+          </Button>
+
+          <Button
+            size="sm"
+            variant="secondary"
             onClick={handleFindPartial}
             loading={partialLoading}
             disabled={partialLoading}
@@ -2239,59 +2088,36 @@ export function ModelAssemble({ onStatusChange }: Props) {
 
         <PanelSection title="候选匹配 (Phase 2)">
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6, lineHeight: 1.5 }}>
-            基于 Seed 区域的局部匹配（数量较少，适合精修）。
-          </div>
-          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>
-            候选数 (numCandidates)
-          </div>
-          <input
-            type="range"
-            min={1}
-            max={12}
-            step={1}
-            value={numCandidates}
-            onChange={(e) => setNumCandidates(Number(e.target.value))}
-            style={{ width: '100%' }}
-          />
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8 }}>
-            {numCandidates}
+            partial-match 找到的 source ↔ target 顶点对都会出现在这里，
+            可以单独审阅、接受或拒绝；接受后会写入 Landmark Pairs。
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
-            <Button
-              size="sm"
-              variant="primary"
-              onClick={handleFindCandidates}
-              disabled={!srcRegion || !tarRegion}
-              style={{ justifyContent: 'center' }}
-            >
-              查找候选
-            </Button>
+          <div style={{ display: 'flex', gap: 6 }}>
             <Button
               size="sm"
               onClick={clearCandidates}
               disabled={candidates.length === 0}
-              style={{ justifyContent: 'center' }}
+              style={{ flex: 1, justifyContent: 'center' }}
             >
               清空候选
             </Button>
+            {candidates.length > 0 && (
+              <Button
+                size="sm"
+                variant="primary"
+                onClick={handleAcceptAllCandidates}
+                disabled={acceptedCandidateIds.size === candidates.length}
+                style={{ flex: 1, justifyContent: 'center' }}
+              >
+                全部接受 ({candidates.length - acceptedCandidateIds.size})
+              </Button>
+            )}
           </div>
-
-          {candidates.length > 0 && (
-            <Button
-              size="sm"
-              onClick={handleAcceptAllCandidates}
-              disabled={acceptedCandidateIds.size === candidates.length}
-              style={{ marginTop: 6, width: '100%', justifyContent: 'center' }}
-            >
-              全部接受 ({candidates.length - acceptedCandidateIds.size})
-            </Button>
-          )}
 
           <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
             {candidates.length === 0 && (
               <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-                先在两个 mesh 上各设置一个 seed，再点"查找候选"。
+                运行 “一键自动对齐” 或 “部分匹配查找” 后，候选对会出现在这里。
               </div>
             )}
             {candidates.map((c, i) => {
@@ -2359,9 +2185,143 @@ export function ModelAssemble({ onStatusChange }: Props) {
             })}
           </div>
         </PanelSection>
+
+        <PanelSection title="全网格查找 (Global)" defaultCollapsed>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
+            适用于 Source 与 Target 形态相近、但拓扑/transform 不同的情况。
+            从整个网格上挑显著点 → 空间 FPS 散开 → 多尺度曲率配对。
+          </div>
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            采样数 (numSamples)
+          </div>
+          <input
+            type="range"
+            min={10}
+            max={200}
+            step={5}
+            value={globalSamples}
+            onChange={(e) => setGlobalSamples(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {globalSamples}
+          </div>
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            描述子尺度 (rings)
+          </div>
+          <input
+            type="range"
+            min={1}
+            max={6}
+            step={1}
+            value={globalRings}
+            onChange={(e) => setGlobalRings(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {globalRings} 圈
+          </div>
+
+          <label
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: 11,
+              color: 'var(--text-muted)',
+              marginBottom: 6,
+              cursor: 'pointer',
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={globalRequireMutual}
+              onChange={(e) => setGlobalRequireMutual(e.target.checked)}
+            />
+            互最近邻过滤（更稳，更少）
+          </label>
+
+          <label
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: 11,
+              color: 'var(--text-muted)',
+              marginBottom: 6,
+              cursor: 'pointer',
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={ransacAutoApply}
+              onChange={(e) => setRansacAutoApply(e.target.checked)}
+            />
+            自动 RANSAC 几何一致性过滤（强烈推荐）
+          </label>
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            RANSAC 阈値（% of bbox 对角线）
+          </div>
+          <input
+            type="range"
+            min={1}
+            max={20}
+            step={0.5}
+            value={ransacThresholdPct}
+            onChange={(e) => setRansacThresholdPct(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {ransacThresholdPct.toFixed(1)}%
+          </div>
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            RANSAC 迭代数
+          </div>
+          <input
+            type="range"
+            min={50}
+            max={2000}
+            step={50}
+            value={ransacIterations}
+            onChange={(e) => setRansacIterations(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {ransacIterations}
+          </div>
+
+          <Button
+            size="sm"
+            variant="primary"
+            onClick={handleFindGlobalCandidates}
+            style={{ width: '100%', justifyContent: 'center' }}
+          >
+            全网格查找候选
+          </Button>
+          <Button
+            size="sm"
+            onClick={handleRansacRefine}
+            disabled={candidates.length < 4}
+            style={{ width: '100%', justifyContent: 'center', marginTop: 6 }}
+            title="用 RANSAC 在当前候选集合中筛出几何一致的子集"
+          >
+            RANSAC 精修当前候选
+          </Button>
+        </PanelSection>
       </aside>
 
-      <main style={{ display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden' }}>
+      <main
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          minWidth: 0,
+          overflow: 'hidden',
+        }}
+      >
         <div
           style={{
             padding: '8px 10px',
@@ -2455,6 +2415,22 @@ export function ModelAssemble({ onStatusChange }: Props) {
           overflow: 'auto',
         }}
       >
+        <PanelSection title="Landmark 显示">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>
+            <span style={{ whiteSpace: 'nowrap' }}>大小</span>
+            <input
+              type="range"
+              min={0.002}
+              max={0.05}
+              step={0.001}
+              value={landmarkSize}
+              onChange={(e) => setLandmarkSize(Number(e.target.value))}
+              style={{ flex: 1 }}
+            />
+            <span style={{ width: 36, textAlign: 'right' }}>{landmarkSize.toFixed(3)}</span>
+          </div>
+        </PanelSection>
+
         <PanelSection title="Landmark Pairs">
           <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8 }}>
             Source 与 Target 按添加顺序一一配对。按住 Ctrl 在对应网格上左键点击可新增。
@@ -2756,22 +2732,41 @@ function ResultPreviewPanel({
   );
 }
 
-function PanelSection({ title, children }: { title: string; children: React.ReactNode }) {
+function PanelSection({
+  title,
+  children,
+  defaultCollapsed = false,
+}: {
+  title: string;
+  children: React.ReactNode;
+  /** When true the section starts collapsed; click the header to toggle. */
+  defaultCollapsed?: boolean;
+}) {
+  const [collapsed, setCollapsed] = useState(defaultCollapsed);
   return (
     <div style={{ borderBottom: '1px solid var(--border-default)', padding: 10 }}>
       <div
+        onClick={() => setCollapsed((v) => !v)}
         style={{
           fontSize: 11,
           fontWeight: 600,
           color: 'var(--text-primary)',
-          marginBottom: 8,
+          marginBottom: collapsed ? 0 : 8,
           textTransform: 'uppercase',
           letterSpacing: 0.5,
+          cursor: 'pointer',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+          userSelect: 'none',
         }}
       >
+        <span style={{ fontSize: 9, color: 'var(--text-muted)', width: 8 }}>
+          {collapsed ? '▶' : '▼'}
+        </span>
         {title}
       </div>
-      {children}
+      {!collapsed && children}
     </div>
   );
 }

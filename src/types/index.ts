@@ -48,12 +48,21 @@ export interface ExtractionState {
   error?: string;
 }
 
+export interface ImageInputState {
+  /** 当前展示的图片 blob: URL */
+  imageUrl: string | null;
+  /** 当前展示图片对应的工程文件名 */
+  imageFile?: string | null;
+}
+
 export interface PartPipelineState {
   id: string;
   name: string;
   nodeStates: NodeState[];
   /** Optional nodes expanded flag, keyed by node index */
   expanded: Record<number, boolean>;
+  /** Image Input 节点状态（第一个节点，读取源图片） */
+  imageInput?: ImageInputState;
   /** Extraction 节点模式 + 结果（在 React state 中维护，未持久化到工程目录） */
   extraction?: ExtractionState;
 }
