@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef, type ReactNode } from 'react';
-import type { ExtractionMode, NodeConfig, NodeState, PartPipelineState } from '../../types';
+import type { NodeConfig, NodeState, PartPipelineState, PipelineMode } from '../../types';
 import { NodeCard } from '../../components/NodeCard';
 import { NodeConnector } from '../../components/NodeConnector';
 import { Button } from '../../components/Button';
@@ -7,18 +7,20 @@ import { Placeholder } from '../../components/Placeholder';
 import { ImagePreviewModal } from '../../components/ImagePreviewModal';
 import { useProject } from '../../contexts/ProjectContext';
 import {
-  EXTRACTION_PROMPT_PRESETS,
+  EXTRACT_JACKET_PROMPT,
   extractWithPrompt,
-  extractWithSAM3,
-  SAM3CancelledError,
-  SAM3NotWiredError,
 } from '../../services/extraction';
 import { type AssetVersion } from '../../services/projectStore';
 import { splitMultiView } from '../../services/multiviewSplit';
 
+/**
+ * Full node list (Mode B · Multi-View). Mode A · Extraction omits the standalone
+ * `multiview` node since the Extract Jacket node already produces a 4-view sheet
+ * directly. Use {@link getPartNodes} to obtain the mode-specific list.
+ */
 export const PART_NODES: NodeConfig[] = [
   { id: 'imageInput', title: 'Image Input', display: 'image' },
-  { id: 'extraction', title: 'Extraction', display: 'image' },
+  { id: 'extraction', title: 'Extract Jacket', display: 'image' },
   { id: 'multiview', title: 'Multi-View', display: 'multiview' },
   { id: 'modify', title: 'Modify', display: 'image', optional: true },
   { id: 'highres', title: 'Highres Model 3D', display: '3d' },
@@ -26,9 +28,17 @@ export const PART_NODES: NodeConfig[] = [
   { id: 'region', title: 'Region Define', display: '3d', optional: true },
 ];
 
-const EXTRACTION_MODE_LABEL: Record<ExtractionMode, string> = {
-  banana: 'Banana Pro 提示词',
-  sam3: 'SAM3 切割',
+/** Returns the node list for a given pipeline mode. */
+export function getPartNodes(mode: PipelineMode): NodeConfig[] {
+  if (mode === 'extraction') {
+    return PART_NODES.filter((n) => n.id !== 'multiview');
+  }
+  return PART_NODES;
+}
+
+const PIPELINE_MODE_LABEL: Record<PipelineMode, string> = {
+  extraction: 'A · Extraction',
+  multiview: 'B · Multi-View',
 };
 
 interface Props {
@@ -44,6 +54,10 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
   const [renaming, setRenaming] = useState(false);
   const [draftName, setDraftName] = useState(pipeline.name);
   const [splitView, setSplitView] = useState(false);
+
+  // Mode-specific node list. Mode A · Extraction omits the standalone Multi-View
+  // node since the Extract Jacket node already produces a 4-view sheet directly.
+  const partNodes = getPartNodes(pipeline.mode);
 
   // Extraction 节点历史版本（仅本 Pipeline 自己的，按 pipeline.name 前缀过滤）
   const [extractionHistory, setExtractionHistory] = useState<AssetVersion[]>([]);
@@ -63,10 +77,9 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     if (sourceUrlRef.current) URL.revokeObjectURL(sourceUrlRef.current);
   }, []);
 
-  // Load source image whenever the active project changes.
-  // Prefer page1.extraction (Page1 的"提取"节点输出) — it's already a 4-view
-  // sheet of the isolated subject. Fall back to page1.multiview if no
-  // extraction has been generated yet.
+  // Load source image whenever the active project or pipeline mode changes.
+  // Mode A (extraction): loads page1.extraction, falls back to page1.multiview
+  // Mode B (multiview):  loads page1.multiview
   useEffect(() => {
     let cancelled = false;
     if (!project) {
@@ -76,8 +89,13 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       return;
     }
     (async () => {
-      let r = await loadLatest('page1.extraction');
-      if (!r) r = await loadLatest('page1.multiview');
+      let r;
+      if (pipeline.mode === 'multiview') {
+        r = await loadLatest('page1.multiview');
+      } else {
+        r = await loadLatest('page1.extraction');
+        if (!r) r = await loadLatest('page1.multiview');
+      }
       if (cancelled) {
         if (r?.url) URL.revokeObjectURL(r.url);
         return;
@@ -105,20 +123,11 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       console.warn('[PartPipeline] load source image failed:', err);
     });
     return () => { cancelled = true; };
-  }, [project, loadLatest]);
+  }, [project, loadLatest, pipeline.mode]);
 
-  // Helpers to update extraction sub-state immutably.
+  // Extraction sub-state — Page2 fixes mode='banana' and the "Extract Jacket"
+  // prompt, so no UI mutator is needed; runner reads/writes resultUrl/file.
   const extraction = pipeline.extraction ?? { mode: 'banana', promptIndex: 0, resultUrl: null };
-  const updateExtraction = useCallback(
-    (patch: Partial<NonNullable<PartPipelineState['extraction']>>) => {
-      const next: PartPipelineState = {
-        ...pipeline,
-        extraction: { ...extraction, ...patch },
-      };
-      onUpdate(pipeline.id, next);
-    },
-    [pipeline, extraction, onUpdate]
-  );
 
   // Helpers to update imageInput sub-state immutably.
   const imageInput = pipeline.imageInput ?? { imageUrl: null };
@@ -201,20 +210,16 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     [pipeline, onUpdate]
   );
 
-  // Real Extraction runner. Dispatches by mode then writes the final 4-view
-  // PNG (+ split per-view sub-set) to the project, exactly like Page1's
-  // Multi-View node.
+  // Real Extraction runner. Calls Banana Pro with the fixed "Extract Jacket"
+  // prompt and writes the final 4-view PNG (+ split per-view sub-set) to the
+  // project, exactly like Page1's Multi-View node.
   const runExtraction = useCallback(async (): Promise<string | null> => {
     if (!sourceFile) {
       onStatus(`[${pipeline.name}] 缺少源图片：请先在 Page1 生成 Extraction 或 Multi-View`, 'error');
       return null;
     }
 
-    const preset = EXTRACTION_PROMPT_PRESETS[extraction.promptIndex] ?? EXTRACTION_PROMPT_PRESETS[0];
-    const noteForMode =
-      extraction.mode === 'banana'
-        ? `${pipeline.name} · Banana · ${preset.label}`
-        : `${pipeline.name} · SAM3`;
+    const noteForMode = `${pipeline.name} · Extract Jacket`;
 
     // Set running
     onUpdate(pipeline.id, {
@@ -222,23 +227,14 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'running' : v)),
       extraction: { ...extraction, error: undefined },
     });
-    onStatus(
-      `[${pipeline.name}] ${extraction.mode === 'banana' ? 'Banana Pro' : 'SAM3'} 提取中…`,
-      'info',
-    );
+    onStatus(`[${pipeline.name}] Extract Jacket 提取中…`, 'info');
 
     try {
-      const url =
-        extraction.mode === 'banana'
-          ? await extractWithPrompt({
-              source: sourceFile,
-              prompt: preset.prompt,
-              onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
-            })
-          : await extractWithSAM3({
-              source: sourceFile,
-              onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
-            });
+      const url = await extractWithPrompt({
+        source: sourceFile,
+        prompt: EXTRACT_JACKET_PROMPT,
+        onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
+      });
 
       // Revoke previous result URL if any
       if (extraction.resultUrl) URL.revokeObjectURL(extraction.resultUrl);
@@ -295,43 +291,28 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
         nodeStates: pipeline.nodeStates.map((v, idx) => {
           if (idx === 1) return 'complete';
           if (idx === 2) {
-            // Promote Multi-View to ready
-            const cfg = PART_NODES[idx];
-            if (cfg.optional) return v === 'idle' ? 'optional' : v;
+            // Promote next node to ready (Multi-View in mode B, Modify in mode A)
+            const cfg = partNodes[idx];
+            if (cfg?.optional) return v === 'idle' ? 'optional' : v;
             return v === 'idle' ? 'ready' : v;
           }
           return v;
         }),
         extraction: { ...extraction, resultUrl: url, resultFile: savedFile, error: undefined },
       });
-      onStatus(`[${pipeline.name}] Extraction 完成`, 'success');
+      onStatus(`[${pipeline.name}] Extract Jacket 完成`, 'success');
       // Reload the per-pipeline history dropdown.
       void refreshExtractionHistory();
       return url;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      // SAM3CancelledError → soft revert to "ready" with a warning toast.
-      if (err instanceof SAM3CancelledError) {
-        console.warn('[PartPipeline] SAM3 cancelled:', err);
-        onUpdate(pipeline.id, {
-          ...pipeline,
-          nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'ready' : v)),
-          extraction: { ...extraction, error: undefined },
-        });
-        onStatus(`[${pipeline.name}] 已取消 SAM3 标注`, 'warning');
-        return null;
-      }
-      const friendlyMsg =
-        err instanceof SAM3NotWiredError
-          ? `SAM3 子进程桥接异常（${msg}）`
-          : msg;
-      console.error('[PartPipeline] extraction failed:', err);
+      console.error('[PartPipeline] extract jacket failed:', err);
       onUpdate(pipeline.id, {
         ...pipeline,
         nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'error' : v)),
-        extraction: { ...extraction, error: friendlyMsg },
+        extraction: { ...extraction, error: msg },
       });
-      onStatus(`[${pipeline.name}] Extraction 失败：${friendlyMsg}`, 'error');
+      onStatus(`[${pipeline.name}] Extract Jacket 失败：${msg}`, 'error');
       return null;
     }
   }, [pipeline, extraction, sourceFile, onStatus, onUpdate, project, saveAsset, saveSegments, refreshExtractionHistory]);
@@ -348,7 +329,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
         nodeStates: pipeline.nodeStates.map((v, idx) => (idx === i ? 'running' : v)),
       };
       onUpdate(pipeline.id, updated);
-      onStatus(`[${pipeline.name}] 运行 ${PART_NODES[i].title} …`, 'info');
+      onStatus(`[${pipeline.name}] 运行 ${partNodes[i].title} …`, 'info');
 
       window.setTimeout(() => {
         // Re-read latest by referencing current pipeline (closure captures pre-state, fine for mock)
@@ -358,15 +339,15 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
             if (idx === i) return 'complete';
             // promote next non-optional node to ready
             if (idx === i + 1) {
-              const cfg = PART_NODES[idx];
-              if (cfg.optional) return v === 'idle' ? 'optional' : v;
+              const cfg = partNodes[idx];
+              if (cfg?.optional) return v === 'idle' ? 'optional' : v;
               return v === 'idle' ? 'ready' : v;
             }
             return v;
           }),
         };
         onUpdate(pipeline.id, after);
-        onStatus(`[${pipeline.name}] ${PART_NODES[i].title} 完成`, 'success');
+        onStatus(`[${pipeline.name}] ${partNodes[i].title} 完成`, 'success');
       }, 2000);
     },
     [pipeline, onUpdate, onStatus, runExtraction]
@@ -454,9 +435,22 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
             {pipeline.name}
           </span>
         )}
+        <span
+          style={{
+            fontSize: 10,
+            fontWeight: 600,
+            padding: '1px 6px',
+            borderRadius: 3,
+            background: pipeline.mode === 'multiview' ? 'var(--accent-purple, #8b5cf6)' : 'var(--accent-blue)',
+            color: '#fff',
+            letterSpacing: 0.5,
+          }}
+        >
+          {PIPELINE_MODE_LABEL[pipeline.mode]}
+        </span>
         <span style={{ flex: 1 }} />
         <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-          {pipeline.nodeStates.filter((s) => s === 'complete').length} / {PART_NODES.length} 完成
+          {pipeline.nodeStates.filter((s) => s === 'complete').length} / {partNodes.length} 完成
         </span>
         <Button variant="ghost" size="sm" onClick={() => onDelete(pipeline.id)}>
           🗑 删除
@@ -466,7 +460,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       {/* Node row */}
       <div style={{ overflowX: 'auto', padding: '20px 12px' }}>
         <div style={{ display: 'flex', alignItems: 'center' }}>
-          {PART_NODES.map((node, i) => {
+          {partNodes.map((node, i) => {
             const state = pipeline.nodeStates[i];
             const expanded = !!pipeline.expanded[i];
 
@@ -491,19 +485,16 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
                     state={state}
                     imageUrl={imageInput.imageUrl}
                     sourceUrl={sourceUrl}
+                    mode={pipeline.mode}
                     label={`${pipeline.name} · ${node.title}`}
                   />
                 ) : node.id === 'extraction' ? (
                   <ExtractionBody
                     state={state}
-                    mode={extraction.mode}
-                    promptIndex={extraction.promptIndex}
                     resultUrl={extraction.resultUrl}
                     resultFile={extraction.resultFile ?? null}
                     sourceUrl={sourceUrl}
                     error={extraction.error}
-                    onModeChange={(m) => updateExtraction({ mode: m })}
-                    onPromptChange={(idx) => updateExtraction({ promptIndex: idx })}
                     label={`${pipeline.name} · ${node.title}`}
                   />
                 ) : (
@@ -545,7 +536,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
                 >
                   {body}
                 </NodeCard>
-                {i < PART_NODES.length - 1 && (
+                {i < partNodes.length - 1 && (
                   <NodeConnector fromState={state} toState={pipeline.nodeStates[i + 1]} />
                 )}
               </div>
@@ -646,12 +637,18 @@ interface ImageInputBodyProps {
   state: NodeState;
   imageUrl: string | null;
   sourceUrl: string | null;
+  mode: PipelineMode;
   label: string;
 }
 
-function ImageInputBody({ state, imageUrl, sourceUrl, label }: ImageInputBodyProps) {
+function ImageInputBody({ state, imageUrl, sourceUrl, mode, label }: ImageInputBodyProps) {
   // Preview: user-set image > source image from Page1
   const previewUrl = imageUrl ?? sourceUrl;
+
+  const sourceHint =
+    mode === 'multiview'
+      ? '来源：Page1 · Multi-View'
+      : '来源：Page1 · Extraction（回退 Multi-View）';
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -662,42 +659,32 @@ function ImageInputBody({ state, imageUrl, sourceUrl, label }: ImageInputBodyPro
         imageUrl={previewUrl ?? undefined}
         height={140}
       />
-      {!previewUrl && (
-        <div style={{ fontSize: 10, color: 'var(--text-muted)', textAlign: 'center' }}>
-          未检测到源图片
-        </div>
-      )}
+      <div style={{ fontSize: 10, color: 'var(--text-muted)', textAlign: 'center' }}>
+        {previewUrl ? sourceHint : '未检测到源图片'}
+      </div>
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Extraction node body
+// Extraction node body — Page2 "Extract Jacket"（固定 Banana Pro + 固定提示词）
 // ---------------------------------------------------------------------------
 
 interface ExtractionBodyProps {
   state: NodeState;
-  mode: ExtractionMode;
-  promptIndex: number;
   resultUrl: string | null;
   resultFile: string | null;
   sourceUrl: string | null;
   error?: string;
-  onModeChange: (mode: ExtractionMode) => void;
-  onPromptChange: (idx: number) => void;
   label: string;
 }
 
 function ExtractionBody({
   state,
-  mode,
-  promptIndex,
   resultUrl,
   resultFile: _resultFile,
   sourceUrl,
   error,
-  onModeChange,
-  onPromptChange,
   label,
 }: ExtractionBodyProps) {
   // Pick the image to preview: result if present, otherwise the source.
@@ -715,85 +702,12 @@ function ExtractionBody({
         height={140}
       />
 
-      {/* 提取模式选择器（从节点头部下拉移到正文，给历史下拉腾位置） */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-        <label style={{ fontSize: 10, color: 'var(--text-muted)' }}>提取模式</label>
-        <select
-          value={mode}
-          onChange={(e) => onModeChange(e.target.value as ExtractionMode)}
-          disabled={state === 'running'}
-          title="切换提取模式"
-          style={{
-            background: 'var(--bg-app)',
-            color: 'var(--text-primary)',
-            border: '1px solid var(--border-default)',
-            fontSize: 11,
-            padding: '3px 4px',
-            borderRadius: 2,
-            width: '100%',
-          }}
-        >
-          <option value="banana">{EXTRACTION_MODE_LABEL.banana}</option>
-          <option value="sam3">{EXTRACTION_MODE_LABEL.sam3}</option>
-        </select>
+      <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+        固定提示词：提取外套，补全被遮挡部分
       </div>
-
-      {mode === 'banana' ? (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <label style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-            提取提示词
-          </label>
-          <select
-            value={promptIndex}
-            onChange={(e) => onPromptChange(Number(e.target.value))}
-            disabled={state === 'running'}
-            title={EXTRACTION_PROMPT_PRESETS[promptIndex]?.prompt}
-            style={{
-              background: 'var(--bg-app)',
-              color: 'var(--text-primary)',
-              border: '1px solid var(--border-default)',
-              fontSize: 11,
-              padding: '3px 4px',
-              borderRadius: 2,
-              width: '100%',
-            }}
-          >
-            {EXTRACTION_PROMPT_PRESETS.map((p, i) => (
-              <option key={i} value={i}>{p.label}</option>
-            ))}
-          </select>
-          {!sourceUrl && (
-            <div style={{ fontSize: 10, color: 'var(--accent-yellow, #d49b3b)' }}>
-              未检测到源图片：请先在 Page1 生成 Extraction 或 Multi-View
-            </div>
-          )}
-        </div>
-      ) : (
-        <div
-          style={{
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 4,
-            fontSize: 10,
-            color: 'var(--text-muted)',
-            padding: '6px 8px',
-            border: '1px dashed var(--border-default)',
-            borderRadius: 2,
-            lineHeight: 1.5,
-          }}
-        >
-          <div style={{ color: 'var(--text-secondary)', fontWeight: 600 }}>
-            SAM3 切割模式
-          </div>
-          <div>
-            点击下方“生成”按钮，会弹出 SAM3 标注窗口并自动加载源图（优先 Page1 Extraction，其次 Multi-View）。
-            在窗口中完成点选/框选后点“导出 JSON”，窗口会自动关闭并把结果回传到这里。
-          </div>
-          {!sourceUrl && (
-            <div style={{ color: 'var(--accent-yellow, #d49b3b)', marginTop: 2 }}>
-              未检测到源图片：请先在 Page1 生成 Extraction 或 Multi-View
-            </div>
-          )}
+      {!sourceUrl && (
+        <div style={{ fontSize: 10, color: 'var(--accent-yellow, #d49b3b)' }}>
+          未检测到源图片：请先在 Page1 生成 Extraction 或 Multi-View
         </div>
       )}
 

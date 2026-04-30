@@ -1,20 +1,31 @@
-import { useState, useCallback } from 'react';
-import type { NodeState, PartPipelineState } from '../../types';
+import { useState, useCallback, useRef, useEffect } from 'react';
+import type { NodeState, PartPipelineState, PipelineMode } from '../../types';
 import { Button } from '../../components/Button';
-import { PART_NODES, PartPipeline } from './PartPipeline';
+import { getPartNodes, PartPipeline } from './PartPipeline';
+
+const PIPELINE_MODE_LABEL: Record<PipelineMode, string> = {
+  extraction: '基于 Extraction',
+  multiview: '基于 Multi-View',
+};
+
+const PIPELINE_MODE_DESC: Record<PipelineMode, string> = {
+  extraction: '使用 Page1 的 Extraction 输出作为源图片',
+  multiview: '使用 Page1 的 Multi-View 输出作为源图片',
+};
 
 interface Props {
   onStatusChange: (msg: string, status?: 'info' | 'success' | 'warning' | 'error') => void;
 }
 
-const makeInitialNodeStates = (): NodeState[] =>
-  PART_NODES.map((n) => (n.optional ? 'optional' : 'idle'));
+const makeInitialNodeStates = (mode: PipelineMode): NodeState[] =>
+  getPartNodes(mode).map((n) => (n.optional ? 'optional' : 'idle'));
 
-const makePart = (idx: number): PartPipelineState => ({
+const makePart = (idx: number, mode: PipelineMode = 'extraction'): PartPipelineState => ({
   id: `part-${Date.now()}-${idx}`,
   name: `Part ${idx + 1}`,
+  mode,
   nodeStates: (() => {
-    const arr = makeInitialNodeStates();
+    const arr = makeInitialNodeStates(mode);
     arr[0] = 'ready'; // Image Input node always starts ready
     return arr;
   })(),
@@ -30,19 +41,34 @@ const makePart = (idx: number): PartPipelineState => ({
 });
 
 export function HighresModel({ onStatusChange }: Props) {
-  const [parts, setParts] = useState<PartPipelineState[]>(() => [makePart(0), makePart(1)]);
+  const [parts, setParts] = useState<PartPipelineState[]>(() => [makePart(0, 'extraction'), makePart(1, 'extraction')]);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  const addDropdownRef = useRef<HTMLDivElement>(null);
+  const [addDropdownOpen, setAddDropdownOpen] = useState(false);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    if (!addDropdownOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (addDropdownRef.current && !addDropdownRef.current.contains(e.target as Node)) {
+        setAddDropdownOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [addDropdownOpen]);
 
   const updatePart = useCallback((id: string, next: PartPipelineState) => {
     setParts((prev) => prev.map((p) => (p.id === id ? next : p)));
   }, []);
 
-  const addPart = () => {
+  const addPart = (mode: PipelineMode) => {
     setParts((prev) => {
-      const next = [...prev, makePart(prev.length)];
-      onStatusChange(`已添加 Part ${prev.length + 1}`, 'success');
+      const next = [...prev, makePart(prev.length, mode)];
+      onStatusChange(`已添加 Part ${prev.length + 1}（${PIPELINE_MODE_LABEL[mode]}）`, 'success');
       return next;
     });
+    setAddDropdownOpen(false);
   };
 
   const requestDelete = (id: string) => setPendingDelete(id);
@@ -77,9 +103,53 @@ export function HighresModel({ onStatusChange }: Props) {
         <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
           共 {parts.length} 条 Pipeline
         </span>
-        <Button variant="primary" size="sm" onClick={addPart}>
-          ＋ 添加 Pipeline
-        </Button>
+        <div ref={addDropdownRef} style={{ position: 'relative' }}>
+          <Button variant="primary" size="sm" onClick={() => setAddDropdownOpen((v) => !v)}>
+            ＋ 添加 Pipeline ▾
+          </Button>
+          {addDropdownOpen && (
+            <div
+              style={{
+                position: 'absolute',
+                right: 0,
+                top: '100%',
+                marginTop: 4,
+                background: 'var(--bg-surface)',
+                border: '1px solid var(--border-default)',
+                borderRadius: 4,
+                boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+                zIndex: 100,
+                minWidth: 220,
+                overflow: 'hidden',
+              }}
+            >
+              {(['extraction', 'multiview'] as PipelineMode[]).map((m) => (
+                <button
+                  key={m}
+                  onClick={() => addPart(m)}
+                  style={{
+                    display: 'block',
+                    width: '100%',
+                    padding: '8px 12px',
+                    background: 'none',
+                    border: 'none',
+                    textAlign: 'left',
+                    cursor: 'pointer',
+                    color: 'var(--text-primary)',
+                    fontSize: 12,
+                  }}
+                  onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--bg-surface-2)')}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = 'none')}
+                >
+                  <div style={{ fontWeight: 600 }}>{PIPELINE_MODE_LABEL[m]}</div>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
+                    {PIPELINE_MODE_DESC[m]}
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Vertical stack of pipelines */}

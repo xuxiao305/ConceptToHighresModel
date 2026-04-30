@@ -17,7 +17,7 @@ import {
   type Trellis2Params,
 } from '../../services/trellis2';
 import { splitMultiView } from '../../services/multiviewSplit';
-import { extractWithPrompt, EXTRACTION_PROMPT_PRESETS } from '../../services/extraction';
+import { extractWithPrompt, REMOVE_JACKET_PROMPT } from '../../services/extraction';
 import { useProject } from '../../contexts/ProjectContext';
 import type { AssetVersion } from '../../services/projectStore';
 
@@ -28,7 +28,7 @@ const NODES: NodeConfig[] = [
   { id: 'rough', title: 'Rough Model', display: '3d', description: 'Tripo AI 生成 3D 粗模 (GLB)' },
   { id: 'rigging', title: 'Rough Model Rigging', display: '3d', description: '骨骼绑定' },
   // 独立节点，与上游不走连线（输入从 Multi-View 读，输出单独供 Page 2 使用）
-  { id: 'extraction', title: 'Extraction (Banana)', display: 'image', description: '基于 Multi-View，提示词提取部件' },
+  { id: 'extraction', title: 'Remove Jacket', display: 'image', description: '基于 Multi-View，使用 Banana Pro 移除外套' },
 ];
 
 /** 节点索引 → projectStore 中的 nodeKey（用于历史读写） */
@@ -128,20 +128,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     try { localStorage.setItem(TRELLIS2_PARAMS_LS_KEY, JSON.stringify(trellis2Params)); } catch { /* ignore */ }
   }, [trellis2Params]);
 
-  // Extraction (Banana Pro) 提示词索引（持久化到 localStorage）
-  const EXTRACTION_PROMPT_LS_KEY = 'page1.extraction.promptIndex';
-  const [extractionPromptIndex, setExtractionPromptIndex] = useState<number>(() => {
-    try {
-      const v = localStorage.getItem(EXTRACTION_PROMPT_LS_KEY);
-      const n = v ? parseInt(v, 10) : 0;
-      return Number.isFinite(n) && n >= 0 && n < EXTRACTION_PROMPT_PRESETS.length ? n : 0;
-    } catch {
-      return 0;
-    }
-  });
-  useEffect(() => {
-    try { localStorage.setItem(EXTRACTION_PROMPT_LS_KEY, String(extractionPromptIndex)); } catch { /* ignore */ }
-  }, [extractionPromptIndex]);
+  // Extraction (Banana Pro) 节点：固定使用 REMOVE_JACKET_PROMPT，不再提供下拉选择。
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -689,8 +676,6 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       onStatusChange('请先生成 Multi-View', 'error');
       return null;
     }
-    const preset =
-      EXTRACTION_PROMPT_PRESETS[extractionPromptIndex] ?? EXTRACTION_PROMPT_PRESETS[0];
 
     setNodeState(5, 'running');
     setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 5: '' } }));
@@ -701,8 +686,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
 
       const url = await extractWithPrompt({
         source: sourceFile,
-        prompt: preset.prompt,
-        onStatus: (m) => onStatusChange(`Extraction · ${m}`, 'info'),
+        prompt: REMOVE_JACKET_PROMPT,
+        onStatus: (m) => onStatusChange(`Remove Jacket · ${m}`, 'info'),
       });
 
       // 持久化 + 4 视图切分（与 Multi-View 节点完全一致的命名）
@@ -714,11 +699,11 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
             'page1.extraction',
             blob,
             'png',
-            preset.label,
+            'Remove Jacket',
           );
           if (v) {
             savedFile = v.file;
-            onStatusChange(`Extraction 已保存到工程：${v.file}`, 'success');
+            onStatusChange(`Remove Jacket 已保存到工程：${v.file}`, 'success');
 
             try {
               const slices = await splitMultiView(blob);
@@ -738,7 +723,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
               }
             } catch (e) {
               onStatusChange(
-                `Extraction 4 视图切分失败：${e instanceof Error ? e.message : String(e)}`,
+                `Remove Jacket 4 视图切分失败：${e instanceof Error ? e.message : String(e)}`,
                 'warning',
               );
             }
@@ -747,7 +732,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           }
         } catch (e) {
           onStatusChange(
-            `Extraction 保存失败：${e instanceof Error ? e.message : String(e)}`,
+            `Remove Jacket 保存失败：${e instanceof Error ? e.message : String(e)}`,
             'error',
           );
         }
@@ -758,17 +743,17 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         return { ...prev, extractionUrl: url, extractionFile: savedFile };
       });
       setNodeState(5, 'complete');
-      onStatusChange('Extraction 生成完成', 'success');
+      onStatusChange('Remove Jacket 生成完成', 'success');
       return url;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error('[Extraction] failed:', err);
+      console.error('[Remove Jacket] failed:', err);
       setNodeState(5, 'error');
       setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 5: msg } }));
-      onStatusChange(`Extraction 生成失败：${msg}`, 'error');
+      onStatusChange(`Remove Jacket 生成失败：${msg}`, 'error');
       return null;
     }
-  }, [onStatusChange, setNodeState, project, saveAsset, saveSegments, refreshHistory, extractionPromptIndex]);
+  }, [onStatusChange, setNodeState, project, saveAsset, saveSegments, refreshHistory]);
 
   // ---- Mock runner for nodes 3..4 (Rough Model / Rigging) -----------------
   const runMockNode = useCallback(
@@ -1023,29 +1008,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                   />
                 )}
                 {node.id === 'extraction' && (
-                  <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 3 }}>
-                    <label style={{ fontSize: 10, color: 'var(--text-muted)' }}>提取提示词</label>
-                    <select
-                      value={extractionPromptIndex}
-                      onChange={(e) => setExtractionPromptIndex(Number(e.target.value))}
-                      onClick={(ev) => ev.stopPropagation()}
-                      onDoubleClick={(ev) => ev.stopPropagation()}
-                      disabled={state === 'running'}
-                      title={EXTRACTION_PROMPT_PRESETS[extractionPromptIndex]?.prompt}
-                      style={{
-                        background: 'var(--bg-app)',
-                        color: 'var(--text-primary)',
-                        border: '1px solid var(--border-default)',
-                        fontSize: 11,
-                        padding: '3px 4px',
-                        borderRadius: 2,
-                        width: '100%',
-                      }}
-                    >
-                      {EXTRACTION_PROMPT_PRESETS.map((p, i) => (
-                        <option key={i} value={i}>{p.label}</option>
-                      ))}
-                    </select>
+                  <div style={{ marginTop: 6, fontSize: 10, color: 'var(--text-muted)' }}>
+                    固定提示词：移除外套，补全 T 恤与手臂
                   </div>
                 )}
               </>

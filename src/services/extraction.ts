@@ -36,24 +36,22 @@
 
 import { generateImage } from './leihuo';
 
-/** Built-in prompt presets shown in the Banana Pro mode dropdown. */
-export const EXTRACTION_PROMPT_PRESETS: { label: string; prompt: string }[] = [
-  {
-    label: '移除外套，补全 T 恤与手臂',
-    prompt:
-      'Remove the orange jacket, and fill the short-sleeve T-shirt and arm coverred by the jacket',
-  },
-  {
-    label: '提取外套，补全被遮挡部分',
-    prompt:
-      'Extract the orange jacket, remove the other part of the character. Fill the missing part covered by the character body',
-  },
-];
+/**
+ * Page1 "Remove Jacket" 节点使用的固定提示词：移除外套，补全 T 恤与手臂。
+ */
+export const REMOVE_JACKET_PROMPT =
+  'Remove the orange jacket, and fill the short-sleeve T-shirt and arm coverred by the jacket';
+
+/**
+ * Page2 "Extract Jacket" 节点使用的固定提示词：提取外套，补全被遮挡部分。
+ */
+export const EXTRACT_JACKET_PROMPT =
+  'Extract the orange jacket, remove the other part of the character. Fill the missing part covered by the character body';
 
 export interface ExtractWithPromptOptions {
   /** Source image (concept / multi-view). Accepts File / Blob / URL string. */
   source: File | Blob | string;
-  /** Free-text prompt — usually one of EXTRACTION_PROMPT_PRESETS[i].prompt. */
+  /** Free-text prompt — usually one of REMOVE_JACKET_PROMPT / EXTRACT_JACKET_PROMPT. */
   prompt: string;
   /** Optional progress / status callback. */
   onStatus?: (msg: string) => void;
