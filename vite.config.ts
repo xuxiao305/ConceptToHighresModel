@@ -33,8 +33,26 @@ export default defineConfig(({ mode }) => {
   const SAM3_PROJECT_DIR =
     env.VITE_SAM3_PROJECT_DIR ?? 'D:\\AI\\Prototypes\\SAM3_Segment';
 
+  // RMBG-2.0 worker (D:\AI\Prototypes\ConceptToHighresModel\scripts\rmbg\rmbg_worker.py) —
+  // Page2 “Jacket Extract” uses this to white-out Banana Pro's near-white
+  // background before SmartCropAndEnlargeAuto. We reuse ComfyUI Easy Install's
+  // embedded Python (which already has torch + transformers + the RMBG-2.0
+  // weights cached at <ComfyUI>/models/RMBG/RMBG-2.0).
+  const RMBG_PYTHON =
+    env.VITE_RMBG_PYTHON ?? 'D:\\AI\\ComfyUI-Easy-Install\\python_embeded\\python.exe';
+  const RMBG_WORKER =
+    env.VITE_RMBG_WORKER ??
+    path.join(process.cwd(), 'scripts', 'rmbg', 'rmbg_worker.py');
+  const RMBG_MODEL_DIR =
+    env.VITE_RMBG_MODEL_DIR ??
+    'D:\\AI\\ComfyUI-Easy-Install\\ComfyUI\\models\\RMBG\\RMBG-2.0';
+
   return {
-    plugins: [react(), sam3ExtractPlugin({ python: SAM3_PYTHON, projectDir: SAM3_PROJECT_DIR })],
+    plugins: [
+      react(),
+      sam3ExtractPlugin({ python: SAM3_PYTHON, projectDir: SAM3_PROJECT_DIR }),
+      rmbgPlugin({ python: RMBG_PYTHON, worker: RMBG_WORKER, modelDir: RMBG_MODEL_DIR }),
+    ],
     // Allow the test_align_e2e.html page to be served as a second entry.
     appType: 'mpa',
     server: {
@@ -146,6 +164,156 @@ export default defineConfig(({ mode }) => {
 interface Sam3PluginOptions {
   python: string;
   projectDir: string;
+}
+
+// ============================================================================
+// RMBG bridge plugin
+// ============================================================================
+//
+// Exposes a single dev-server endpoint:
+//
+//   POST /api/rmbg
+//     Content-Type: application/json
+//     Body: {
+//       imageBase64: "data:image/png;base64,...",
+//       processRes?: number,        // default 1024 (matches workflow)
+//       sensitivity?: number,       // default 1.0
+//       maskBlur?: number,          // default 0
+//       maskOffset?: number,        // default 0
+//       backgroundColor?: string,   // default "#ffffff"
+//     }
+//
+//     Spawns scripts/rmbg/rmbg_worker.py once per call (the RMBG-2.0 model is
+//     reloaded each time — a few seconds on warm disk cache, ~10s cold; not
+//     worth the long-lived-process complexity for the current usage volume).
+//
+//     Response shape:
+//       { ok: true,  imageBase64: "data:image/png;base64,..." }
+//       { ok: false, error: <string> }
+//
+interface RmbgPluginOptions {
+  python: string;
+  worker: string;
+  modelDir: string;
+}
+
+function rmbgPlugin(opts: RmbgPluginOptions): Plugin {
+  return {
+    name: 'rmbg-bridge',
+    apply: 'serve',
+    configureServer(server) {
+      server.middlewares.use('/api/rmbg', async (req, res, next) => {
+        if (req.method !== 'POST') return next();
+
+        const sendJson = (status: number, body: unknown) => {
+          res.statusCode = status;
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          res.end(JSON.stringify(body));
+        };
+
+        let body = '';
+        try {
+          for await (const chunk of req) body += chunk;
+        } catch (err) {
+          return sendJson(400, { ok: false, error: `读取请求体失败：${(err as Error).message}` });
+        }
+
+        let parsed: {
+          imageBase64?: string;
+          processRes?: number;
+          sensitivity?: number;
+          maskBlur?: number;
+          maskOffset?: number;
+          backgroundColor?: string;
+        };
+        try {
+          parsed = JSON.parse(body);
+          if (!parsed.imageBase64) throw new Error('缺少 imageBase64 字段');
+        } catch (err) {
+          return sendJson(400, { ok: false, error: `请求体不合法：${(err as Error).message}` });
+        }
+
+        const m = /^data:image\/[^;]+;base64,(.+)$/.exec(parsed.imageBase64!);
+        const pureB64 = m ? m[1] : parsed.imageBase64!;
+
+        const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rmbg-bridge-'));
+        const inputPath = path.join(tmpDir, 'in.png');
+        const outputPath = path.join(tmpDir, 'out.png');
+
+        try {
+          await fs.writeFile(inputPath, Buffer.from(pureB64, 'base64'));
+
+          const args = [
+            opts.worker,
+            '--input', inputPath,
+            '--output', outputPath,
+            '--model-dir', opts.modelDir,
+            '--process-res', String(parsed.processRes ?? 1024),
+            '--sensitivity', String(parsed.sensitivity ?? 1.0),
+            '--mask-blur', String(parsed.maskBlur ?? 0),
+            '--mask-offset', String(parsed.maskOffset ?? 0),
+            '--background-color', parsed.backgroundColor ?? '#ffffff',
+          ];
+          // eslint-disable-next-line no-console
+          console.log('[rmbg-bridge] spawn:', opts.python, args.join(' '));
+
+          const child = spawn(opts.python, args, {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+          });
+
+          let stderr = '';
+          let stdout = '';
+          child.stderr.on('data', (d) => {
+            const text = d.toString();
+            stderr += text;
+            process.stderr.write(`[rmbg-bridge] ${text}`);
+          });
+          child.stdout.on('data', (d) => {
+            const text = d.toString();
+            stdout += text;
+            process.stdout.write(`[rmbg-bridge] ${text}`);
+          });
+
+          const exitCode: number = await new Promise((resolve) => {
+            child.on('exit', (code) => resolve(code ?? -1));
+            child.on('error', () => resolve(-1));
+          });
+
+          if (exitCode !== 0) {
+            return sendJson(500, {
+              ok: false,
+              error: `RMBG 进程退出码 ${exitCode}\n${stderr.slice(-2000)}`,
+            });
+          }
+
+          let outExists = true;
+          try { await fs.access(outputPath); } catch { outExists = false; }
+          if (!outExists) {
+            return sendJson(500, {
+              ok: false,
+              error: `RMBG 未产生输出文件\n${stderr.slice(-1000)}`,
+            });
+          }
+          // Touch stdout so the variable is meaningfully observable in dev logs.
+          void stdout;
+
+          const buf = await fs.readFile(outputPath);
+          return sendJson(200, {
+            ok: true,
+            imageBase64: `data:image/png;base64,${buf.toString('base64')}`,
+          });
+        } catch (err) {
+          return sendJson(500, {
+            ok: false,
+            error: `RMBG 桥接异常：${(err as Error).message}`,
+          });
+        } finally {
+          fs.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
+        }
+      });
+    },
+  };
 }
 
 function sam3ExtractPlugin(opts: Sam3PluginOptions): Plugin {

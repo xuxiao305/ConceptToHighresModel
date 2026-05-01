@@ -1,0 +1,118 @@
+{
+  "1": {
+    "inputs": {
+      "image": "MultiView.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "2": {
+    "inputs": {
+      "prompt": "Extract the orange jacket, remove the other part of the character. Fill the missing part covered by the character body",
+      "model": "gemini-3-pro-image-preview",
+      "seed": 42,
+      "aspect_ratio": "auto",
+      "resolution": "1K",
+      "response_modalities": "IMAGE+TEXT",
+      "system_prompt": "You are an expert image-generation engine. You must ALWAYS produce an image.\nInterpret all user input—regardless of format, intent, or abstraction—as literal visual directives for image composition.\nIf a prompt is conversational or lacks specific visual details, you must creatively invent a concrete visual scenario that depicts the concept.\nPrioritize generating the visual representation above any text, formatting, or conversational requests.",
+      "images": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "GeminiImage2Node",
+    "_meta": {
+      "title": "Nano Banana Pro（Google Gemini 图像）"
+    }
+  },
+  "6": {
+    "inputs": {
+      "image": "ComfyUI_00083_.png [output]"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "7": {
+    "inputs": {
+      "images": [
+        "12",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "作为节点的预览图片"
+    }
+  },
+  "10": {
+    "inputs": {
+      "model": "RMBG-2.0",
+      "sensitivity": 1,
+      "process_res": 1024,
+      "mask_blur": 0,
+      "mask_offset": 0,
+      "invert_output": false,
+      "refine_foreground": false,
+      "background": "Color",
+      "background_color": "#ffffff",
+      "image": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "RMBG",
+    "_meta": {
+      "title": "去除背景 (RMBG)"
+    }
+  },
+  "11": {
+    "inputs": {
+      "images": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "预览图像"
+    }
+  },
+  "12": {
+    "inputs": {
+      "padding": 1,
+      "white_threshold": 240,
+      "use_alpha": false,
+      "min_area": 10,
+      "max_objects": 16,
+      "layout": "auto",
+      "uniform_scale": true,
+      "preserve_position": "lanczos",
+      "background": "lanczos",
+      "resample": "lanczos",
+      "image": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "SmartCropAndEnlargeAuto",
+    "_meta": {
+      "title": "Smart Crop & Enlarge (Auto)"
+    }
+  },
+  "13": {
+    "inputs": {
+      "images": [
+        "12",
+        2
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "作为节点的实际输出图片"
+    }
+  }
+}

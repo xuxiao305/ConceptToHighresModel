@@ -29,25 +29,14 @@ export interface NodeConfig {
 }
 
 /**
- * Extraction node mode:
- *   - banana: 用 Banana Pro (Gemini) + 文本提示词直接生成提取结果
- *   - sam3:   点击"生成"后弹出 SAM3 独立窗口进行交互式点选，
- *             用户"导出 JSON"后窗口自动关闭、结果回传。
- */
-export type ExtractionMode = 'banana' | 'sam3';
-
-/**
- * Pipeline source mode — controls which Page1 node feeds Image Input:
- *   - extraction: 使用 Page1 的 Extraction 输出作为源图片
- *                 （若不存在则回退到 Multi-View）
- *   - multiview:  使用 Page1 的 Multi-View 输出作为源图片
+ * Pipeline source mode — controls which Page1 node feeds Image Input,
+ * and which extraction implementation runs:
+ *   - multiview:  Pipeline 1 — Page1 Multi-View → Banana Pro (Jacket Extract) + RMBG
+ *   - extraction: Pipeline 2 — Page1 Extraction → SAM3 interactive segmentation
  */
 export type PipelineMode = 'extraction' | 'multiview';
 
 export interface ExtractionState {
-  mode: ExtractionMode;
-  /** Banana Pro 当前选中的提示词预设索引 */
-  promptIndex: number;
   /** 当前展示的图片 blob: URL（生成结果或选中的历史版本） */
   resultUrl: string | null;
   /** 当前展示图片对应的工程文件名（用于历史下拉、复制路径） */

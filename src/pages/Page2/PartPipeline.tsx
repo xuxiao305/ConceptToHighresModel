@@ -10,25 +10,28 @@ import {
   EXTRACT_JACKET_PROMPT,
   extractWithPrompt,
   extractWithSAM3,
+  removeBackgroundRMBG,
+  RMBGNotWiredError,
   SAM3CancelledError,
   SAM3NotWiredError,
 } from '../../services/extraction';
 import { type AssetVersion } from '../../services/projectStore';
-import { splitMultiView, enlargeMultiViewToFill } from '../../services/multiviewSplit';
+import { splitMultiView, smartCropAndEnlargeAuto } from '../../services/multiviewSplit';
 
 /**
- * Full node list (Mode B · Multi-View). Mode A · Extraction omits the standalone
- * `multiview` node since the Extract Jacket node already produces a 4-view sheet
- * directly. Use {@link getPartNodes} to obtain the mode-specific list.
+ * Full node list (Mode 'multiview' = Jacket Extract pipeline). Mode
+ * 'extraction' = General Extract pipeline omits the standalone `multiview`
+ * node since the SAM3 extraction step already preserves the 4-view layout.
+ * Use {@link getPartNodes} to obtain the mode-specific list.
  *
- * Note: the `extraction` node's display title is mode-dependent — see
- * {@link getPartNodes}. Mode A (general extraction) uses SAM3 interactive
- * segmentation and is labelled "SAM3 Extract"; Mode B (Extract Jacket) uses
- * a fixed Banana Pro prompt and is labelled "Extract Jacket".
+ * The `extraction` node's display title is mode-dependent — see
+ * {@link getPartNodes}. Mode 'multiview' uses the Banana Pro "Extract Jacket"
+ * prompt and is labelled "Jacket Extraction". Mode 'extraction' uses SAM3
+ * interactive segmentation and is labelled "General Extraction".
  */
 export const PART_NODES: NodeConfig[] = [
   { id: 'imageInput', title: 'Image Input', display: 'image' },
-  { id: 'extraction', title: 'Extract Jacket', display: 'image' },
+  { id: 'extraction', title: 'Jacket Extraction', display: 'image' },
   { id: 'multiview', title: 'Multi-View', display: 'multiview' },
   { id: 'modify', title: 'Modify', display: 'image', optional: true },
   { id: 'highres', title: 'Highres Model 3D', display: '3d' },
@@ -39,18 +42,19 @@ export const PART_NODES: NodeConfig[] = [
 /** Returns the node list for a given pipeline mode. */
 export function getPartNodes(mode: PipelineMode): NodeConfig[] {
   if (mode === 'extraction') {
-    // Mode A: SAM3 interactive segmentation → omit the standalone Multi-View
-    // node and rename the extraction node so the UI reflects the actual runner.
+    // General Extract pipeline: SAM3 mask is applied to the existing 4-view
+    // source, so no standalone Multi-View regen is needed. Rename the
+    // extraction node to reflect the actual runner.
     return PART_NODES
       .filter((n) => n.id !== 'multiview')
-      .map((n) => (n.id === 'extraction' ? { ...n, title: 'SAM3 Extract' } : n));
+      .map((n) => (n.id === 'extraction' ? { ...n, title: 'General Extraction' } : n));
   }
   return PART_NODES;
 }
 
 const PIPELINE_MODE_LABEL: Record<PipelineMode, string> = {
-  extraction: 'A · Extraction',
-  multiview: 'B · Multi-View',
+  extraction: 'General Extract',
+  multiview: 'Jacket Extract',
 };
 
 interface Props {
@@ -139,7 +143,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
 
   // Extraction sub-state — Page2 fixes mode='banana' and the "Extract Jacket"
   // prompt, so no UI mutator is needed; runner reads/writes resultUrl/file.
-  const extraction = pipeline.extraction ?? { mode: 'banana', promptIndex: 0, resultUrl: null };
+  const extraction = pipeline.extraction ?? { resultUrl: null };
 
   // Helpers to update imageInput sub-state immutably.
   const imageInput = pipeline.imageInput ?? { imageUrl: null };
@@ -222,13 +226,20 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     [pipeline, onUpdate]
   );
 
-  // Real Extraction runner. Two modes:
-  //   - pipeline.mode === 'multiview' (Extract Jacket pipeline): Banana Pro
-  //     with the fixed "Extract Jacket" prompt directly produces a 4-view sheet.
-  //   - pipeline.mode === 'extraction' (General Extraction pipeline): SAM3
-  //     bridge spawns the standalone GUI for interactive segmentation, then
-  //     Banana Pro recomposes the masked subject into a 4-view sheet.
-  // Both paths converge on the same post-processing (enlarge → save → split).
+  // Real Extraction runner. Two pipelines, exactly mirroring the ComfyUI
+  // workflows in Document/Design/Pipelines_Page2:
+  //
+  //   pipeline.mode === 'multiview' (Pipeline 1 "Jacket Extract"):
+  //     Banana Pro (EXTRACT_JACKET_PROMPT) → RMBG-2.0 (white bg)
+  //                                       → SmartCropAndEnlargeAuto
+  //     Mirrors ComfyuiWorkflow/BananaExtractJacket.json.
+  //
+  //   pipeline.mode === 'extraction' (Pipeline 2 "General Extract"):
+  //     SAM3 GUI segmentation → mask × source (white bg, full size)
+  //                            → SmartCropAndEnlargeAuto
+  //     Mirrors ComfyuiWorkflow/SAM3_ExtractParts.json.
+  //
+  // Both paths converge on the same persistence + 4-view split tail.
   const runExtraction = useCallback(async (): Promise<string | null> => {
     if (!sourceFile) {
       onStatus(`[${pipeline.name}] 缺少源图片：请先在 Page1 生成 Extraction 或 Multi-View`, 'error');
@@ -236,7 +247,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     }
 
     const useSAM3 = pipeline.mode === 'extraction';
-    const modeLabel = useSAM3 ? 'SAM3 提取' : 'Extract Jacket';
+    const modeLabel = useSAM3 ? 'General Extract' : 'Jacket Extract';
     const noteForMode = `${pipeline.name} · ${modeLabel}`;
 
     // Set running
@@ -248,38 +259,75 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     onStatus(`[${pipeline.name}] ${modeLabel} 提取中…`, 'info');
 
     try {
-      const url = useSAM3
-        ? await extractWithSAM3({
-            source: sourceFile,
-            onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
-          })
-        : await extractWithPrompt({
-            source: sourceFile,
-            prompt: EXTRACT_JACKET_PROMPT,
-            onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
-          });
+      // ── Step ① + ②: extract → mask-on-white (full 4-view size) ─────────
+      let maskedBlob: Blob;
+      if (useSAM3) {
+        const r = await extractWithSAM3({
+          source: sourceFile,
+          onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
+        });
+        maskedBlob = r.blob;
+      } else {
+        const url = await extractWithPrompt({
+          source: sourceFile,
+          prompt: EXTRACT_JACKET_PROMPT,
+          onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
+        });
+        const bananaBlob = await (await fetch(url)).blob();
+        URL.revokeObjectURL(url);
+        // RMBG-2.0 to white background — matches BananaExtractJacket.json node 10.
+        const rmbgUrl = await removeBackgroundRMBG({
+          source: bananaBlob,
+          backgroundColor: '#ffffff',
+          processRes: 1024,
+          sensitivity: 1.0,
+          onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
+        });
+        maskedBlob = await (await fetch(rmbgUrl)).blob();
+        URL.revokeObjectURL(rmbgUrl);
+      }
 
       // Revoke previous result URL if any
       if (extraction.resultUrl) URL.revokeObjectURL(extraction.resultUrl);
 
-      // Post-process: 对 Banana Pro 输出的 4-view 做"分别等比放大撑满象限"，
-      // 让每个 view 的主体尺度更接近，再交给后续紧凑切分。
+      // ── Step ③: SmartCropAndEnlargeAuto with workflow-specific params ──
+      onStatus(`[${pipeline.name}] Smart Crop & Enlarge (Auto)…`, 'info');
       let processedBlob: Blob;
       let processedUrl: string;
       try {
-        const rawBlob = await (await fetch(url)).blob();
-        onStatus(`[${pipeline.name}] 等比放大每个视图…`, 'info');
-        processedBlob = await enlargeMultiViewToFill(rawBlob);
+        processedBlob = useSAM3
+          ? await smartCropAndEnlargeAuto(maskedBlob, {
+              // SAM3_ExtractParts.json node 13 params
+              padding: 8,
+              whiteThreshold: 240,
+              useAlpha: false,
+              minArea: 64,
+              maxObjects: 16,
+              layout: 'auto',
+              uniformScale: false,
+              preservePosition: false,
+              background: '#ffffff',
+            })
+          : await smartCropAndEnlargeAuto(maskedBlob, {
+              // BananaExtractJacket.json node 12 params
+              padding: 1,
+              whiteThreshold: 240,
+              useAlpha: false,
+              minArea: 10,
+              maxObjects: 16,
+              layout: 'auto',
+              uniformScale: true,
+              preservePosition: true,
+              background: '#ffffff',
+            });
         processedUrl = URL.createObjectURL(processedBlob);
-        // 释放 Banana Pro 返回的原始 blob URL
-        URL.revokeObjectURL(url);
       } catch (e) {
         onStatus(
-          `[${pipeline.name}] 等比放大失败，回退使用原图：${e instanceof Error ? e.message : String(e)}`,
+          `[${pipeline.name}] Smart Crop 失败，回退使用 mask 原图：${e instanceof Error ? e.message : String(e)}`,
           'warning',
         );
-        processedBlob = await (await fetch(url)).blob();
-        processedUrl = url;
+        processedBlob = maskedBlob;
+        processedUrl = URL.createObjectURL(processedBlob);
       }
 
       // Save to project (full 4-view PNG)
@@ -360,7 +408,11 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
         return null;
       }
       const friendlyMsg =
-        err instanceof SAM3NotWiredError ? `SAM3 子进程桥接异常（${msg}）` : msg;
+        err instanceof SAM3NotWiredError
+          ? `SAM3 子进程桥接异常（${msg}）`
+          : err instanceof RMBGNotWiredError
+            ? `RMBG 子进程桥接异常（${msg}）`
+            : msg;
       console.error('[PartPipeline] extract jacket failed:', err);
       onUpdate(pipeline.id, {
         ...pipeline,
@@ -552,6 +604,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
                     sourceUrl={sourceUrl}
                     error={extraction.error}
                     label={`${pipeline.name} · ${node.title}`}
+                    mode={pipeline.mode}
                   />
                 ) : (
                   <Placeholder type={displayType} state={state} label={`${pipeline.name} · ${node.title}`} />
@@ -723,7 +776,7 @@ function ImageInputBody({ state, imageUrl, sourceUrl, mode, label }: ImageInputB
 }
 
 // ---------------------------------------------------------------------------
-// Extraction node body — Page2 "Extract Jacket"（固定 Banana Pro + 固定提示词）
+// Extraction node body — Page2 Pipeline 1 (Jacket Extract) / Pipeline 2 (General Extract)
 // ---------------------------------------------------------------------------
 
 interface ExtractionBodyProps {
@@ -733,6 +786,7 @@ interface ExtractionBodyProps {
   sourceUrl: string | null;
   error?: string;
   label: string;
+  mode: PipelineMode;
 }
 
 function ExtractionBody({
@@ -742,6 +796,7 @@ function ExtractionBody({
   sourceUrl,
   error,
   label,
+  mode,
 }: ExtractionBodyProps) {
   // Pick the image to preview: result if present, otherwise the source.
   const previewUrl = resultUrl ?? sourceUrl;
@@ -759,7 +814,9 @@ function ExtractionBody({
       />
 
       <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-        固定提示词：提取外套，补全被遮挡部分
+        {mode === 'multiview'
+          ? 'Banana Pro（固定提示词：提取外套，补全被遮挡部分）→ RMBG-2.0 → Smart Crop'
+          : 'SAM3 交互分割（整图保留 4-view）→ Smart Crop'}
       </div>
       {!sourceUrl && (
         <div style={{ fontSize: 10, color: 'var(--accent-yellow, #d49b3b)' }}>

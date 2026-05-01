@@ -1,37 +1,31 @@
 /**
- * Part-level extraction service.
+ * Page2 part-level extraction service.
  *
- * Mode 1 (Banana Pro / Nano Banana Pro):
- *   Reuses the Leihuo gateway's `gemini-3-pro-image-preview` model — which is
- *   the same Gemini model that ComfyUI labels "Nano Banana Pro (Google Gemini
- *   Image)" — to extract a sub-region of the source character image using a
- *   text prompt.
+ * Two pipelines (matching Document/Design/Pipelines_Page2 exactly):
  *
- * Mode 2 (SAM3 segmentation):
- *   Mirrors the ComfyUI workflow `SAM3_ExtractParts.json` step-for-step but
- *   without depending on ComfyUI:
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │ Pipeline 1 — "Jacket Extract"                                       │
+ *   │   source: Page1 Multi-View (T-pose 4-view)                          │
+ *   │   ① extractWithPrompt(EXTRACT_JACKET_PROMPT) → Banana Pro 4-view    │
+ *   │   ② removeBackgroundRMBG()  → RMBG-2.0, white background            │
+ *   │   ③ smartCropAndEnlargeAuto({padding:1, max_objects:16,             │
+ *   │       layout:'auto', uniform_scale:true, preserve_position:true})   │
+ *   │   ④ splitMultiView()        → 4 individual views                    │
+ *   │ Mirrors ComfyuiWorkflow/BananaExtractJacket.json node-for-node.     │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │ Pipeline 2 — "General Extract"                                      │
+ *   │   source: Page1 Extraction (Remove Jacket 4-view)                   │
+ *   │   ① extractWithSAM3() → user paints multi-region masks in SAM3 GUI  │
+ *   │   ② applyMaskWhiteFullSize() → mask × source, white background      │
+ *   │   ③ smartCropAndEnlargeAuto({padding:8, min_area:64,                │
+ *   │       layout:'auto', uniform_scale:false, preserve_position:false}) │
+ *   │   ④ splitMultiView()        → 4 individual views                    │
+ *   │ Mirrors ComfyuiWorkflow/SAM3_ExtractParts.json node-for-node.       │
+ *   └─────────────────────────────────────────────────────────────────────┘
  *
- *     1. Spawn the standalone `sam3_app` GUI in a subprocess (handled by the
- *        Vite dev plugin `sam3-extract-bridge` in vite.config.ts). The user
- *        does interactive point/click segmentation in a native PyQt window
- *        that opens with the source image preloaded; on "导出 JSON" + window
- *        close the bridge returns the resulting `<basename>.json` plus a
- *        grayscale `<basename>_mask.png` where each region has a unique
- *        gray value.
- *     2. SAM3MergeMasks(union) — implicit: any non-zero pixel in the mask is
- *        "inside the union of all regions".
- *     3. AILab_MaskExtractor(extract_masked_area, white background) — done
- *        in the browser via canvas: copy source pixels where mask>0, fill the
- *        rest with white.
- *     4. SmartCropAndEnlargeAuto — likewise canvas-side: tight bbox of the
- *        non-white area, optional padding.
- *     5. GeminiImage2Node — re-compose into a 4-view (front / left / right /
- *        back) reference sheet by calling `generateImage()` with the prompt
- *        copied verbatim from the workflow.
- *
- *   The final output has the SAME shape as Page1's Multi-View (a 2x2 grid),
- *   so we save it the same way: full PNG to `page2.extraction/<file>` and
- *   per-view splits to `<file_basename>_v0001/{front,left,back,right}_v0001.png`.
+ * The two pipelines share the same post-process tail (③+④) — only the
+ * "extract → mask-on-white" prefix differs.  Wiring lives in
+ * src/pages/Page2/PartPipeline.tsx (`runExtraction`).
  */
 
 import { generateImage } from './leihuo';
@@ -43,13 +37,17 @@ export const REMOVE_JACKET_PROMPT =
   'Remove the orange jacket, and fill the short-sleeve T-shirt and arm coverred by the jacket';
 
 /**
- * Page2 "Extract Jacket" 节点使用的固定提示词：提取外套，补全被遮挡部分。
+ * Page2 Pipeline 1 ("Jacket Extract") 使用的固定提示词：提取外套，补全被遮挡部分。
  */
 export const EXTRACT_JACKET_PROMPT =
   'Extract the orange jacket, remove the other part of the character. Fill the missing part covered by the character body';
 
+// ===========================================================================
+// Banana Pro extraction (Pipeline 1 step ①)
+// ===========================================================================
+
 export interface ExtractWithPromptOptions {
-  /** Source image (concept / multi-view). Accepts File / Blob / URL string. */
+  /** Source image. Accepts File / Blob / URL string. */
   source: File | Blob | string;
   /** Free-text prompt — usually one of REMOVE_JACKET_PROMPT / EXTRACT_JACKET_PROMPT. */
   prompt: string;
@@ -65,7 +63,7 @@ export interface ExtractWithPromptOptions {
  * Run a Banana-Pro-prompt extraction. Returns a blob: URL of the generated PNG.
  */
 export async function extractWithPrompt(
-  opts: ExtractWithPromptOptions
+  opts: ExtractWithPromptOptions,
 ): Promise<string> {
   const seed =
     typeof opts.seed === 'number' ? opts.seed : Math.floor(Math.random() * 2 ** 31);
@@ -76,12 +74,77 @@ export async function extractWithPrompt(
     seed,
     signal: opts.signal,
   });
-  opts.onStatus?.('提取完成');
+  opts.onStatus?.('Banana Pro 提取完成');
   return url;
 }
 
 // ===========================================================================
-// SAM3 mode
+// RMBG-2.0 background removal (Pipeline 1 step ②)
+// ===========================================================================
+
+export interface RemoveBackgroundOptions {
+  /** Source image. */
+  source: File | Blob | string;
+  /** Background color (default '#ffffff'). */
+  backgroundColor?: string;
+  /** RMBG model processing resolution (default 1024 — matches workflow). */
+  processRes?: number;
+  /** Mask sensitivity (default 1.0). */
+  sensitivity?: number;
+  /** Optional progress callback. */
+  onStatus?: (msg: string) => void;
+  /** Abort signal. */
+  signal?: AbortSignal;
+}
+
+/** Marker error: RMBG bridge is not reachable / Python failed. */
+export class RMBGNotWiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RMBGNotWiredError';
+  }
+}
+
+/**
+ * POSTs to the Vite dev plugin `/api/rmbg`, which spawns
+ * `scripts/rmbg/rmbg_worker.py` to run RMBG-2.0 on the embedded ComfyUI Python
+ * (D:\AI\ComfyUI-Easy-Install\python_embeded\python.exe). Returns a blob: URL
+ * to the white-composited PNG.
+ */
+export async function removeBackgroundRMBG(
+  opts: RemoveBackgroundOptions,
+): Promise<string> {
+  opts.onStatus?.('RMBG-2.0 去背景中…');
+  const sourceB64 = await blobToDataUrl(await toBlob(opts.source));
+
+  const res = await fetch('/api/rmbg', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      imageBase64: sourceB64,
+      processRes: opts.processRes ?? 1024,
+      sensitivity: opts.sensitivity ?? 1.0,
+      backgroundColor: opts.backgroundColor ?? '#ffffff',
+    }),
+    signal: opts.signal,
+  });
+  if (!res.ok) {
+    throw new RMBGNotWiredError(`RMBG 桥接 HTTP ${res.status}：${await res.text()}`);
+  }
+  const payload = (await res.json()) as
+    | { ok: true; imageBase64: string }
+    | { ok: false; error: string };
+  if (!payload.ok) {
+    throw new RMBGNotWiredError(payload.error);
+  }
+
+  const blob = await dataUrlToBlob(payload.imageBase64);
+  opts.onStatus?.('RMBG-2.0 完成');
+  return URL.createObjectURL(blob);
+}
+
+// ===========================================================================
+// SAM3 segmentation (Pipeline 2 step ①)
 // ===========================================================================
 
 /** JSON exported by `sam3_app` (see `_on_export_json` in app.py). */
@@ -97,22 +160,12 @@ export interface SAM3ExportJson {
 }
 
 export interface ExtractWithSAM3Options {
-  /** Source image (page1.multiview). */
+  /** Source image. */
   source: File | Blob;
-  /** Optional Banana-Pro re-composition prompt; when omitted uses the default
-   *  prompt copied verbatim from `SAM3_ExtractParts.json` step 11.            */
-  recomposePrompt?: string;
   /** Optional progress / status callback. */
   onStatus?: (msg: string) => void;
-  /** Optional fixed seed (omit for random). */
-  seed?: number;
   /** Abort signal for cancellation. */
   signal?: AbortSignal;
-  /** Padding in pixels around the cropped subject before recompose. Default 12. */
-  cropPadding?: number;
-  /** Skip the Banana Pro recompose step and return the cropped subject PNG
-   *  directly (useful for debugging / when caller wants the masked image). */
-  skipRecompose?: boolean;
 }
 
 /** Marker error so the UI can distinguish bridge errors from real failures. */
@@ -131,39 +184,38 @@ export class SAM3CancelledError extends Error {
   }
 }
 
-/** Default Banana Pro re-composition prompt — copied verbatim from
- *  `SAM3_ExtractParts.json` node "11.GeminiImage2Node". */
-export const SAM3_RECOMPOSE_PROMPT =
-  'note this is the SAME subject with different angle with such order:\n' +
-  'top left: front view \n' +
-  'top right: left view\n' +
-  'bottom left: right view\n' +
-  'bottom right: back view \n\n' +
-  'You need enlarged the subject, scale filling its zone, but do NOT make it across to other grids\n';
+/**
+ * Result of SAM3 segmentation: original-size source PNG with the union of all
+ * SAM3 regions kept (others replaced by white). Matches the
+ * AILab_MaskExtractor(extract_masked_area, background=Color/#FFFFFF) step in
+ * SAM3_ExtractParts.json — output keeps the source's full dimensions, no
+ * cropping. The caller runs SmartCropAndEnlarge + 4-view split next.
+ */
+export interface SAM3MaskResult {
+  /** Mask-applied PNG, same dimensions as the source. */
+  blob: Blob;
+  /** Grayscale mask PNG (R=G=B per region) for inspection. */
+  maskBlob: Blob;
+  /** Region count returned by SAM3. */
+  regionCount: number;
+}
 
 /**
- * Drives the full SAM3 extraction workflow by:
- *   1. POSTing the source image to the Vite dev plugin `/api/sam3-extract`.
- *      The plugin spawns the SAM3 GUI (PyQt window) with the image
- *      preloaded; the user does point/click segmentation and hits "导出
- *      JSON". The window auto-closes on export and the plugin returns the
- *      mask PNG + JSON.
- *   2. In the browser, applies the mask to the source (extract masked area,
- *      fill the rest with white) — equivalent to ComfyUI's
- *      AILab_MaskExtractor(extract_masked_area, background=white).
- *   3. Tight-crops the result around the non-white pixels with a small
- *      padding — equivalent to SmartCropAndEnlargeAuto.
- *   4. Calls Banana Pro (Gemini) with `SAM3_RECOMPOSE_PROMPT` to re-compose
- *      a 4-view (front / left / right / back) reference sheet.
- *
- * Returns a blob: URL of the final 4-view PNG (same shape as page1.multiview).
+ * Drives the SAM3 GUI bridge:
+ *   1. POSTs the source image to `/api/sam3-extract`. The plugin spawns the
+ *      SAM3 GUI (PyQt window) with the image preloaded; the user does
+ *      multi-region point/click segmentation and hits "导出 JSON". The
+ *      window auto-closes once the export lands.
+ *   2. In the browser, applies the union of SAM3 masks (any non-zero pixel
+ *      counts) to the source: pixels inside the mask keep their colour,
+ *      pixels outside become white. Output keeps the source's full
+ *      dimensions — this matches AILab_MaskExtractor in the workflow.
  */
 export async function extractWithSAM3(
   opts: ExtractWithSAM3Options,
-): Promise<string> {
+): Promise<SAM3MaskResult> {
   const { source, onStatus, signal } = opts;
 
-  // ── 1. Send to bridge → spawn SAM3 GUI → wait for export ────────────────
   onStatus?.('打开 SAM3 窗口…（请在新弹出的窗口中标注后点击"导出 JSON"）');
   const sourceB64 = await blobToDataUrl(source);
 
@@ -194,29 +246,28 @@ export async function extractWithSAM3(
   }
   onStatus?.(`SAM3 标注完成：${payload.json.objects.length} 个区域`);
 
-  // ── 2. Apply mask + 3. tight crop, all in one canvas pass ───────────────
-  const padding = opts.cropPadding ?? 12;
-  const croppedBlob = await applyMaskAndCrop(source, payload.maskBase64, padding);
-  onStatus?.('已应用 mask 并裁切到主体边界');
+  const maskBlob = await dataUrlToBlob(payload.maskBase64);
+  const maskedBlob = await applyMaskWhiteFullSize(source, payload.maskBase64);
+  onStatus?.('已对原图应用 SAM3 mask（保留 4-view 整图）');
 
-  if (opts.skipRecompose) {
-    return URL.createObjectURL(croppedBlob);
-  }
-
-  // ── 4. Banana Pro recompose into 4-view sheet ──────────────────────────
-  const seed = typeof opts.seed === 'number' ? opts.seed : Math.floor(Math.random() * 2 ** 31);
-  onStatus?.(`Banana Pro 4视图重组中（seed=${seed}）…`);
-  const url = await generateImage({
-    prompt: opts.recomposePrompt ?? SAM3_RECOMPOSE_PROMPT,
-    images: [croppedBlob],
-    seed,
-    signal,
-  });
-  onStatus?.('SAM3 提取完成');
-  return url;
+  return {
+    blob: maskedBlob,
+    maskBlob,
+    regionCount: payload.json.objects.length,
+  };
 }
 
-// ─── Helpers ───────────────────────────────────────────────────────────────
+// ===========================================================================
+// Helpers
+// ===========================================================================
+
+async function toBlob(src: File | Blob | string): Promise<Blob> {
+  if (typeof src === 'string') {
+    const r = await fetch(src);
+    return await r.blob();
+  }
+  return src;
+}
 
 /** Read a Blob/File as a `data:image/...;base64,...` URL. */
 async function blobToDataUrl(blob: Blob): Promise<string> {
@@ -233,6 +284,11 @@ async function blobToDataUrl(blob: Blob): Promise<string> {
   return `data:${mime};base64,${btoa(bin)}`;
 }
 
+async function dataUrlToBlob(dataUrl: string): Promise<Blob> {
+  const r = await fetch(dataUrl);
+  return await r.blob();
+}
+
 /** Decode a URL or data-URL into an `HTMLImageElement`, awaiting load. */
 async function loadImage(src: string): Promise<HTMLImageElement> {
   return await new Promise((resolve, reject) => {
@@ -245,14 +301,16 @@ async function loadImage(src: string): Promise<HTMLImageElement> {
 }
 
 /**
- * Apply mask to source: pixels where mask>0 keep their source colour, the rest
- * become pure white. Then tight-crop around the non-white area with `padding`
- * pixels of margin.
+ * Compose source × mask → "source-where-mask, white-elsewhere" PNG, keeping
+ * the source's original dimensions.  Equivalent to ComfyUI's
+ * `AILab_MaskExtractor(mode=extract_masked_area, background=Color/#FFFFFF)`.
+ *
+ * Mask is interpreted as grayscale (R=G=B); any value > 0 is treated as
+ * "inside the union of all regions", matching `SAM3MergeMasks(union)`.
  */
-async function applyMaskAndCrop(
+async function applyMaskWhiteFullSize(
   source: Blob,
   maskBase64: string,
-  padding: number,
 ): Promise<Blob> {
   const sourceUrl = URL.createObjectURL(source);
   try {
@@ -260,72 +318,40 @@ async function applyMaskAndCrop(
     const W = srcImg.naturalWidth;
     const H = srcImg.naturalHeight;
 
-    // Step A: composite source × mask → masked-on-white canvas
-    const masked = document.createElement('canvas');
-    masked.width = W;
-    masked.height = H;
-    const mctx = masked.getContext('2d', { willReadFrequently: true });
-    if (!mctx) throw new Error('无法获取 2D Canvas 上下文');
+    const out = document.createElement('canvas');
+    out.width = W;
+    out.height = H;
+    const octx = out.getContext('2d', { willReadFrequently: true });
+    if (!octx) throw new Error('无法获取 2D Canvas 上下文');
 
-    // Draw the source first (so we can read its pixels at full resolution).
-    mctx.drawImage(srcImg, 0, 0);
-    const srcData = mctx.getImageData(0, 0, W, H);
+    octx.drawImage(srcImg, 0, 0);
+    const srcData = octx.getImageData(0, 0, W, H);
 
-    // Draw mask scaled to source size onto a temporary canvas, then read.
     const maskCanvas = document.createElement('canvas');
     maskCanvas.width = W;
     maskCanvas.height = H;
-    const mcCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
-    if (!mcCtx) throw new Error('无法获取 mask 2D Canvas 上下文');
-    mcCtx.imageSmoothingEnabled = false;
-    mcCtx.drawImage(maskImg, 0, 0, W, H);
-    const maskData = mcCtx.getImageData(0, 0, W, H).data;
+    const mctx = maskCanvas.getContext('2d', { willReadFrequently: true });
+    if (!mctx) throw new Error('无法获取 mask 2D Canvas 上下文');
+    mctx.imageSmoothingEnabled = false;
+    mctx.drawImage(maskImg, 0, 0, W, H);
+    const maskData = mctx.getImageData(0, 0, W, H).data;
 
-    // Combine: where mask R-channel > 0 keep src pixel; else white.
-    let minX = W, minY = H, maxX = -1, maxY = -1;
-    const out = srcData.data;
+    const px = srcData.data;
     for (let y = 0; y < H; y++) {
       for (let x = 0; x < W; x++) {
         const idx = (y * W + x) * 4;
-        const m = maskData[idx]; // grayscale mask: R=G=B
-        if (m > 0) {
-          // keep source RGB, force alpha 255
-          out[idx + 3] = 255;
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
+        if (maskData[idx] > 0) {
+          // keep src RGB; force opaque
+          px[idx + 3] = 255;
         } else {
-          out[idx] = 255;
-          out[idx + 1] = 255;
-          out[idx + 2] = 255;
-          out[idx + 3] = 255;
+          px[idx] = 255; px[idx + 1] = 255; px[idx + 2] = 255; px[idx + 3] = 255;
         }
       }
     }
-    mctx.putImageData(srcData, 0, 0);
-
-    if (maxX < 0) {
-      throw new Error('SAM3 mask 完全为空（没有任何非零像素），无法裁切');
-    }
-
-    // Step B: tight crop with padding (clamped to canvas bounds).
-    const x0 = Math.max(0, minX - padding);
-    const y0 = Math.max(0, minY - padding);
-    const x1 = Math.min(W - 1, maxX + padding);
-    const y1 = Math.min(H - 1, maxY + padding);
-    const cw = x1 - x0 + 1;
-    const ch = y1 - y0 + 1;
-
-    const cropped = document.createElement('canvas');
-    cropped.width = cw;
-    cropped.height = ch;
-    const cctx = cropped.getContext('2d');
-    if (!cctx) throw new Error('无法获取 crop 2D Canvas 上下文');
-    cctx.drawImage(masked, x0, y0, cw, ch, 0, 0, cw, ch);
+    octx.putImageData(srcData, 0, 0);
 
     return await new Promise<Blob>((resolve, reject) => {
-      cropped.toBlob(
+      out.toBlob(
         (b) => (b ? resolve(b) : reject(new Error('Canvas.toBlob 返回空'))),
         'image/png',
       );

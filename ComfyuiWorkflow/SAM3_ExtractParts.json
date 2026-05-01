@@ -146,25 +146,6 @@
       "title": "遮罩提取 (RMBG) 🎭"
     }
   },
-  "11": {
-    "inputs": {
-      "prompt": "note this is the SAME subject with different angle with such order:\ntop left: front view \ntop right: left view\nbottom left: right view\nbottom right: back view \n\nYou need enlarged the subject, scale filling its zone, but do NOT make it across to other grids\n",
-      "model": "gemini-3-pro-image-preview",
-      "seed": 43,
-      "aspect_ratio": "auto",
-      "resolution": "1K",
-      "response_modalities": "IMAGE+TEXT",
-      "system_prompt": "You are an expert image-generation engine. You must ALWAYS produce an image.\nInterpret all user input—regardless of format, intent, or abstraction—as literal visual directives for image composition.\nIf a prompt is conversational or lacks specific visual details, you must creatively invent a concrete visual scenario that depicts the concept.\nPrioritize generating the visual representation above any text, formatting, or conversational requests.",
-      "images": [
-        "10",
-        0
-      ]
-    },
-    "class_type": "GeminiImage2Node",
-    "_meta": {
-      "title": "Nano Banana Pro（Google Gemini 图像）"
-    }
-  },
   "12": {
     "inputs": {
       "filename_prefix": "ComfyUI",
@@ -186,6 +167,8 @@
       "min_area": 64,
       "max_objects": 16,
       "layout": "auto",
+      "uniform_scale": false,
+      "preserve_position": false,
       "background": "white",
       "resample": "lanczos",
       "image": [
@@ -207,7 +190,7 @@
     },
     "class_type": "PreviewImage",
     "_meta": {
-      "title": "预览图像"
+      "title": "作为节点的预览图片"
     }
   },
   "16": {
@@ -230,6 +213,18 @@
     "class_type": "Anything Everywhere",
     "_meta": {
       "title": "Anything Everywhere"
+    }
+  },
+  "18": {
+    "inputs": {
+      "images": [
+        "13",
+        2
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "作为节点的实际输出图片"
     }
   }
 }

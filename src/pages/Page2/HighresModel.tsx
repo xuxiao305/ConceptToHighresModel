@@ -6,14 +6,14 @@ import { useProject } from '../../contexts/ProjectContext';
 import type { PersistedPipeline } from '../../services/projectStore';
 
 const PIPELINE_MODE_LABEL: Record<PipelineMode, string> = {
-  extraction: 'SAM3 Extract',
-  multiview: 'Extract Jacket',
+  extraction: 'General Extract',
+  multiview: 'Jacket Extract',
 };
 
 const PIPELINE_MODE_DESC: Record<PipelineMode, string> = {
-  extraction: '使用 Page1 的 Extraction 输出作为源图片，由 SAM3 交互式分割 + Banana Pro 重组 4 视图',
-  multiview: '使用 Page1 的 Multi-View 输出作为源图片，由 Extract Jacket 节点重新生成 4 视图',
-};
+  extraction: '使用 Page1 的 Extraction 输出作为源图片，由 SAM3 交互式分割 → Smart Crop（保留 4-view 整图）',
+  multiview: '使用 Page1 的 Multi-View 输出作为源图片，由 Banana Pro（提取外套）+ RMBG-2.0 → Smart Crop',
+};;
 
 interface Props {
   onStatusChange: (msg: string, status?: 'info' | 'success' | 'warning' | 'error') => void;
@@ -36,8 +36,6 @@ const makePart = (idx: number, mode: PipelineMode = 'extraction'): PartPipelineS
     imageUrl: null,
   },
   extraction: {
-    mode: 'banana',
-    promptIndex: 0,
     resultUrl: null,
   },
 });
@@ -47,8 +45,6 @@ function toPersisted(p: PartPipelineState): PersistedPipeline {
   return {
     name: p.name,
     mode: p.mode,
-    extractionMode: p.extraction?.mode,
-    promptIndex: p.extraction?.promptIndex,
     imageFile: p.imageInput?.imageFile ?? null,
     resultFile: p.extraction?.resultFile ?? null,
   };
@@ -70,8 +66,6 @@ function fromPersisted(pp: PersistedPipeline, index: number): PartPipelineState 
       imageFile: pp.imageFile ?? null,
     },
     extraction: {
-      mode: pp.extractionMode ?? 'banana',
-      promptIndex: pp.promptIndex ?? 0,
       resultUrl: null,
       resultFile: pp.resultFile ?? null,
     },

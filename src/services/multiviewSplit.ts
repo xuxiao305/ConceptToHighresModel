@@ -111,60 +111,90 @@ export async function splitMultiView(
 }
 
 // ---------------------------------------------------------------------------
-// 等比放大撑满（移植自 D:\AI\MyComfyuiNodes\SmartCropAndEnlarge nodes.py）
+// SmartCropAndEnlargeAuto —— 端到端移植自
+// D:\AI\MyComfyuiNodes\SmartCropAndEnlarge\nodes.py 的 SmartCropAndEnlargeAuto。
+//
+// 算法概述：
+//   1. 在整张图上扫描"前景连通分量"（white_threshold/alpha 判定）。
+//   2. 丢掉面积 < min_area 的噪点；按面积从大到小截到 max_objects 个。
+//   3. 对剩余 bbox 按"原图位置（行优先）"排序：先从上到下分组成行（用中位
+//      高度的 0.5 当作行阈值），每行再从左到右。
+//   4. 按 layout 把每个 bbox 的内容等比放大粘到输出画布上：
+//        - layout='auto'        : 取 cols=ceil(sqrt(N)), rows=ceil(N/cols)
+//        - layout='horizontal'  : 1 × N
+//        - layout='vertical'    : N × 1
+//      若 preserve_position=true，则忽略 layout，每个 bbox 围绕原中心原地
+//      最大化等比缩放，不做位置重排。
+//   5. uniform_scale=true 时所有 bbox 共享同一个缩放倍率（取所有候选
+//      scale 的最小值），保持物体之间的相对大小关系。
 // ---------------------------------------------------------------------------
 
-export interface EnlargeToFillOptions {
-  /** 网格行数，默认 2（适配 2x2 多视图布局） */
-  rows?: number;
-  /** 网格列数，默认 2 */
-  cols?: number;
-  /** 在每个单元内、围绕 tight bbox 的外扩像素数，默认 8 */
+export type SmartCropLayout = 'auto' | 'horizontal' | 'vertical';
+
+export interface SmartCropAutoOptions {
+  /** bbox 外扩像素，默认 8 */
   padding?: number;
-  /** 视为"白底背景"的阈值：r/g/b 任一 < 该值即视为前景，默认 240 */
+  /** 近白判定阈值（rgb 任一 < 阈值即前景），默认 240 */
   whiteThreshold?: number;
-  /** 若图像带 alpha，是否按 alpha>8 来判定前景（默认 false，按白底判定） */
+  /** 若图像带 alpha，是否按 alpha>8 判前景（默认 false） */
   useAlpha?: boolean;
-  /** 内容相对单元的最大占比，1.0 = 完全撑满。默认 1.0 */
-  fillRatio?: number;
-  /** 背景填充色，默认 '#ffffff'（白）。可用 'transparent' 关键字。 */
+  /** 小于该面积的连通块视为噪点丢弃，默认 64 */
+  minArea?: number;
+  /** 最多保留的物体数（按面积从大到小），默认 16 */
+  maxObjects?: number;
+  /** 排布模式，默认 'auto' */
+  layout?: SmartCropLayout;
+  /** 所有物体使用同一缩放倍率（保持相对大小），默认 false */
+  uniformScale?: boolean;
+  /**
+   * 不重新排布，每个物体围绕原位置中心原地放大。开启后忽略 layout。
+   * 默认 false。
+   */
+  preservePosition?: boolean;
+  /** 背景色，默认 '#ffffff'。可用 'transparent'。 */
   background?: string;
 }
 
 /**
- * 把一张图按 rows × cols 网格切分，每个单元内：
- *   1. 找前景的紧凑包围盒（按 white_threshold 或 alpha 判定）
- *   2. 围绕 bbox 加 `padding` 像素外扩
- *   3. 把这块内容等比缩放到 (cell_w * fillRatio, cell_h * fillRatio) 的最大尺寸
- *   4. 居中粘回相同的单元位置
- *
- * 输出尺寸与输入一致，每个单元的主体都被"撑满"。
- *
- * 算法严格对照 ComfyUI 节点 SmartCropAndEnlargeGrid 的实现，便于结果一致。
+ * SmartCropAndEnlargeAuto 的浏览器实现，输入输出都是 Blob，输出尺寸与输入一致。
+ * 算法逐行参考 ComfyUI 节点同名实现，参数语义保持一致。
  */
-export async function enlargeMultiViewToFill(
+export async function smartCropAndEnlargeAuto(
   source: Blob | string,
-  opts: EnlargeToFillOptions = {},
+  opts: SmartCropAutoOptions = {},
 ): Promise<Blob> {
-  const rows = Math.max(1, Math.floor(opts.rows ?? 2));
-  const cols = Math.max(1, Math.floor(opts.cols ?? 2));
   const padding = Math.max(0, Math.floor(opts.padding ?? 8));
   const whiteThr = opts.whiteThreshold ?? 240;
   const useAlpha = opts.useAlpha ?? false;
-  const fillRatio = Math.max(0.05, Math.min(1.0, opts.fillRatio ?? 1.0));
+  const minArea = Math.max(1, Math.floor(opts.minArea ?? 64));
+  const maxObjects = Math.max(1, Math.floor(opts.maxObjects ?? 16));
+  const layout = opts.layout ?? 'auto';
+  const uniformScale = opts.uniformScale ?? false;
+  const preservePosition = opts.preservePosition ?? false;
   const bgColor = opts.background ?? '#ffffff';
-  const transparent = bgColor.toLowerCase() === 'transparent' || bgColor.toLowerCase() === 'none';
+  const transparent =
+    bgColor.toLowerCase() === 'transparent' || bgColor.toLowerCase() === 'none';
 
   const img = await loadImage(source);
   const W = img.naturalWidth;
   const H = img.naturalHeight;
 
-  // 把源图绘到一张 canvas，方便逐像素读取。
+  // 读源像素
   const srcCanvas = makeCanvas(W, H);
   const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true });
   if (!srcCtx) throw new Error('无法获取 2D Canvas 上下文');
   srcCtx.drawImage(img, 0, 0);
   const srcData = srcCtx.getImageData(0, 0, W, H).data;
+
+  // 1. 找全图所有连通分量
+  let bboxes = allComponentsBBoxes(srcData, W, H, whiteThr, useAlpha, minArea);
+
+  // 2. 按面积从大到小截取
+  bboxes.sort((a, b) => (b.x1 - b.x0) * (b.y1 - b.y0) - (a.x1 - a.x0) * (a.y1 - a.y0));
+  bboxes = bboxes.slice(0, maxObjects);
+
+  // 3. 行优先排序（保持原图相对位置）
+  bboxes = sortBBoxesRowMajor(bboxes);
 
   // 输出画布
   const outCanvas = makeCanvas(W, H);
@@ -179,54 +209,245 @@ export async function enlargeMultiViewToFill(
   outCtx.imageSmoothingEnabled = true;
   outCtx.imageSmoothingQuality = 'high';
 
-  // 单元尺寸（最后一行/列吸收余数，避免边缘 1px 黑线）
+  if (bboxes.length === 0) {
+    return await canvasToBlob(outCanvas, 'image/png');
+  }
+
+  // 把每个 bbox 加 padding 后映射到原图坐标（端不包含）
+  const padded = bboxes.map((b) => ({
+    x0: Math.max(0, b.x0 - padding),
+    y0: Math.max(0, b.y0 - padding),
+    x1: Math.min(W, b.x1 + padding),
+    y1: Math.min(H, b.y1 + padding),
+  }));
+
+  if (preservePosition) {
+    // 围绕原中心原地最大化缩放（不重排）
+    let scaleOverride: number | null = null;
+    if (uniformScale) {
+      const cands: number[] = [];
+      for (const p of padded) {
+        const fgW = p.x1 - p.x0;
+        const fgH = p.y1 - p.y0;
+        if (fgW <= 0 || fgH <= 0) continue;
+        const cx = (p.x0 + p.x1) / 2;
+        const cy = (p.y0 + p.y1) / 2;
+        const [tw, th] = centeredLimitSize(cx, cy, W, H, 1.0);
+        cands.push(Math.min(tw / fgW, th / fgH));
+      }
+      if (cands.length > 0) scaleOverride = Math.min(...cands);
+    }
+
+    for (const p of padded) {
+      const fgW = p.x1 - p.x0;
+      const fgH = p.y1 - p.y0;
+      if (fgW <= 0 || fgH <= 0) continue;
+      const cx = (p.x0 + p.x1) / 2;
+      const cy = (p.y0 + p.y1) / 2;
+      const [tw, th] = centeredLimitSize(cx, cy, W, H, 1.0);
+      const [newW, newH] = fitWithScale(fgW, fgH, tw, th, scaleOverride);
+      const [px, py] = pasteXyForCenter(cx, cy, newW, newH, W, H);
+      outCtx.drawImage(img, p.x0, p.y0, fgW, fgH, px, py, newW, newH);
+    }
+    return await canvasToBlob(outCanvas, 'image/png');
+  }
+
+  // 网格排布
+  const n = padded.length;
+  let cols: number, rows: number;
+  if (layout === 'horizontal') {
+    rows = 1; cols = n;
+  } else if (layout === 'vertical') {
+    rows = n; cols = 1;
+  } else {
+    cols = Math.ceil(Math.sqrt(n));
+    rows = Math.ceil(n / cols);
+  }
   const cellWBase = Math.floor(W / cols);
   const cellHBase = Math.floor(H / rows);
 
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const x0 = c * cellWBase;
-      const y0 = r * cellHBase;
-      const x1 = c === cols - 1 ? W : (c + 1) * cellWBase;
-      const y1 = r === rows - 1 ? H : (r + 1) * cellHBase;
-      const cellW = x1 - x0;
-      const cellH = y1 - y0;
-      if (cellW <= 0 || cellH <= 0) continue;
-
-      // 在单元内找"最大连通分量"的紧凑 bbox（绝对坐标，end 不包含）。
-      // 使用最大连通分量是为了避免把邻接象限渗过来的零碎像素算进 bbox。
-      const bb = largestComponentBBox(srcData, W, x0, y0, x1, y1, whiteThr, useAlpha);
-      if (!bb) continue;
-
-      // 把 bbox 向外扩 padding（限制在单元范围内）
-      const bx0 = Math.max(x0, bb.x0 - padding);
-      const by0 = Math.max(y0, bb.y0 - padding);
-      const bx1 = Math.min(x1, bb.x1 + padding);
-      const by1 = Math.min(y1, bb.y1 + padding);
-      const fgW = bx1 - bx0;
-      const fgH = by1 - by0;
-      if (fgW <= 0 || fgH <= 0) continue;
-
-      // 等比缩放到 (cellW * fillRatio, cellH * fillRatio) 内部
-      const targetW = Math.max(1, Math.round(cellW * fillRatio));
-      const targetH = Math.max(1, Math.round(cellH * fillRatio));
-      const scale = Math.min(targetW / fgW, targetH / fgH);
-      const newW = Math.max(1, Math.round(fgW * scale));
-      const newH = Math.max(1, Math.round(fgH * scale));
-
-      // 在单元内居中
-      const dx = x0 + Math.floor((cellW - newW) / 2);
-      const dy = y0 + Math.floor((cellH - newH) / 2);
-
-      outCtx.drawImage(
-        img,
-        bx0, by0, fgW, fgH,  // src
-        dx, dy, newW, newH,   // dst
-      );
+  // uniform scale 候选
+  let scaleOverride: number | null = null;
+  if (uniformScale) {
+    const cands: number[] = [];
+    for (let i = 0; i < n; i++) {
+      const r = Math.floor(i / cols);
+      const c = i % cols;
+      const cx0 = c * cellWBase;
+      const cy0 = r * cellHBase;
+      const cx1 = c === cols - 1 ? W : (c + 1) * cellWBase;
+      const cy1 = r === rows - 1 ? H : (r + 1) * cellHBase;
+      const cw = cx1 - cx0;
+      const ch = cy1 - cy0;
+      const fgW = padded[i].x1 - padded[i].x0;
+      const fgH = padded[i].y1 - padded[i].y0;
+      if (cw <= 0 || ch <= 0 || fgW <= 0 || fgH <= 0) continue;
+      cands.push(Math.min(cw / fgW, ch / fgH));
     }
+    if (cands.length > 0) scaleOverride = Math.min(...cands);
+  }
+
+  for (let i = 0; i < n; i++) {
+    const r = Math.floor(i / cols);
+    const c = i % cols;
+    const cx0 = c * cellWBase;
+    const cy0 = r * cellHBase;
+    const cx1 = c === cols - 1 ? W : (c + 1) * cellWBase;
+    const cy1 = r === rows - 1 ? H : (r + 1) * cellHBase;
+    const cw = cx1 - cx0;
+    const ch = cy1 - cy0;
+    if (cw <= 0 || ch <= 0) continue;
+
+    const p = padded[i];
+    const fgW = p.x1 - p.x0;
+    const fgH = p.y1 - p.y0;
+    if (fgW <= 0 || fgH <= 0) continue;
+
+    const [newW, newH] = fitWithScale(fgW, fgH, cw, ch, scaleOverride);
+    const px = cx0 + Math.floor((cw - newW) / 2);
+    const py = cy0 + Math.floor((ch - newH) / 2);
+    outCtx.drawImage(img, p.x0, p.y0, fgW, fgH, px, py, newW, newH);
   }
 
   return await canvasToBlob(outCanvas, 'image/png');
+}
+
+// ---- helpers for SmartCropAndEnlargeAuto -----------------------------------
+
+interface BBox { x0: number; y0: number; x1: number; y1: number; }
+
+/**
+ * 全图 4-邻接连通分量扫描；返回 area >= minArea 的所有分量 bbox（端不含）。
+ * 使用 typed-array stack 模拟 DFS，避免大图递归爆栈。
+ */
+function allComponentsBBoxes(
+  data: Uint8ClampedArray,
+  W: number,
+  H: number,
+  whiteThr: number,
+  useAlpha: boolean,
+  minArea: number,
+): BBox[] {
+  // 先把前景标到 mask 上（0=bg, 1=fg, 2=visited）
+  const N = W * H;
+  const mask = new Uint8Array(N);
+  let totalFg = 0;
+  for (let y = 0; y < H; y++) {
+    const row = y * W;
+    for (let x = 0; x < W; x++) {
+      const i = (row + x) * 4;
+      const a = data[i + 3];
+      let isFg: boolean;
+      if (useAlpha) {
+        isFg = a > 8;
+      } else if (a < 8) {
+        isFg = false;
+      } else {
+        isFg = data[i] < whiteThr || data[i + 1] < whiteThr || data[i + 2] < whiteThr;
+      }
+      if (isFg) {
+        mask[row + x] = 1;
+        totalFg++;
+      }
+    }
+  }
+  if (totalFg === 0) return [];
+
+  const stack = new Int32Array(totalFg);
+  const out: BBox[] = [];
+
+  for (let py = 0; py < H; py++) {
+    for (let px = 0; px < W; px++) {
+      const start = py * W + px;
+      if (mask[start] !== 1) continue;
+      let top = 0;
+      stack[top++] = start;
+      mask[start] = 2;
+      let minX = px, maxX = px, minY = py, maxY = py;
+      let area = 0;
+      while (top > 0) {
+        const idx = stack[--top];
+        const x = idx % W;
+        const y = (idx - x) / W;
+        area++;
+        if (x < minX) minX = x; else if (x > maxX) maxX = x;
+        if (y < minY) minY = y; else if (y > maxY) maxY = y;
+        if (x + 1 < W && mask[idx + 1] === 1) { mask[idx + 1] = 2; stack[top++] = idx + 1; }
+        if (x - 1 >= 0 && mask[idx - 1] === 1) { mask[idx - 1] = 2; stack[top++] = idx - 1; }
+        if (y + 1 < H && mask[idx + W] === 1) { mask[idx + W] = 2; stack[top++] = idx + W; }
+        if (y - 1 >= 0 && mask[idx - W] === 1) { mask[idx - W] = 2; stack[top++] = idx - W; }
+      }
+      if (area >= minArea) {
+        out.push({ x0: minX, y0: minY, x1: maxX + 1, y1: maxY + 1 });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 行优先排序：先按 y 中心分行（行阈值 = 中位高度 * 0.5），每行再按 x 中心从左到右。
+ * 与 SmartCropAndEnlarge nodes.py 中 _sort_bboxes_row_major 等价。
+ */
+function sortBBoxesRowMajor(bboxes: BBox[]): BBox[] {
+  if (bboxes.length <= 1) return bboxes;
+  const cy = (b: BBox) => (b.y0 + b.y1) / 2;
+  const cx = (b: BBox) => (b.x0 + b.x1) / 2;
+
+  const heights = bboxes.map((b) => Math.max(1, b.y1 - b.y0)).sort((a, b) => a - b);
+  const median = heights[Math.floor(heights.length / 2)];
+  const rowThreshold = Math.max(1, median * 0.5);
+
+  const sorted = [...bboxes].sort((a, b) => cy(a) - cy(b) || cx(a) - cx(b));
+  const rows: BBox[][] = [];
+  for (const b of sorted) {
+    if (rows.length === 0) {
+      rows.push([b]);
+      continue;
+    }
+    const lastRow = rows[rows.length - 1];
+    const rowCy = lastRow.reduce((s, x) => s + cy(x), 0) / lastRow.length;
+    if (Math.abs(cy(b) - rowCy) <= rowThreshold) lastRow.push(b);
+    else rows.push([b]);
+  }
+  const out: BBox[] = [];
+  for (const row of rows) {
+    row.sort((a, b) => cx(a) - cx(b) || a.x0 - b.x0);
+    out.push(...row);
+  }
+  return out;
+}
+
+function centeredLimitSize(
+  cx: number, cy: number, W: number, H: number, fillCell: number,
+): [number, number] {
+  const f = Math.max(0.05, Math.min(1.0, fillCell));
+  const maxWByCenter = Math.max(1, 2 * Math.min(cx, W - cx));
+  const maxHByCenter = Math.max(1, 2 * Math.min(cy, H - cy));
+  const tw = Math.min(W * f, maxWByCenter);
+  const th = Math.min(H * f, maxHByCenter);
+  return [Math.max(1, Math.floor(tw)), Math.max(1, Math.floor(th))];
+}
+
+function pasteXyForCenter(
+  cx: number, cy: number, ow: number, oh: number, W: number, H: number,
+): [number, number] {
+  let px = Math.round(cx - ow / 2);
+  let py = Math.round(cy - oh / 2);
+  px = Math.max(0, Math.min(W - ow, px));
+  py = Math.max(0, Math.min(H - oh, py));
+  return [px, py];
+}
+
+function fitWithScale(
+  sw: number, sh: number, dw: number, dh: number, scale: number | null,
+): [number, number] {
+  if (scale == null) {
+    const s = Math.min(dw / sw, dh / sh);
+    return [Math.max(1, Math.round(sw * s)), Math.max(1, Math.round(sh * s))];
+  }
+  const s = Math.min(scale, dw / sw, dh / sh);
+  return [Math.max(1, Math.floor(sw * s + 1e-6)), Math.max(1, Math.floor(sh * s + 1e-6))];
 }
 
 /**

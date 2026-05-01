@@ -1,0 +1,38 @@
+Pipeline 1 - 使用Banana从Page1的全身MultiView上提取外套的专用管线
+Pipeline名：Jacket Extract
+这个节点名要出现在 “推荐Pipeline”的按钮下，以及Pipeline自身的标签里，现在这里还写着 “B - Multi-View”
+
+从左至右的节点顺序和说明：
+- Image Input
+  - 输入：使用Page1的Multi-View四合一拼图
+  - 输出：Page1的Multi-View四合一拼图 （同输入，无实际操作）
+- Jacket Extraction
+  - 操作：参考D:\AI\Prototypes\ConceptToHighresModel\ComfyuiWorkflow\BananaExtractJacket.JSON流程
+    - 1. 使用Banana Pro的提取外套提示词，获取外套的四合一图片
+    - 2. 得到输出的结果以后，自动调用和comfyui workflow里类似算法，对图片进行remove background (make background white), smart crop & enlarge
+    - 3. 将四合一的图片作为节点预览，切割好的图片作为输出给下一个节点
+
+- 后续几个节点保持不变
+
+
+
+Pipeline 2 - 使用SAM3进行通用切割
+Pipeline名：General Extract 
+这个节点名要出现在 “推荐Pipeline”的按钮下，以及Pipeline自身的标签里，现在这里还写着 “A - Extract”
+
+从左至右的节点顺序和说明：
+- Image Input
+  - 输入：使用Page1的Remove Jacket的四合一拼图
+  - 输出：Page1的Remove Jacket的四合一拼图 （同输入，无实际操作）
+- General Extraction
+  - 操作：参考D:\AI\Prototypes\ConceptToHighresModel\ComfyuiWorkflow\SAM3_ExtractParts.JSON流程
+    - 1. 使用subprocess调用SAM3的实现，对图片进行切割
+    - 2. 得到输出的结果以后，自动调用和comfyui workflow里类似算法，对图片进行remove background (make background white), smart crop & enlarge
+    - 3. 将四合一的图片作为节点预览，切割好的图片作为输出给下一个节点
+- 后续几个节点保持不变
+
+这两个流程中都有一个关键节点SmartCropAndEnlarge, 实现在D:\AI\MyComfyuiNodes\SmartCropAndEnlarge；注意该节点有很多参数和模式，我们需要和我提供的workflow流程里使用相同的参数和模式
+
+其他comfyui节点都能在D:\AI\ComfyUI-Easy-Install\ComfyUI\custom_nodes找到
+
+这些流程和核心算法都是在comfyui里单独验证好的，如果找不到对应的实现就问我，不要自己现写实现；我们这边只做应用层的转换和接入，以便能在本工程独立运行，而不依赖comfyui

@@ -556,12 +556,8 @@ export async function loadLatestSegmentSet(
 export interface PersistedPipeline {
   /** Pipeline 名称（用户可编辑） */
   name: string;
-  /** 源图片模式：'extraction' 用 Page1 Extraction 输出，'multiview' 用 Multi-View 输出 */
+  /** 源图片模式：'extraction' = General Extract（SAM3），'multiview' = Jacket Extract（Banana+RMBG） */
   mode: 'extraction' | 'multiview';
-  /** Extraction 节点模式 */
-  extractionMode?: 'banana' | 'sam3';
-  /** Banana Pro 当前选中的提示词预设索引 */
-  promptIndex?: number;
   /** 用户手动设置的 Image Input 文件名（工程内相对路径，null 表示自动加载） */
   imageFile?: string | null;
   /** 当前 Extraction 结果文件名（工程内相对路径，用于恢复显示） */
