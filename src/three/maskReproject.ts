@@ -41,11 +41,24 @@ export interface MaskReprojectionResult {
 
 export interface MaskReprojectionOptions {
   /**
+   * Projection behavior:
+   * - 'front': keep only the front-most vertex per pixel.
+   * - 'through': assign every vertex whose projected pixel is inside the mask.
+   * Default 'front'.
+   */
+  projectionMode?: 'front' | 'through';
+  /**
    * For each labeled pixel, splat the assignment to vertices in a small
    * pixel neighborhood. Helps coarse meshes where vertices don't cover
    * every pixel. Default 0 (off).
    */
   splatRadiusPx?: number;
+  /**
+   * Dilate labeled mask pixels into nearby unlabeled/background pixels
+   * before reprojection. This compensates for tiny edge mismatches
+   * between the rendered mesh silhouette and the SAM mask. Default 0.
+   */
+  maskDilatePx?: number;
 }
 
 /**
@@ -176,9 +189,10 @@ export function reprojectMaskToVertices(
       `mask ${mask.width}x${mask.height} does not match camera ${camera.width}x${camera.height}`,
     );
   }
+  const projectionMode = options.projectionMode ?? 'front';
   const splat = Math.max(0, options.splatRadiusPx ?? 0);
+  const dilate = Math.max(0, Math.floor(options.maskDilatePx ?? 0));
 
-  const frontMap = buildFrontVertexMap(vertices, camera);
   const w = mask.width;
   const h = mask.height;
 
@@ -198,6 +212,8 @@ export function reprojectMaskToVertices(
   }
   const valueTolerance = 4;
 
+  const pixelLabels = buildDilatedPixelLabels(mask.data, w, h, valueToLabel, valueTolerance, dilate);
+
   let unassigned = 0;
 
   const tryAssign = (vertexIdx: number, label: string) => {
@@ -208,20 +224,51 @@ export function reprojectMaskToVertices(
     }
   };
 
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const v = mask.data[y * w + x];
-      if (v === 0) continue;
-      // Pick the closest known mask_value within tolerance.
-      let bestLabel: string | undefined;
-      let bestDelta = valueTolerance + 1;
-      for (const [val, lab] of valueToLabel) {
-        const d = Math.abs(v - val);
-        if (d < bestDelta) {
-          bestDelta = d;
-          bestLabel = lab;
+  if (projectionMode === 'through') {
+    const cx = w / 2;
+    const cy = h / 2;
+    const inv = 1 / camera.worldPerPx;
+    for (let i = 0; i < vertices.length; i++) {
+      const [, wy, wz] = vertices[i];
+      const u = cx + (camera.camZ - wz) * inv;
+      const v = cy - (wy - camera.camY) * inv;
+      const px = Math.round(u);
+      const py = Math.round(v);
+      if (px < 0 || px >= w || py < 0 || py >= h) continue;
+
+      let bestLabel = pixelLabels[py * w + px];
+      if (!bestLabel && splat > 0) {
+        for (let dy = -splat; dy <= splat && !bestLabel; dy++) {
+          const yy = py + dy;
+          if (yy < 0 || yy >= h) continue;
+          for (let dx = -splat; dx <= splat; dx++) {
+            const xx = px + dx;
+            if (xx < 0 || xx >= w) continue;
+            bestLabel = pixelLabels[yy * w + xx];
+            if (bestLabel) break;
+          }
         }
       }
+      if (bestLabel) tryAssign(i, bestLabel);
+    }
+
+    for (const label of pixelLabels) {
+      if (label) pixelHits.set(label, pixelHits.get(label)! + 1);
+    }
+
+    return {
+      assignments,
+      regions: regionSets,
+      perRegionPixelHits: pixelHits,
+      unassignedPixels: 0,
+    };
+  }
+
+  const frontMap = buildFrontVertexMap(vertices, camera);
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const bestLabel = pixelLabels[y * w + x];
       if (!bestLabel) continue;
       pixelHits.set(bestLabel, pixelHits.get(bestLabel)! + 1);
 
@@ -262,4 +309,72 @@ export function reprojectMaskToVertices(
     perRegionPixelHits: pixelHits,
     unassignedPixels: unassigned,
   };
+}
+
+function resolveMaskLabel(
+  value: number,
+  valueToLabel: Map<number, string>,
+  valueTolerance: number,
+): string | undefined {
+  if (value === 0) return undefined;
+  let bestLabel: string | undefined;
+  let bestDelta = valueTolerance + 1;
+  for (const [val, lab] of valueToLabel) {
+    const d = Math.abs(value - val);
+    if (d < bestDelta) {
+      bestDelta = d;
+      bestLabel = lab;
+    }
+  }
+  return bestLabel;
+}
+
+function buildDilatedPixelLabels(
+  gray: Uint8Array,
+  width: number,
+  height: number,
+  valueToLabel: Map<number, string>,
+  valueTolerance: number,
+  radiusPx: number,
+): Array<string | undefined> {
+  const labels = new Array<string | undefined>(width * height);
+  const seeds: Array<{ x: number; y: number; label: string }> = [];
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x;
+      const label = resolveMaskLabel(gray[idx], valueToLabel, valueTolerance);
+      if (!label) continue;
+      labels[idx] = label;
+      seeds.push({ x, y, label });
+    }
+  }
+
+  if (radiusPx <= 0 || seeds.length === 0) return labels;
+
+  const bestDist2 = new Int16Array(width * height);
+  bestDist2.fill(32767);
+
+  for (const seed of seeds) {
+    for (let dy = -radiusPx; dy <= radiusPx; dy++) {
+      const yy = seed.y + dy;
+      if (yy < 0 || yy >= height) continue;
+      for (let dx = -radiusPx; dx <= radiusPx; dx++) {
+        const xx = seed.x + dx;
+        if (xx < 0 || xx >= width) continue;
+        const d2 = dx * dx + dy * dy;
+        if (d2 === 0 || d2 > radiusPx * radiusPx) continue;
+        const idx = yy * width + xx;
+        if (resolveMaskLabel(gray[idx], valueToLabel, valueTolerance)) continue;
+        if (d2 < bestDist2[idx]) {
+          bestDist2[idx] = d2;
+          labels[idx] = seed.label;
+        } else if (d2 === bestDist2[idx] && labels[idx] !== seed.label) {
+          labels[idx] = undefined;
+        }
+      }
+    }
+  }
+
+  return labels;
 }

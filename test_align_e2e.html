@@ -48,11 +48,15 @@ function log(msg, cls = '') {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+// Let the browser paint the latest log before continuing heavy work.
+const flush = () => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
 // ── 严格复刻用户的 9 步流程 ──────────────────────────────────────────
 
 try {
   // Step 1: 加载 Source + Target mesh（和 Page3 restoreDemo 一样）
   log('Step 1: 加载 Source + Target mesh…', 'info');
+  await flush();
   const [srcMesh, tarMesh] = await Promise.all([
     loadGlbAsMesh('/demo/alignmenttest_arm_hires.glb'),
     loadGlbAsMesh('/demo/alignmenttest_bot.glb'),
@@ -62,6 +66,7 @@ try {
 
   // Step 2: 加载参考图 Bot.png（取尺寸 + 主体 bbox）
   log('\nStep 2: 加载参考图 Bot.png…', 'info');
+  await flush();
   const refImg = new Image();
   refImg.crossOrigin = 'anonymous';
   await new Promise((resolve, reject) => {
@@ -74,17 +79,20 @@ try {
 
   // Step 3: 加载 segmentation.json
   log('\nStep 3: 加载 segmentation.json…', 'info');
+  await flush();
   const segResp = await fetch('/demo/SAM3_SegInfo/segmentation.json');
   const segPack = parseSegmentationJson(await segResp.text());
   log(`  区域: ${segPack.regions.map(r => `${r.label}(${r.mask_value})`).join(', ')}`);
 
   // Step 4: 加载 mask
   log('\nStep 4: 加载 segmentation_mask.png…', 'info');
+  await flush();
   const mask = await loadMaskGray('/demo/SAM3_SegInfo/segmentation_mask.png');
   log(`  Mask: ${mask.width}×${mask.height}`);
 
   // Step 5: 计算 fitBBox（三图叠加用的对齐框）
   log('\nStep 5: 计算 fitBBox（和 UI "自动拟合" 一致）…', 'info');
+  await flush();
   const fitBBox = regionsUnionBBox(segPack.regions);
   log(`  Union bbox: ${fitBBox.w}×${fitBBox.h} @ (${fitBBox.x},${fitBBox.y})`);
 
@@ -105,12 +113,13 @@ try {
 
   // Step 7: 反投影 mask → 顶点
   log('\nStep 7: reprojectMaskToVertices…', 'info');
+  await flush();
   const reproj = reprojectMaskToVertices(
     tarMesh.vertices,
     mask,
     segPack.regions,
     orthoCamera,
-    { splatRadiusPx: 2 },
+    { projectionMode: 'through', splatRadiusPx: 2, maskDilatePx: 2 },
   );
   for (const [label, verts] of reproj.regions) {
     log(`  ${label}: ${verts.size} verts  pixelHits=${reproj.perRegionPixelHits.get(label)}`);
@@ -142,83 +151,150 @@ try {
 
   // Step 9: Build adjacency
   log('\nStep 9: Building adjacency…', 'info');
+  await flush();
   const t0adj = performance.now();
   const srcAdj = buildMeshAdjacency(srcMesh.vertices, srcMesh.faces);
   const tarAdj = buildMeshAdjacency(tarMesh.vertices, tarMesh.faces);
   log(`  srcAdj: ${(performance.now() - t0adj).toFixed(0)}ms total`);
 
-  // Step 10: matchPartialToWhole（和 UI "部分匹配查找" 一致）
-  log('\nStep 10: matchPartialToWhole (production defaults + SAM3 seed)…', 'info');
-  const t0pm = performance.now();
-  const pm = matchPartialToWhole(
-    { vertices: srcMesh.vertices, adjacency: srcAdj },
-    { vertices: tarMesh.vertices, adjacency: tarAdj },
-    {
-      numSrcSamples: 20,
-      numTarSamples: 80,
-      topK: 5,
-      iterations: 600,
-      inlierThreshold: 0.05,
-      descriptor: 'fpfh',
-      axialWeight: 5.0,
-      tarSeedCentroid: armCentroid,
-      tarSeedRadius: armRadius,
-      tarSeedWeight: 5.0,
-      tarConstraintVertices: armSet,
-    },
-  );
-  const pmMs = performance.now() - t0pm;
-  if (!pm.matrix4x4 || pm.pairs.length < 3) {
-    log(`  FAILED: inliers=${pm.bestInlierCount}`, 'err');
-    throw new Error('partial-match failed');
-  }
-  log(`  ${pm.pairs.length} pairs, RMSE=${pm.rmse.toFixed(4)}, ${pmMs.toFixed(0)}ms`, 'ok');
+// Step 10: 参数 sweep — 数据准备只做一次，匹配跑多组
+  log('\n═══ 参数 Sweep ═══', 'info');
 
-  // Step 11: SVD landmark fit（和 UI "执行对齐" 一致）
-  log('\nStep 11: SVD landmark fit (similarity)…', 'info');
-  const lmFit = alignSourceMeshByLandmarks(
-    srcMesh.vertices,
-    pm.pairs.map(p => p.srcPosition),
-    pm.pairs.map(p => p.tarPosition),
-    'similarity',
-  );
-  log(`  RMSE=${lmFit.rmse.toFixed(4)} scale=${lmFit.scale.toFixed(4)}`);
-
-  // Step 12: ICP refine（production defaults, NO tarRestrict）
-  log('\nStep 12: ICP refine…', 'info');
-  const icp = icpRefine(srcMesh.vertices, tarMesh.vertices, lmFit.matrix4x4);
-
-  // Apples-to-apples comparison on landmark pairs
-  const evalRmse = (m) => {
-    let s = 0;
-    for (const p of pm.pairs) {
-      const t = applyTransform(p.srcPosition, m);
-      s += (t[0]-p.tarPosition[0])**2 + (t[1]-p.tarPosition[1])**2 + (t[2]-p.tarPosition[2])**2;
-    }
-    return Math.sqrt(s / pm.pairs.length);
+  const BASE = {
+    numSrcSamples: 20,
+    numTarSamples: 80,
+    topK: 5,
+    iterations: 600,
+    inlierThreshold: 0.05,
+    descriptor: 'fpfh',
+    axialWeight: 5.0,
+    tarSeedCentroid: armCentroid,
+    tarSeedRadius: armRadius,
+    tarSeedWeight: 5.0,
+    tarConstraintVertices: armSet,
   };
-  const lmRmse = evalRmse(lmFit.matrix4x4);
-  const icpRmse = evalRmse(icp.matrix4x4);
-  const useIcp = icpRmse < lmRmse;
-  const finalMatrix = useIcp ? icp.matrix4x4 : lmFit.matrix4x4;
-  const finalRmse = useIcp ? icpRmse : lmRmse;
 
-  log(`  ICP: ${icp.iterations.length} iter, ${icp.stopReason}, best#${icp.bestIteration}`);
-  log(`  lmFit landmark RMSE: ${lmRmse.toFixed(4)}`);
-  log(`  ICP   landmark RMSE: ${icpRmse.toFixed(4)}`);
-  log(`  → 选择: ${useIcp ? 'ICP' : 'SVD-only'}  finalRMSE=${finalRmse.toFixed(4)}`, useIcp ? 'ok' : 'info');
+  const allConfigs = [
+    { label: '当前默认', color: '#44ff66', params: {} },
+    { label: 'srcSmp=30', color: '#66ccff', params: { numSrcSamples: 30 } },
+    { label: 'srcSmp=40', color: '#ff9944', params: { numSrcSamples: 40 } },
+    { label: 'tarSmp=150', color: '#cc66ff', params: { numTarSamples: 150 } },
+    { label: 'topK=8', color: '#ffcc44', params: { topK: 8 } },
+    { label: 'iter=1200', color: '#44ffcc', params: { iterations: 1200 } },
+    { label: 'thresh=8%', color: '#ff6688', params: { inlierThreshold: 0.08 } },
+    { label: 'axial=3', color: '#88ff44', params: { axialWeight: 3 } },
+    { label: 'seedW=2', color: '#ff44cc', params: { tarSeedWeight: 2.0 } },
+    { label: 'seedW=10', color: '#44cccc', params: { tarSeedWeight: 10 } },
+    { label: 'src30+tar150+topK8', color: '#ffaa66', params: { numSrcSamples: 30, numTarSamples: 150, topK: 8 } },
+    { label: 'src40+tar200+topK10', color: '#66ffaa', params: { numSrcSamples: 40, numTarSamples: 200, topK: 10 } },
+    { label: '约束内显著点', color: '#ffffff', params: { tarConstraintUseSaliency: true } },
+    { label: '显著点+topK8', color: '#99aaff', params: { tarConstraintUseSaliency: true, topK: 8 } },
+    { label: '显著点+topK10', color: '#77ddff', params: { tarConstraintUseSaliency: true, topK: 10 } },
+    { label: '显著点+tar100+topK8', color: '#ffdd77', params: { tarConstraintUseSaliency: true, numTarSamples: 100, topK: 8 } },
+    { label: '显著点+tar120+topK8', color: '#77ffdd', params: { tarConstraintUseSaliency: true, numTarSamples: 120, topK: 8 } },
+    { label: '显著点+src25+topK8', color: '#ddff77', params: { tarConstraintUseSaliency: true, numSrcSamples: 25, topK: 8 } },
+    { label: '显著点+src25+tar100+topK8', color: '#ff77dd', params: { tarConstraintUseSaliency: true, numSrcSamples: 25, numTarSamples: 100, topK: 8 } },
+    { label: '显著点+seedW2+topK8', color: '#aa77ff', params: { tarConstraintUseSaliency: true, tarSeedWeight: 2, topK: 8 } },
+    { label: '显著点+seedW10+topK8', color: '#77ffaa', params: { tarConstraintUseSaliency: true, tarSeedWeight: 10, topK: 8 } },
+    { label: '显著点1500+topK8', color: '#ff99aa', params: { tarConstraintUseSaliency: true, saliencyPoolTar: 1500, topK: 8 } },
+    { label: '显著点3000+topK8', color: '#aaff99', params: { tarConstraintUseSaliency: true, saliencyPoolTar: 3000, topK: 8 } },
+    { label: 'src30+显著1500+topK8', color: '#dd99ff', params: { tarConstraintUseSaliency: true, saliencyPoolTar: 1500, numSrcSamples: 30, numTarSamples: 150, topK: 8 } },
+  ];
 
-  // Summary
-  const finalScale = Math.sqrt(
-    finalMatrix[0][0]**2 + finalMatrix[1][0]**2 + finalMatrix[2][0]**2,
-  );
-  log(`\n═══ 结果 ═══`, 'ok');
-  log(`  pairs: ${pm.pairs.length}`, 'ok');
-  log(`  scale: ${finalScale.toFixed(4)}`, 'ok');
-  log(`  RMSE:  ${finalRmse.toFixed(4)}`, 'ok');
+  const fastConfigs = [
+    { label: '显著点+topK10', color: '#77ddff', params: { tarConstraintUseSaliency: true, topK: 10 } },
+    { label: '显著点+seedW2+topK8', color: '#aa77ff', params: { tarConstraintUseSaliency: true, tarSeedWeight: 2, topK: 8 } },
+    { label: '显著点+topK8', color: '#99aaff', params: { tarConstraintUseSaliency: true, topK: 8 } },
+    { label: '显著点+src25+topK8', color: '#ddff77', params: { tarConstraintUseSaliency: true, numSrcSamples: 25, topK: 8 } },
+  ];
 
-  // Step 13: 3D 可视化
-  log('\nStep 13: 渲染 3D 对比视图…', 'info');
+  const mode = new URLSearchParams(location.search).get('mode');
+  const configs = mode === 'full' ? allConfigs : fastConfigs;
+  log(`  Sweep 模式: ${mode === 'full' ? 'FULL 24组（较慢）' : 'FAST 4组（默认）'}；完整测试请加 ?mode=full`, 'warn');
+
+  const results = [];
+  for (let ci = 0; ci < configs.length; ci++) {
+    const cfg = configs[ci];
+    const partial = { ...BASE, ...cfg.params };
+    log(`\n[${ci+1}/${configs.length}] ${cfg.label}…`, 'info');
+    await flush();
+    const t0 = performance.now();
+    let pm;
+    try {
+      pm = matchPartialToWhole(
+        { vertices: srcMesh.vertices, adjacency: srcAdj },
+        { vertices: tarMesh.vertices, adjacency: tarAdj },
+        partial,
+      );
+    } catch (e) {
+      log(`  ERROR: ${e.message}`, 'err');
+      continue;
+    }
+    if (!pm.matrix4x4 || pm.pairs.length < 3) {
+      log(`  FAILED (${pm.bestInlierCount} inliers)`, 'err');
+      continue;
+    }
+    const lmFit = alignSourceMeshByLandmarks(
+      srcMesh.vertices,
+      pm.pairs.map(p => p.srcPosition),
+      pm.pairs.map(p => p.tarPosition),
+      'similarity',
+    );
+    const icp = icpRefine(srcMesh.vertices, tarMesh.vertices, lmFit.matrix4x4);
+    const evalRmse = (m) => {
+      let s = 0;
+      for (const p of pm.pairs) {
+        const t = applyTransform(p.srcPosition, m);
+        s += (t[0]-p.tarPosition[0])**2 + (t[1]-p.tarPosition[1])**2 + (t[2]-p.tarPosition[2])**2;
+      }
+      return Math.sqrt(s / pm.pairs.length);
+    };
+    const lmR = evalRmse(lmFit.matrix4x4);
+    const icpR = evalRmse(icp.matrix4x4);
+    const useIcp = icpR < lmR;
+    const finalMatrix = useIcp ? icp.matrix4x4 : lmFit.matrix4x4;
+    const finalRmse = useIcp ? icpR : lmR;
+    const scale = Math.sqrt(finalMatrix[0][0]**2 + finalMatrix[1][0]**2 + finalMatrix[2][0]**2);
+    const ms = performance.now() - t0;
+
+    results.push({ ...cfg, pm, finalMatrix, finalRmse, scale, useIcp, ms, pairs: pm.pairs.length });
+    log(`  pairs=${pm.pairs.length} RMSE=${finalRmse.toFixed(3)} scale=${scale.toFixed(3)} ${useIcp?'ICP':'SVD'} ${ms.toFixed(0)}ms`, 'ok');
+    if (configs.length <= 4 || (ci + 1) % 4 === 0) {
+      renderTopPreview(results, `当前已完成 ${ci + 1}/${configs.length} 组，临时前 4 名`);
+      await flush();
+    }
+  }
+
+  // 排名表
+  log('\n═══ 排名（按 RMSE 升序）═══', 'info');
+  const ranked = [...results].sort((a, b) => a.finalRmse - b.finalRmse);
+  log('  rank | pairs | RMSE   | scale  | method | time   | config', 'info');
+  log('  -----+-------+--------+--------+--------+--------+--------', 'info');
+  for (let i = 0; i < ranked.length; i++) {
+    const r = ranked[i];
+    log(`  ${String(i+1).padStart(4)} | ${String(r.pairs).padStart(5)} | ${r.finalRmse.toFixed(3).padStart(6)} | ${r.scale.toFixed(3).padStart(6)} | ${(r.useIcp?'ICP':'SVD').padStart(6)} | ${(r.ms/1000).toFixed(1).padStart(4)}s | ${r.label}`);
+  }
+
+  // 可视化前 4 名
+  log('\n渲染前 4 名的 3D 对比…', 'info');
+  renderTopPreview(results, '最终前 4 名');
+
+  // Step 13: 渲染 3D 对比视图…
+
+  function renderTopPreview(items, heading) {
+    vizEl.innerHTML = '';
+    const head = document.createElement('div');
+    head.style.cssText = 'width:100%;font-size:13px;color:#8cf;font-weight:bold;margin-bottom:4px;';
+    head.textContent = heading;
+    vizEl.appendChild(head);
+    const top4 = [...items].sort((a, b) => a.finalRmse - b.finalRmse).slice(0, 4);
+    for (const r of top4) {
+      createViewer(
+        `${r.label} · RMSE=${r.finalRmse.toFixed(3)} · scale=${r.scale.toFixed(3)} · ${r.pairs}对`,
+        r.finalMatrix, r.color,
+      );
+    }
+  }
 
   function createViewer(label, matrix, color) {
     const W = 500, H = 450;
@@ -228,14 +304,11 @@ try {
     title.style.cssText = `font-size:12px;color:${color};font-weight:bold;margin-bottom:4px;`;
     title.textContent = label;
     wrapper.appendChild(title);
-    const canvas = document.createElement('canvas');
-    canvas.width = W; canvas.height = H;
-    wrapper.appendChild(canvas);
+    const viewsRow = document.createElement('div');
+    viewsRow.style.cssText = 'display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;';
+    wrapper.appendChild(viewsRow);
     vizEl.appendChild(wrapper);
 
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-    renderer.setClearColor(0x0a0a1c);
-    renderer.setSize(W, H, false);
     const scene = new THREE.Scene();
     scene.add(new THREE.AmbientLight(0x8888aa, 1.2));
     const d1 = new THREE.DirectionalLight(0xffffff, 0.9);
@@ -294,15 +367,33 @@ try {
     const sz = new THREE.Vector3();
     tarGeo.boundingBox.getSize(sz);
     const maxD = Math.max(sz.x, sz.y, sz.z);
-    const cam = new THREE.PerspectiveCamera(40, W/H, 0.1, 5000);
-    cam.position.set(center.x + maxD*1.6, center.y, center.z);
-    cam.lookAt(center);
-    const ctrl = new OrbitControls(cam, canvas);
-    ctrl.target.copy(center); ctrl.update();
-    (function loop(){ requestAnimationFrame(loop); ctrl.update(); renderer.render(scene, cam); })();
-  }
 
-  createViewer(`最终结果 (${useIcp ? 'ICP' : 'SVD'}) · RMSE=${finalRmse.toFixed(3)} · scale=${finalScale.toFixed(3)}`, finalMatrix, '#44ff66');
+    function addView(viewLabel, cameraPosition) {
+      const pane = document.createElement('div');
+      pane.style.cssText = 'display:inline-block;';
+      const sub = document.createElement('div');
+      sub.style.cssText = 'font-size:11px;color:#9ab;margin-bottom:3px;';
+      sub.textContent = viewLabel;
+      pane.appendChild(sub);
+      const canvas = document.createElement('canvas');
+      canvas.width = W; canvas.height = H;
+      pane.appendChild(canvas);
+      viewsRow.appendChild(pane);
+
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+      renderer.setClearColor(0x0a0a1c);
+      renderer.setSize(W, H, false);
+      const cam = new THREE.PerspectiveCamera(40, W/H, 0.1, 5000);
+      cam.position.copy(cameraPosition);
+      cam.lookAt(center);
+      const ctrl = new OrbitControls(cam, canvas);
+      ctrl.target.copy(center); ctrl.update();
+      (function loop(){ requestAnimationFrame(loop); ctrl.update(); renderer.render(scene, cam); })();
+    }
+
+    addView('正视图（+X → -X）', new THREE.Vector3(center.x + maxD*1.6, center.y, center.z));
+    addView('侧视图（+Z → -Z）', new THREE.Vector3(center.x, center.y, center.z + maxD*1.6));
+  }
 
   log('\n完成 ✓', 'ok');
 

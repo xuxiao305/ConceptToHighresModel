@@ -164,9 +164,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [ransacIterations, setRansacIterations] = useState(300);
 
   // ── Partial-to-whole (Phase 2.6) ──────────────────────────────────────
-  const [partialSrcSamples, setPartialSrcSamples] = useState(20);
+  const [partialSrcSamples, setPartialSrcSamples] = useState(25);
   const [partialTarSamples, setPartialTarSamples] = useState(80);
-  const [partialTopK, setPartialTopK] = useState(5);
+  const [partialTopK, setPartialTopK] = useState(8);
   const [partialThresholdPct, setPartialThresholdPct] = useState(5);
   const [partialIterations, setPartialIterations] = useState(600);
   const [partialDescriptor, setPartialDescriptor] = useState<'curvature' | 'fpfh'>('fpfh');
@@ -398,6 +398,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         tarSeedRadius: tarRegion?.boundingRadius,
         tarSeedWeight: tarRegion ? partialSeedWeight : 0,
         tarConstraintVertices: tarRegion?.vertices,
+        tarConstraintUseSaliency: Boolean(tarRegion?.vertices?.size),
         axialWeight: partialAxialWeight,
       },
     );
@@ -458,6 +459,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         tarSeedRadius: tarRegion?.boundingRadius,
         tarSeedWeight: tarRegion ? partialSeedWeight : 0,
         tarConstraintVertices: tarRegion?.vertices,
+        tarConstraintUseSaliency: Boolean(tarRegion?.vertices?.size),
         axialWeight: partialAxialWeight,
       },
     );
@@ -659,7 +661,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         mask,
         segPack.regions,
         orthoCamera,
-        { splatRadiusPx: 1 },
+        { projectionMode: 'through', splatRadiusPx: 1, maskDilatePx: 2 },
       );
       setMaskReproj(result);
       const stats = Array.from(result.regions.entries())
@@ -1174,6 +1176,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
             tarSeedRadius: tarRegion?.boundingRadius,
             tarSeedWeight: tarRegion ? partialSeedWeight : 0,
             tarConstraintVertices: tarRegion?.vertices,
+            tarConstraintUseSaliency: Boolean(tarRegion?.vertices?.size),
             axialWeight: partialAxialWeight,
           },
         );

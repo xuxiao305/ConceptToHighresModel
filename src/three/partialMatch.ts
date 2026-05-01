@@ -114,6 +114,14 @@ export interface PartialMatchOptions {
   /** Optional hard filter (kept for compatibility, prefer the soft variant) */
   tarConstraintVertices?: Set<number>;
   /**
+   * When `tarConstraintVertices` is provided, choose the target FPS pool
+   * from the most salient vertices inside that constraint instead of the
+   * whole constraint set. Useful when the constraint is a large
+   * through-projected volume and raw FPS would over-sample smooth / hidden
+   * geometry. Default false to preserve the previous behavior.
+   */
+  tarConstraintUseSaliency?: boolean;
+  /**
    * Weight for the axial+radial PCA features that are appended to the
    * descriptor.  Use a positive value (e.g. 4-6) to break the symmetry
    * of cylindrical parts (arm, leg).  0 disables the feature entirely.
@@ -161,6 +169,33 @@ const DEFAULTS = {
   axialWeight: 5,
 };
 
+function pickSalientCandidatesInSet(
+  saliency: Float32Array,
+  allowed: Set<number>,
+  topN: number,
+  minSaliency: number,
+): number[] {
+  const scored: Array<{ idx: number; sal: number }> = [];
+  for (const idx of allowed) {
+    if (idx < 0 || idx >= saliency.length) continue;
+    const sal = saliency[idx];
+    if (sal > minSaliency) scored.push({ idx, sal });
+  }
+
+  if (scored.length === 0) {
+    const fallback: Array<{ idx: number; sal: number }> = [];
+    for (const idx of allowed) {
+      if (idx < 0 || idx >= saliency.length) continue;
+      fallback.push({ idx, sal: saliency[idx] });
+    }
+    fallback.sort((a, b) => b.sal - a.sal);
+    return fallback.slice(0, topN).map(v => v.idx);
+  }
+
+  scored.sort((a, b) => b.sal - a.sal);
+  return scored.slice(0, topN).map(v => v.idx);
+}
+
 export function matchPartialToWhole(
   src: { vertices: Vec3[]; adjacency: MeshAdjacency },
   tar: { vertices: Vec3[]; adjacency: MeshAdjacency },
@@ -180,7 +215,9 @@ export function matchPartialToWhole(
   // regions of candidates.
   const tarPool =
     opt.tarConstraintVertices && opt.tarConstraintVertices.size > 0
-      ? Array.from(opt.tarConstraintVertices)
+      ? opt.tarConstraintUseSaliency
+        ? pickSalientCandidatesInSet(tarSal, opt.tarConstraintVertices, opt.saliencyPoolTar, 0.05)
+        : Array.from(opt.tarConstraintVertices)
       : pickSalientCandidates(tarSal, opt.saliencyPoolTar, 0.05);
   if (srcPool.length === 0 || tarPool.length === 0) {
     return emptyResult(0, opt);
@@ -490,7 +527,9 @@ export function computePartialDebug(
   const srcSaliencyTop = pickSalientCandidates(srcSal, opt.saliencyPoolSrc, 0.05);
   const tarSaliencyTop =
     opt.tarConstraintVertices && opt.tarConstraintVertices.size > 0
-      ? Array.from(opt.tarConstraintVertices)
+      ? opt.tarConstraintUseSaliency
+        ? pickSalientCandidatesInSet(tarSal, opt.tarConstraintVertices, opt.saliencyPoolTar, 0.05)
+        : Array.from(opt.tarConstraintVertices)
       : pickSalientCandidates(tarSal, opt.saliencyPoolTar, 0.05);
 
   const srcFPS = farthestPointSample(src.vertices, srcSaliencyTop, opt.numSrcSamples);
