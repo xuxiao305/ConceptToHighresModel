@@ -52,6 +52,26 @@ export function getPartNodes(mode: PipelineMode): NodeConfig[] {
   return PART_NODES;
 }
 
+/**
+ * Promote all downstream nodes after `completedIdx` from 'idle' to either
+ * 'ready' (non-optional) or 'optional' (optional). Optional nodes don't gate
+ * the chain — they're just labels — so a non-optional node further down
+ * should still be promoted to 'ready' even if intervening optional nodes were
+ * skipped.
+ */
+function promoteDownstream(
+  nodeStates: NodeState[],
+  completedIdx: number,
+  partNodes: NodeConfig[],
+): NodeState[] {
+  return nodeStates.map((v, idx) => {
+    if (idx <= completedIdx) return v;
+    if (v !== 'idle' && v !== 'optional') return v;
+    const cfg = partNodes[idx];
+    return cfg?.optional ? 'optional' : 'ready';
+  });
+}
+
 const PIPELINE_MODE_LABEL: Record<PipelineMode, string> = {
   extraction: 'General Extract',
   multiview: 'Jacket Extract',
@@ -203,7 +223,11 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       if (extraction.resultUrl) URL.revokeObjectURL(extraction.resultUrl);
       onUpdate(pipeline.id, {
         ...pipeline,
-        nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'complete' : v)),
+        nodeStates: promoteDownstream(
+          pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'complete' : v)),
+          1,
+          partNodes,
+        ),
         extraction: { ...extraction, resultUrl: r.url, resultFile: fileName, error: undefined },
       });
       onStatus(`[${pipeline.name}] 已切换到 ${fileName}`, 'success');
@@ -297,15 +321,17 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       try {
         processedBlob = useSAM3
           ? await smartCropAndEnlargeAuto(maskedBlob, {
-              // SAM3_ExtractParts.json node 13 params
+              // SAM3_ExtractParts.json node 13 params (with overrides per project spec:
+              // workflow had max_objects=16 / uniform_scale=false / preserve_position=false
+              // by mistake — corrected here to keep 4-view layout aligned)
               padding: 8,
               whiteThreshold: 240,
               useAlpha: false,
               minArea: 64,
-              maxObjects: 16,
+              maxObjects: 4,
               layout: 'auto',
-              uniformScale: false,
-              preservePosition: false,
+              uniformScale: true,
+              preservePosition: true,
               background: '#ffffff',
             })
           : await smartCropAndEnlargeAuto(maskedBlob, {
@@ -378,16 +404,11 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
 
       onUpdate(pipeline.id, {
         ...pipeline,
-        nodeStates: pipeline.nodeStates.map((v, idx) => {
-          if (idx === 1) return 'complete';
-          if (idx === 2) {
-            // Promote next node to ready (Multi-View in mode B, Modify in mode A)
-            const cfg = partNodes[idx];
-            if (cfg?.optional) return v === 'idle' ? 'optional' : v;
-            return v === 'idle' ? 'ready' : v;
-          }
-          return v;
-        }),
+        nodeStates: promoteDownstream(
+          pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'complete' : v)),
+          1,
+          partNodes,
+        ),
         extraction: { ...extraction, resultUrl: processedUrl, resultFile: savedFile, error: undefined },
       });
       onStatus(`[${pipeline.name}] ${modeLabel} 完成`, 'success');

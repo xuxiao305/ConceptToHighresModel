@@ -55,6 +55,16 @@ function fromPersisted(pp: PersistedPipeline, index: number): PartPipelineState 
   const nodeStates = makeInitialNodeStates(pp.mode);
   nodeStates[0] = pp.imageFile ? 'complete' : 'ready';
   if (pp.resultFile) nodeStates[1] = 'complete';
+  // Promote downstream nodes (across optional gaps) so e.g. Highres Model 3D
+  // becomes 'ready' instead of stuck at 'idle' when Modify is optional.
+  const lastComplete = pp.resultFile ? 1 : pp.imageFile ? 0 : -1;
+  if (lastComplete >= 0) {
+    const nodes = getPartNodes(pp.mode);
+    for (let i = lastComplete + 1; i < nodeStates.length; i++) {
+      if (nodeStates[i] !== 'idle' && nodeStates[i] !== 'optional') continue;
+      nodeStates[i] = nodes[i]?.optional ? 'optional' : 'ready';
+    }
+  }
   return {
     id: `part-${Date.now()}-${index}`,
     name: pp.name,
