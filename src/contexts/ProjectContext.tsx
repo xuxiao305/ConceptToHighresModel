@@ -2,22 +2,30 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from 'react';
 import {
+  clearLastProjectHandle,
   isProjectSupported,
   listNodeHistory,
   loadLatestNodeAsset,
   loadLatestSegmentSet,
   loadNodeAssetByName,
+  loadPipelines,
   pickAndOpenOrCreateProject,
   renameProject as renameProjectApi,
   saveNodeAsset,
+  savePipelines,
   saveSegmentSet,
   setProjectAbsolutePath,
+  tryRestoreLastProject,
   type AssetVersion,
+  type Page2PipelinesIndex,
+  type PersistedPipeline,
   type ProjectHandle,
   type SegmentSetHandle,
   type SegmentSetIndex,
@@ -31,6 +39,8 @@ interface ProjectContextValue {
 
   newOrOpenProject: () => Promise<ProjectHandle>;
   closeProject: () => void;
+  /** 尝试重新打开上次工程（从 IndexedDB 恢复句柄） */
+  tryReopenLast: () => Promise<ProjectHandle | null>;
   rename: (name: string) => Promise<void>;
   /** 保存工程根目录的本地绝对路径（用户人工提供） */
   setAbsolutePath: (path: string) => Promise<void>;
@@ -71,6 +81,12 @@ interface ProjectContextValue {
     nodeKey: string,
     baseName?: string,
   ) => Promise<{ dirName: string; index: SegmentSetIndex; files: Map<string, Blob> } | null>;
+
+  /** 保存 Page2 Pipeline 配置到工程目录 */
+  savePipelines: (pipelines: PersistedPipeline[]) => Promise<void>;
+
+  /** 从工程目录加载 Page2 Pipeline 配置，未打开/不存在返回 null */
+  loadPipelines: () => Promise<Page2PipelinesIndex | null>;
 }
 
 const ProjectContext = createContext<ProjectContextValue | null>(null);
@@ -78,6 +94,17 @@ const ProjectContext = createContext<ProjectContextValue | null>(null);
 export function ProjectProvider({ children }: { children: ReactNode }) {
   const [project, setProject] = useState<ProjectHandle | null>(null);
   const supported = useMemo(() => isProjectSupported(), []);
+  const restoreAttempted = useRef(false);
+
+  // 页面加载时自动尝试恢复上次打开的工程（IndexedDB 持久化的目录句柄）
+  useEffect(() => {
+    if (!supported || restoreAttempted.current) return;
+    restoreAttempted.current = true;
+
+    tryRestoreLastProject().then((h) => {
+      if (h) setProject(h);
+    }).catch(() => { /* 静默 — 无历史句柄或权限不足 */ });
+  }, [supported]);
 
   const newOrOpenProject = useCallback(async () => {
     const h = await pickAndOpenOrCreateProject();
@@ -85,7 +112,16 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     return h;
   }, []);
 
-  const closeProject = useCallback(() => setProject(null), []);
+  const closeProject = useCallback(() => {
+    clearLastProjectHandle().catch(() => {});
+    setProject(null);
+  }, []);
+
+  const tryReopenLast = useCallback(async (): Promise<ProjectHandle | null> => {
+    const h = await tryRestoreLastProject();
+    if (h) setProject(h);
+    return h;
+  }, []);
 
   const rename = useCallback(
     async (name: string) => {
@@ -165,12 +201,26 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     [project],
   );
 
+  const savePipelinesCb = useCallback(
+    async (pipelines: PersistedPipeline[]) => {
+      if (!project) return;
+      await savePipelines(project, pipelines);
+    },
+    [project],
+  );
+
+  const loadPipelinesCb = useCallback(async (): Promise<Page2PipelinesIndex | null> => {
+    if (!project) return null;
+    return await loadPipelines(project);
+  }, [project]);
+
   const value = useMemo<ProjectContextValue>(
     () => ({
       project,
       supported,
       newOrOpenProject,
       closeProject,
+      tryReopenLast,
       rename,
       setAbsolutePath,
       saveAsset,
@@ -179,8 +229,10 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       loadByName,
       saveSegments,
       loadLatestSegments,
+      savePipelines: savePipelinesCb,
+      loadPipelines: loadPipelinesCb,
     }),
-    [project, supported, newOrOpenProject, closeProject, rename, setAbsolutePath, saveAsset, loadLatest, listHistory, loadByName, saveSegments, loadLatestSegments]
+    [project, supported, newOrOpenProject, closeProject, tryReopenLast, rename, setAbsolutePath, saveAsset, loadLatest, listHistory, loadByName, saveSegments, loadLatestSegments, savePipelinesCb, loadPipelinesCb]
   );
 
   return <ProjectContext.Provider value={value}>{children}</ProjectContext.Provider>;

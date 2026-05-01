@@ -2,9 +2,11 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import type { NodeState, PartPipelineState, PipelineMode } from '../../types';
 import { Button } from '../../components/Button';
 import { getPartNodes, PartPipeline } from './PartPipeline';
+import { useProject } from '../../contexts/ProjectContext';
+import type { PersistedPipeline } from '../../services/projectStore';
 
 const PIPELINE_MODE_LABEL: Record<PipelineMode, string> = {
-  extraction: '基于 Extraction',
+  extraction: 'SAM3 Extract',
   multiview: 'Extract Jacket',
 };
 
@@ -40,11 +42,92 @@ const makePart = (idx: number, mode: PipelineMode = 'extraction'): PartPipelineS
   },
 });
 
+/** PartPipelineState → 可持久化的精简表示 */
+function toPersisted(p: PartPipelineState): PersistedPipeline {
+  return {
+    name: p.name,
+    mode: p.mode,
+    extractionMode: p.extraction?.mode,
+    promptIndex: p.extraction?.promptIndex,
+    imageFile: p.imageInput?.imageFile ?? null,
+    resultFile: p.extraction?.resultFile ?? null,
+  };
+}
+
+/** 从持久化数据重建 PartPipelineState */
+function fromPersisted(pp: PersistedPipeline, index: number): PartPipelineState {
+  const nodeStates = makeInitialNodeStates(pp.mode);
+  nodeStates[0] = pp.imageFile ? 'complete' : 'ready';
+  if (pp.resultFile) nodeStates[1] = 'complete';
+  return {
+    id: `part-${Date.now()}-${index}`,
+    name: pp.name,
+    mode: pp.mode,
+    nodeStates,
+    expanded: {},
+    imageInput: {
+      imageUrl: null,
+      imageFile: pp.imageFile ?? null,
+    },
+    extraction: {
+      mode: pp.extractionMode ?? 'banana',
+      promptIndex: pp.promptIndex ?? 0,
+      resultUrl: null,
+      resultFile: pp.resultFile ?? null,
+    },
+  };
+}
+
 export function HighresModel({ onStatusChange }: Props) {
+  const { project, savePipelines, loadPipelines } = useProject();
   const [parts, setParts] = useState<PartPipelineState[]>(() => [makePart(0, 'extraction'), makePart(1, 'extraction')]);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const addDropdownRef = useRef<HTMLDivElement>(null);
   const [addDropdownOpen, setAddDropdownOpen] = useState(false);
+
+  // Track whether we've restored pipelines for the current open project.
+  const loadedForProject = useRef<string | null>(null);
+  const initialised = useRef(false);
+
+  // On project open/close: restore saved pipelines or reset to defaults.
+  useEffect(() => {
+    const key = project?.meta.createdAt ?? null;
+    // Avoid re-running when project identity hasn't changed.
+    if (loadedForProject.current === key && initialised.current) return;
+    loadedForProject.current = key;
+    initialised.current = true;
+
+    if (!project) {
+      setParts([makePart(0, 'extraction'), makePart(1, 'extraction')]);
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      const idx = await loadPipelines();
+      if (cancelled) return;
+      if (idx && idx.pipelines.length > 0) {
+        setParts(idx.pipelines.map((pp, i) => fromPersisted(pp, i)));
+        onStatusChange(`已从工程恢复 ${idx.pipelines.length} 条 Pipeline`, 'info');
+      }
+      // If no pipelines saved yet, keep the defaults (already set by useState).
+    })();
+
+    return () => { cancelled = true; };
+  }, [project]);
+
+  // Auto-save pipelines whenever parts change (debounced 500ms).
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!project) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      void savePipelines(parts.map(toPersisted));
+    }, 500);
+    return () => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+    };
+  }, [parts, project, savePipelines]);
 
   // Close dropdown on outside click
   useEffect(() => {

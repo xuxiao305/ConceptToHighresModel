@@ -20,6 +20,11 @@ import { splitMultiView, enlargeMultiViewToFill } from '../../services/multiview
  * Full node list (Mode B · Multi-View). Mode A · Extraction omits the standalone
  * `multiview` node since the Extract Jacket node already produces a 4-view sheet
  * directly. Use {@link getPartNodes} to obtain the mode-specific list.
+ *
+ * Note: the `extraction` node's display title is mode-dependent — see
+ * {@link getPartNodes}. Mode A (general extraction) uses SAM3 interactive
+ * segmentation and is labelled "SAM3 Extract"; Mode B (Extract Jacket) uses
+ * a fixed Banana Pro prompt and is labelled "Extract Jacket".
  */
 export const PART_NODES: NodeConfig[] = [
   { id: 'imageInput', title: 'Image Input', display: 'image' },
@@ -34,7 +39,11 @@ export const PART_NODES: NodeConfig[] = [
 /** Returns the node list for a given pipeline mode. */
 export function getPartNodes(mode: PipelineMode): NodeConfig[] {
   if (mode === 'extraction') {
-    return PART_NODES.filter((n) => n.id !== 'multiview');
+    // Mode A: SAM3 interactive segmentation → omit the standalone Multi-View
+    // node and rename the extraction node so the UI reflects the actual runner.
+    return PART_NODES
+      .filter((n) => n.id !== 'multiview')
+      .map((n) => (n.id === 'extraction' ? { ...n, title: 'SAM3 Extract' } : n));
   }
   return PART_NODES;
 }

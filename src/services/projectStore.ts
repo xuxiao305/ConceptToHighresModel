@@ -73,6 +73,108 @@ export function isProjectSupported(): boolean {
   return typeof window !== 'undefined' && typeof window.showDirectoryPicker === 'function';
 }
 
+// ---------------------------------------------------------------------------
+// IndexedDB — 持久化 FileSystemDirectoryHandle，实现"自动打开上次工程"
+// ---------------------------------------------------------------------------
+
+const IDB_NAME = 'concept-to-highres';
+const IDB_VERSION = 1;
+const IDB_STORE = 'handles';
+const IDB_KEY = 'lastProject';
+
+async function openIdb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(IDB_STORE)) {
+        req.result.createObjectStore(IDB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/**
+ * 将当前打开的工程目录句柄持久化到 IndexedDB。
+ * 下次页面加载时可通过 restoreLastProjectHandle() 恢复，无需用户再次导航目录。
+ */
+export async function persistLastProjectHandle(root: FSDirHandle): Promise<void> {
+  const db = await openIdb();
+  const tx = db.transaction(IDB_STORE, 'readwrite');
+  tx.objectStore(IDB_STORE).put(root, IDB_KEY);
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  db.close();
+}
+
+/**
+ * 尝试从 IndexedDB 恢复上一次打开的工程目录句柄。
+ * 恢复成功时会检查权限 —— 在 Chrome 中同一 origin 的句柄通常自动授予。
+ * 返回 null 表示无历史句柄或权限被拒绝。
+ */
+export async function restoreLastProjectHandle(): Promise<FSDirHandle | null> {
+  try {
+    const db = await openIdb();
+    const root: FSDirHandle | undefined = await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(IDB_KEY);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+
+    if (!root) return null;
+
+    // 检查权限：已授权 → 直接用；需提示 → 尝试请求；拒绝 → 返回 null
+    const qr = await (root as any).queryPermission?.({ mode: 'readwrite' });
+    if (qr === 'granted') return root;
+    if (qr === 'prompt') {
+      const rr = await (root as any).requestPermission?.({ mode: 'readwrite' });
+      if (rr === 'granted') return root;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 尝试从 IndexedDB 恢复上次工程。成功返回 ProjectHandle, 否则返回 null。
+ * 同时清除可能已失效的句柄。
+ */
+export async function tryRestoreLastProject(): Promise<ProjectHandle | null> {
+  const root = await restoreLastProjectHandle();
+  if (!root) return null;
+
+  try {
+    const meta = await tryReadJson<ProjectMeta>(root, 'project.json');
+    if (!meta) return null;
+    return { root, meta };
+  } catch {
+    // 句柄失效，从 IndexedDB 中清除
+    try {
+      const db = await openIdb();
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).delete(IDB_KEY);
+      db.close();
+    } catch { /* ignore */ }
+    return null;
+  }
+}
+
+/** 清除 IndexedDB 中存储的上次工程句柄（用户主动关闭工程时调用） */
+export async function clearLastProjectHandle(): Promise<void> {
+  try {
+    const db = await openIdb();
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).delete(IDB_KEY);
+    db.close();
+  } catch { /* ignore */ }
+}
+
 /** 生成时间戳文件名（精确到毫秒，避免重复） */
 export function makeTimestamp(): string {
   const d = new Date();
@@ -150,6 +252,10 @@ export async function pickAndOpenOrCreateProject(defaultName?: string): Promise<
     };
     await writeFile(root, 'project.json', JSON.stringify(meta, null, 2));
   }
+
+  // 持久化目录句柄，下次页面加载时自动恢复
+  persistLastProjectHandle(root).catch(() => { /* 非关键路径 */ });
+
   return { root, meta };
 }
 
@@ -442,4 +548,61 @@ export async function loadLatestSegmentSet(
 }
 
 
+// ---------------------------------------------------------------------------
+// Page2 Pipeline 配置持久化
+// ---------------------------------------------------------------------------
 
+/** 单条 Pipeline 的可持久化字段（存到 page2_highres/pipelines.json） */
+export interface PersistedPipeline {
+  /** Pipeline 名称（用户可编辑） */
+  name: string;
+  /** 源图片模式：'extraction' 用 Page1 Extraction 输出，'multiview' 用 Multi-View 输出 */
+  mode: 'extraction' | 'multiview';
+  /** Extraction 节点模式 */
+  extractionMode?: 'banana' | 'sam3';
+  /** Banana Pro 当前选中的提示词预设索引 */
+  promptIndex?: number;
+  /** 用户手动设置的 Image Input 文件名（工程内相对路径，null 表示自动加载） */
+  imageFile?: string | null;
+  /** 当前 Extraction 结果文件名（工程内相对路径，用于恢复显示） */
+  resultFile?: string | null;
+}
+
+export interface Page2PipelinesIndex {
+  /** 版本号（便于后续迁移） */
+  version: 1;
+  pipelines: PersistedPipeline[];
+}
+
+/**
+ * 将 Page2 的 Pipeline 配置保存到工程目录。
+ * 写入 page2_highres/pipelines.json，自动创建所需子目录。
+ */
+export async function savePipelines(
+  handle: ProjectHandle,
+  pipelines: PersistedPipeline[],
+): Promise<void> {
+  const pageDir = await getOrCreateDir(handle.root, 'page2_highres');
+  const index: Page2PipelinesIndex = { version: 1, pipelines };
+  await writeFile(pageDir, 'pipelines.json', JSON.stringify(index, null, 2));
+  await touchProject(handle);
+}
+
+/**
+ * 从工程目录加载 Page2 Pipeline 配置。
+ * 若文件不存在或工程未打开，返回 null。
+ */
+export async function loadPipelines(
+  handle: ProjectHandle,
+): Promise<Page2PipelinesIndex | null> {
+  try {
+    const pageDir = await handle.root.getDirectoryHandle('page2_highres');
+    const idx = await tryReadJson<Page2PipelinesIndex>(pageDir, 'pipelines.json');
+    if (!idx) return null;
+    // 非预期版本 / 格式不完整 → 视为无有效数据
+    if (idx.version !== 1 || !Array.isArray(idx.pipelines)) return null;
+    return idx;
+  } catch {
+    return null;
+  }
+}
