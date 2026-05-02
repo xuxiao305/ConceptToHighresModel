@@ -50,8 +50,8 @@ export {
   renderOrthoFrontViewWithFrustum,
 } from './orthoFrontRender';
 export type { OrthoFrontFrustum, OrthoRenderOptions } from './orthoFrontRender';
-export { renderOrthoFrontViewWithCamera } from './orthoFrontRender';
-export type { OrthoFrontCamera } from './orthoFrontRender';
+export { renderOrthoFrontViewWithCamera, renderTexturedFrontSnapshot } from './orthoFrontRender';
+export type { OrthoFrontCamera, TexturedSnapshotOptions } from './orthoFrontRender';
 export {
   projectVerticesToImage,
   buildFrontVertexMap,

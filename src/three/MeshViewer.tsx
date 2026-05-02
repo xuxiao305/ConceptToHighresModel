@@ -359,7 +359,7 @@ export interface MeshViewerProps {
   label?: string;
   /** Camera-sync ID — set the same string on multiple viewers to sync. */
   cameraSyncId?: string;
-  /** Optional second mesh (rendered as wireframe) overlayed in same canvas. */
+  /** Optional second mesh overlayed in the same canvas. */
   overlayVertices?: Vec3[];
   overlayFaces?: Face3[];
   overlayColor?: string;
@@ -379,6 +379,8 @@ export interface MeshViewerProps {
   showFitButton?: boolean;
   /** External-controlled view mode change callback */
   onViewModeChange?: (mode: ViewMode) => void;
+  /** Enable only when the canvas needs to be read back for screenshots/export. Default false for performance. */
+  preserveDrawingBuffer?: boolean;
   /** Place the model on the grid (lift so bbox.min.y sits at y=0). Default true. */
   placeOnGround?: boolean;
   /**
@@ -434,6 +436,7 @@ export function MeshViewer({
   showViewModeToggle = true,
   showFitButton = true,
   onViewModeChange,
+  preserveDrawingBuffer = false,
   placeOnGround = true,
   highlightVertices,
   highlightColor = '#7df0ff',
@@ -520,7 +523,7 @@ export function MeshViewer({
       <Canvas
         camera={{ fov: 50, near: 0.01, far: 1000 }}
         style={{ background }}
-        gl={{ preserveDrawingBuffer: true }}
+        gl={{ preserveDrawingBuffer }}
       >
         <ambientLight intensity={1.0} />
         <directionalLight position={[5, 5, 5]} intensity={1.6} castShadow />
@@ -543,7 +546,7 @@ export function MeshViewer({
               vertices={overlayVertices}
               faces={overlayFaces}
               color={overlayColor}
-              viewMode="wireframe"
+              viewMode="solid"
             />
           )}
 

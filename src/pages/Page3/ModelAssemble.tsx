@@ -12,6 +12,7 @@ import {
   MeshViewer,
   useLandmarkStore,
   loadGlbAsMesh,
+  loadGlb,
   buildMeshAdjacency,
   matchGlobalCandidates,
   ransacFilterCandidates,
@@ -19,6 +20,7 @@ import {
   computePartialDebug,
   bboxDiagonal,
   renderOrthoFrontViewWithCamera,
+  renderTexturedFrontSnapshot,
   loadMaskGray,
   reprojectMaskToVertices,
   extractImageSubjectBBox,
@@ -1581,12 +1583,11 @@ export function ModelAssemble({ onStatusChange }: Props) {
           const loaded = await loadByName('page2.highres', item.file);
           if (!loaded) throw new Error('未找到模型文件');
           loadedUrlToRevoke = loaded.url;
-          const mesh = await loadGlbAsMesh(loaded.url);
-          const { dataUrl } = renderOrthoFrontViewWithCamera(mesh.vertices, mesh.faces, {
+          const glb = await loadGlb(loaded.url);
+          const dataUrl = renderTexturedFrontSnapshot(glb.scene, glb.bbox, {
             width: 220,
             height: 140,
             padding: 0.08,
-            meshColor: '#d8dde8',
             background: '#20242a',
             pixelRatio: 1,
           });

@@ -420,3 +420,109 @@ export function renderOrthoFrontViewWithFrustum(
   const dataUrl = renderOrthoFrontView(vertices, faces, options);
   return { dataUrl, frustum };
 }
+
+export interface TexturedSnapshotOptions {
+  width: number;
+  height: number;
+  padding?: number;
+  background?: string;
+  pixelRatio?: number;
+}
+
+/**
+ * Render a THREE.Group (GLTF scene with original materials/textures)
+ * from the orthographic front view with basic lighting.
+ *
+ * Unlike `renderOrthoFrontViewWithCamera` which uses flat MeshBasicMaterial
+ * on raw vertices, this renders the original GLTF scene so textured
+ * PBR materials and basic directional+ambient lighting show up.
+ */
+export function renderTexturedFrontSnapshot(
+  scene: THREE.Object3D,
+  bbox: { min: Vec3; max: Vec3 },
+  options: TexturedSnapshotOptions,
+): string {
+  const { width, height, padding = 0.08, background = '#2a2a2a', pixelRatio = 1 } = options;
+
+  const minX = bbox.min[0], minY = bbox.min[1], minZ = bbox.min[2];
+  const maxX = bbox.max[0], maxY = bbox.max[1], maxZ = bbox.max[2];
+
+  const meshCenterX = (minX + maxX) / 2;
+  const meshCenterY = (minY + maxY) / 2;
+  const meshCenterZ = (minZ + maxZ) / 2;
+  const meshHeight = Math.max(maxY - minY, 1e-6);
+  const meshWidth = Math.max(maxZ - minZ, 1e-6);
+  const meshDepth = Math.max(maxX - minX, 1.0);
+
+  const aspect = width / height;
+  let halfHeight = (meshHeight / 2) * (1 + padding);
+  let halfWidth = halfHeight * aspect;
+  if (halfWidth < (meshWidth / 2) * (1 + padding)) {
+    halfWidth = (meshWidth / 2) * (1 + padding);
+    halfHeight = halfWidth / aspect;
+  }
+  const camDist = Math.max(meshDepth * 2, 1.0);
+
+  const renderer = new THREE.WebGLRenderer({
+    antialias: true,
+    alpha: false,
+    preserveDrawingBuffer: true,
+  });
+  renderer.setPixelRatio(pixelRatio);
+  renderer.setSize(width, height, false);
+  renderer.setClearColor(new THREE.Color(background), 1);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
+
+  const renderScene = new THREE.Scene();
+  renderScene.background = new THREE.Color(background);
+
+  // Clone the scene so we don't mutate the original
+  const cloned = scene.clone(true);
+  renderScene.add(cloned);
+
+  // Lighting: key light + fill + ambient for even illumination
+  const ambient = new THREE.AmbientLight('#ffffff', 0.6);
+  renderScene.add(ambient);
+
+  const keyLight = new THREE.DirectionalLight('#ffffff', 1.2);
+  keyLight.position.set(camDist, meshHeight * 0.6, meshWidth * 0.5);
+  renderScene.add(keyLight);
+
+  const fillLight = new THREE.DirectionalLight('#8899cc', 0.5);
+  fillLight.position.set(camDist * 0.5, -meshHeight * 0.3, -meshWidth * 0.6);
+  renderScene.add(fillLight);
+
+  const camera = new THREE.OrthographicCamera(
+    -halfWidth, halfWidth,
+    halfHeight, -halfHeight,
+    0.001, camDist * 4,
+  );
+  camera.position.set(meshCenterX + camDist, meshCenterY, meshCenterZ);
+  camera.up.set(0, 1, 0);
+  camera.lookAt(meshCenterX, meshCenterY, meshCenterZ);
+  camera.updateProjectionMatrix();
+
+  renderer.render(renderScene, camera);
+
+  let dataUrl = '';
+  try {
+    dataUrl = renderer.domElement.toDataURL('image/png');
+  } finally {
+    renderer.dispose();
+    cloned.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if ((mesh as any).isMesh) {
+        mesh.geometry?.dispose();
+        if (Array.isArray(mesh.material)) {
+          mesh.material.forEach((m) => m.dispose());
+        } else {
+          mesh.material?.dispose();
+        }
+      }
+    });
+  }
+
+  return dataUrl;
+}
