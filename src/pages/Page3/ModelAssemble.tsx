@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '../../components/Button';
-import { GLBThumbnail } from '../../components/GLBThumbnail';
 import { OrthoCompareModal } from '../../components/OrthoCompareModal';
 import { useProject } from '../../contexts/ProjectContext';
 import {
@@ -84,6 +83,15 @@ interface AlignTraceEntry {
   data: Record<string, unknown>;
 }
 
+type ManualAlignmentPairSource = 'landmarks' | 'accepted-candidates' | 'partial-candidates';
+
+interface ManualAlignmentPairs {
+  source: ManualAlignmentPairSource;
+  sourcePoints: Vec3[];
+  targetPoints: Vec3[];
+  count: number;
+}
+
 interface HighresGalleryItem extends AssetVersion {
   id: string;
   pipelineKey: string;
@@ -98,6 +106,11 @@ interface SourceGalleryBinding {
   pipelineName: string;
   pipelineMode: PersistedPipeline['mode'];
   file: string;
+}
+
+interface GallerySnapshot {
+  status: 'loading' | 'ready' | 'error';
+  dataUrl?: string;
 }
 
 const TRACE_LIMIT = 200;
@@ -162,6 +175,47 @@ function qualityLabel(summary: AutoAlignSummary): { label: string; color: string
   if (summary.rmse < 1.0 && summary.pairs >= 20) return { label: '良好', color: '#7fd97f' };
   if (summary.rmse < 1.8 && summary.pairs >= 15) return { label: '可用', color: '#e9d36c' };
   return { label: '需要检查', color: '#e08a8a' };
+}
+
+const ALIGNMENT_MODE: AlignmentMode = 'similarity';
+
+function matrixSimilarityScale(matrix4x4: number[][]): number {
+  const sx = Math.sqrt(matrix4x4[0][0] ** 2 + matrix4x4[1][0] ** 2 + matrix4x4[2][0] ** 2);
+  const sy = Math.sqrt(matrix4x4[0][1] ** 2 + matrix4x4[1][1] ** 2 + matrix4x4[2][1] ** 2);
+  const sz = Math.sqrt(matrix4x4[0][2] ** 2 + matrix4x4[1][2] ** 2 + matrix4x4[2][2] ** 2);
+  return (sx + sy + sz) / 3;
+}
+
+function buildAlignmentResultFromMatrix(
+  srcMesh: MeshData,
+  srcLandmarks: Vec3[],
+  tarLandmarks: Vec3[],
+  matrix4x4: number[][],
+): AlignmentResult {
+  const transformedVertices = srcMesh.vertices.map((v) => applyTransform(v, matrix4x4));
+  const alignedSrcLandmarks = srcLandmarks.map((v) => applyTransform(v, matrix4x4));
+  const errors = alignedSrcLandmarks.map((a, i) => {
+    const b = tarLandmarks[i];
+    const dx = a[0] - b[0];
+    const dy = a[1] - b[1];
+    const dz = a[2] - b[2];
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  });
+  const meanError = errors.length > 0 ? errors.reduce((s, v) => s + v, 0) / errors.length : 0;
+  const rmse = errors.length > 0 ? Math.sqrt(errors.reduce((s, v) => s + v * v, 0) / errors.length) : 0;
+  const maxError = errors.length > 0 ? Math.max(...errors) : 0;
+
+  return {
+    mode: ALIGNMENT_MODE,
+    matrix4x4,
+    transformedVertices,
+    alignedSrcLandmarks,
+    targetLandmarks: tarLandmarks,
+    rmse,
+    meanError,
+    maxError,
+    scale: matrixSimilarityScale(matrix4x4),
+  };
 }
 
 function baseName(path: string): string {
@@ -242,7 +296,6 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [tarMesh, setTarMesh] = useState<MeshData>(demoTarget);
   const [viewMode, setViewMode] = useState<ViewMode>('solid');
   const [landmarkSize, setLandmarkSize] = useState(0.01);
-  const [alignmentMode, setAlignmentMode] = useState<AlignmentMode>('similarity');
   const [aligning, setAligning] = useState(false);
   const [alignResult, setAlignResult] = useState<AlignmentResult | null>(null);
   const [centerViewMode, setCenterViewMode] = useState<CenterViewMode>('landmark');
@@ -253,7 +306,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [highresHistory, setHighresHistory] = useState<HighresGalleryItem[]>([]);
   const [galleryLoading, setGalleryLoading] = useState(false);
   const [selectedGalleryId, setSelectedGalleryId] = useState<string | null>(null);
-  const [selectedGalleryPreviewUrl, setSelectedGalleryPreviewUrl] = useState<string | null>(null);
+  const [gallerySnapshots, setGallerySnapshots] = useState<Record<string, GallerySnapshot>>({});
   const [sourceGalleryBinding, setSourceGalleryBinding] = useState<SourceGalleryBinding | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [autoAlignSummary, setAutoAlignSummary] = useState<AutoAlignSummary | null>(null);
@@ -317,6 +370,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [partialAxialWeight, setPartialAxialWeight] = useState(5.0);
   const [partialLoading, setPartialLoading] = useState(false);
 
+  // ── ICP manual/refine parameters ─────────────────────────────────────
+  const [icpMaxIterations, setIcpMaxIterations] = useState(30);
+  const [icpSampleCount, setIcpSampleCount] = useState(400);
+  const [icpRejectMultiplier, setIcpRejectMultiplier] = useState(2.5);
+  const [icpConvergenceImprovement, setIcpConvergenceImprovement] = useState(0.005);
+
   // ── Phase 1 debug visualization ───────────────────────────────────────
   const [partialDebug, setPartialDebug] = useState<PartialDebugResult | null>(null);
   const [showSaliency, setShowSaliency] = useState(true);
@@ -344,6 +403,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
   // matches the one used to render it.
   const [orthoCamera, setOrthoCamera] = useState<OrthoFrontCamera | null>(null);
   const [maskReproj, setMaskReproj] = useState<MaskReprojectionResult | null>(null);
+  const [autoLocalizing, setAutoLocalizing] = useState(false);
   const [showOrthoCompare, setShowOrthoCompare] = useState(false);
   // Auto-fit is the default; users only override these manually if the
   // automatic subject-bbox extraction misjudges the image.
@@ -977,6 +1037,129 @@ export function ModelAssemble({ onStatusChange }: Props) {
     [maskReproj, buildTarRegionFromSet, onStatusChange],
   );
 
+  // Once the SAM3 three-piece pack is loaded, immediately perform the
+  // target localization that used to be delayed until the manual buttons or
+  // the one-click auto-align button: render Target front view, reproject mask
+  // to target vertices, then adopt the selected region as the Target seed.
+  useEffect(() => {
+    if (!segPack || !maskImageUrl || !refImageSize || !selectedTargetRegionLabel) return;
+    if (maskReproj) return;
+    if (tarMesh.vertices.length === 0 || tarMesh.faces.length === 0) return;
+
+    let cancelled = false;
+    const run = async () => {
+      setAutoLocalizing(true);
+      const t0 = performance.now();
+      try {
+        const useAuto = autoFit && !!fitBBox;
+        const rendered = renderOrthoFrontViewWithCamera(
+          tarMesh.vertices,
+          tarMesh.faces,
+          {
+            width: refImageSize.w,
+            height: refImageSize.h,
+            background: null,
+            meshColor: '#dddddd',
+            ...(useAuto
+              ? { fitToImageBBox: fitBBox! }
+              : {
+                  scale: orthoScale,
+                  offsetX: orthoOffsetX,
+                  offsetY: orthoOffsetY,
+                }),
+          },
+        );
+        if (cancelled) return;
+        setOrthoRenderUrl((prev) => {
+          if (prev) URL.revokeObjectURL(prev);
+          return rendered.dataUrl;
+        });
+        setOrthoCamera(rendered.camera);
+        appendAlignmentTrace('auto-localize-render-ortho', {
+          useAuto,
+          refImageSize,
+          fitBBox,
+          manualFit: { scale: orthoScale, offsetX: orthoOffsetX, offsetY: orthoOffsetY },
+          camera: summarizeCamera(rendered.camera),
+        });
+
+        const mask = await loadMaskGray(maskImageUrl);
+        if (cancelled) return;
+        if (!mask) {
+          onStatusChange('分割包已加载，但 mask 解码失败，无法自动反投影', 'error');
+          return;
+        }
+        const reproj = reprojectMaskToVertices(
+          tarMesh.vertices,
+          mask,
+          segPack.regions,
+          rendered.camera,
+          { projectionMode: 'through', splatRadiusPx: 1, maskDilatePx: 2 },
+        );
+        if (cancelled) return;
+        setMaskReproj(reproj);
+        appendAlignmentTrace('auto-localize-reproject-mask', {
+          selectedTargetRegionLabel,
+          camera: summarizeCamera(rendered.camera),
+          mask: maskImageName,
+          segmentation: segPackName,
+          result: summarizeMaskReprojection(reproj),
+        });
+
+        const set = reproj.regions.get(selectedTargetRegionLabel);
+        if (set && set.size > 0) {
+          const region = buildTarRegionFromSet(set);
+          if (region) {
+            setTarRegion(region);
+            setTarRegionLabel(selectedTargetRegionLabel);
+          }
+        } else {
+          setTarRegion(null);
+          setTarRegionLabel(null);
+        }
+
+        const stats = Array.from(reproj.regions.entries())
+          .map(([label, regionSet]) => `${label}=${regionSet.size}`)
+          .join(', ');
+        onStatusChange(
+          `分割包 3D 定位完成：已渲染 Target 正视图并反投影 mask · ${stats} · ${(performance.now() - t0).toFixed(1)}ms`,
+          'success',
+        );
+      } catch (err) {
+        if (!cancelled) {
+          onStatusChange(
+            `分割包 3D 定位失败：${err instanceof Error ? err.message : '未知错误'}`,
+            'error',
+          );
+        }
+      } finally {
+        if (!cancelled) setAutoLocalizing(false);
+      }
+    };
+
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    segPack,
+    maskImageUrl,
+    refImageSize,
+    selectedTargetRegionLabel,
+    maskReproj,
+    tarMesh,
+    autoFit,
+    fitBBox,
+    orthoScale,
+    orthoOffsetX,
+    orthoOffsetY,
+    maskImageName,
+    segPackName,
+    buildTarRegionFromSet,
+    appendAlignmentTrace,
+    onStatusChange,
+  ]);
+
   const onRefImageFileChange = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
@@ -1054,16 +1237,11 @@ export function ModelAssemble({ onStatusChange }: Props) {
       const imageFile = findReferencedFile(pack.imageName);
       const maskFile = findReferencedFile(pack.maskName);
 
-      setSegPack(pack);
-      setSegPackName(jsonFile.name);
-      setOrthoRenderUrl((prev) => {
-        if (prev) URL.revokeObjectURL(prev);
-        return null;
-      });
-      setOrthoCamera(null);
-      setMaskReproj(null);
-      setTarRegion(null);
-      setTarRegionLabel(null);
+      // Use the exact same state path as manual JSON loading, then reuse
+      // the same reference-image and mask loaders. This keeps one-click
+      // bundle loading behavior identical to loading the three files one by
+      // one before continuing the manual alignment flow.
+      await handleLoadSegJson(jsonFile);
       appendAlignmentTrace('load-seg-pack', {
         jsonFile: jsonFile.name,
         imageFile: imageFile?.name ?? null,
@@ -1095,7 +1273,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         'error',
       );
     }
-  }, [handleLoadMaskImage, handleLoadRefImage, onStatusChange, refImageSize]);
+  }, [handleLoadMaskImage, handleLoadRefImage, handleLoadSegJson, onStatusChange, refImageSize]);
 
   const onSegJsonFileChange = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1135,6 +1313,36 @@ export function ModelAssemble({ onStatusChange }: Props) {
 
   const pairCount = Math.min(srcLandmarks.length, tarLandmarks.length);
   const isBalanced = srcLandmarks.length === tarLandmarks.length && srcLandmarks.length > 0;
+  const manualAlignmentPairs = useMemo<ManualAlignmentPairs | null>(() => {
+    if (isBalanced && srcLandmarks.length >= 3) {
+      return {
+        source: 'landmarks',
+        sourcePoints: srcLandmarks.map((p) => p.position),
+        targetPoints: tarLandmarks.map((p) => p.position),
+        count: srcLandmarks.length,
+      };
+    }
+
+    const accepted = candidates.filter((_, i) => acceptedCandidateIds.has(i));
+    const pairSource = accepted.length >= 3 ? accepted : candidates;
+    if (pairSource.length >= 3) {
+      return {
+        source: accepted.length >= 3 ? 'accepted-candidates' : 'partial-candidates',
+        sourcePoints: pairSource.map((p) => p.srcPosition),
+        targetPoints: pairSource.map((p) => p.tarPosition),
+        count: pairSource.length,
+      };
+    }
+
+    return null;
+  }, [acceptedCandidateIds, candidates, isBalanced, srcLandmarks, tarLandmarks]);
+  const manualPairSourceLabel = manualAlignmentPairs?.source === 'landmarks'
+    ? 'Landmark Pairs'
+    : manualAlignmentPairs?.source === 'accepted-candidates'
+      ? '已接受候选'
+      : manualAlignmentPairs?.source === 'partial-candidates'
+        ? 'Partial 候选'
+        : '无可用输入';
   const hasResultPreview = resultPreview !== null;
 
   const srcHighlightArr = useMemo(
@@ -1276,10 +1484,6 @@ export function ModelAssemble({ onStatusChange }: Props) {
       setHighresHistory([]);
       setSelectedGalleryId(null);
       setSourceGalleryBinding(null);
-      setSelectedGalleryPreviewUrl((prev) => {
-        if (prev) URL.revokeObjectURL(prev);
-        return null;
-      });
       return;
     }
 
@@ -1310,10 +1514,6 @@ export function ModelAssemble({ onStatusChange }: Props) {
 
       if (currentModels.length === 0) {
         setSelectedGalleryId(null);
-        setSelectedGalleryPreviewUrl((prev) => {
-          if (prev) URL.revokeObjectURL(prev);
-          return null;
-        });
         return;
       }
 
@@ -1343,18 +1543,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
         : currentModels[0];
 
       setSelectedGalleryId(nextItem.id);
-      const preview = await loadByName('page2.highres', nextItem.file);
-      setSelectedGalleryPreviewUrl((prev) => {
-        if (prev) URL.revokeObjectURL(prev);
-        return preview?.url ?? null;
-      });
     } catch {
       setHighresHistory([]);
       setSelectedGalleryId(null);
-      setSelectedGalleryPreviewUrl((prev) => {
-        if (prev) URL.revokeObjectURL(prev);
-        return null;
-      });
     } finally {
       setGalleryLoading(false);
     }
@@ -1373,19 +1564,58 @@ export function ModelAssemble({ onStatusChange }: Props) {
   }, [refreshHighresGallery]);
 
   useEffect(() => {
-    return () => {
-      if (selectedGalleryPreviewUrl) URL.revokeObjectURL(selectedGalleryPreviewUrl);
-    };
-  }, [selectedGalleryPreviewUrl]);
+    let cancelled = false;
+    if (!project || highresHistory.length === 0) {
+      setGallerySnapshots({});
+      return () => { cancelled = true; };
+    }
+
+    setGallerySnapshots(Object.fromEntries(
+      highresHistory.map((item) => [item.id, { status: 'loading' as const }]),
+    ));
+
+    (async () => {
+      for (const item of highresHistory) {
+        let loadedUrlToRevoke: string | null = null;
+        try {
+          const loaded = await loadByName('page2.highres', item.file);
+          if (!loaded) throw new Error('未找到模型文件');
+          loadedUrlToRevoke = loaded.url;
+          const mesh = await loadGlbAsMesh(loaded.url);
+          const { dataUrl } = renderOrthoFrontViewWithCamera(mesh.vertices, mesh.faces, {
+            width: 220,
+            height: 140,
+            padding: 0.08,
+            meshColor: '#d8dde8',
+            background: '#20242a',
+            pixelRatio: 1,
+          });
+          if (!cancelled) {
+            setGallerySnapshots((prev) => ({
+              ...prev,
+              [item.id]: { status: 'ready', dataUrl },
+            }));
+          }
+        } catch (err) {
+          console.warn('[Page3] render gallery snapshot failed:', item.file, err);
+          if (!cancelled) {
+            setGallerySnapshots((prev) => ({
+              ...prev,
+              [item.id]: { status: 'error' },
+            }));
+          }
+        } finally {
+          if (loadedUrlToRevoke) URL.revokeObjectURL(loadedUrlToRevoke);
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [highresHistory, loadByName, project]);
 
   const handleSelectGalleryItem = useCallback(async (item: HighresGalleryItem) => {
     setSelectedGalleryId(item.id);
-    const preview = await loadByName('page2.highres', item.file);
-    setSelectedGalleryPreviewUrl((prev) => {
-      if (prev) URL.revokeObjectURL(prev);
-      return preview?.url ?? null;
-    });
-  }, [loadByName]);
+  }, []);
 
   const handleOpenGalleryToSource = useCallback(async (item: HighresGalleryItem) => {
     await loadGalleryItemToSource(item);
@@ -1506,12 +1736,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
   };
 
   const handleRunAlign = () => {
-    if (!isBalanced) {
-      onStatusChange('Source/Target landmark 数量不一致，无法对齐', 'error');
+    if (srcLandmarks.length !== tarLandmarks.length && (srcLandmarks.length > 0 || tarLandmarks.length > 0)) {
+      onStatusChange('Source/Target landmark 数量不一致，请修正或清空后使用候选对齐', 'error');
       return;
     }
-    if (pairCount < 3) {
-      onStatusChange('至少需要 3 对 landmark 才能执行刚体/相似对齐', 'error');
+    if (!manualAlignmentPairs || manualAlignmentPairs.count < 3) {
+      onStatusChange('至少需要 3 对 landmark 或 partial-match 候选才能执行 Similarity SVD 对齐', 'error');
       return;
     }
 
@@ -1519,9 +1749,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
     try {
       const result = alignSourceMeshByLandmarks(
         srcMesh.vertices,
-        srcLandmarks.map((p) => p.position),
-        tarLandmarks.map((p) => p.position),
-        alignmentMode,
+        manualAlignmentPairs.sourcePoints,
+        manualAlignmentPairs.targetPoints,
+        ALIGNMENT_MODE,
       );
       setAlignResult(result);
       setResultPreview({
@@ -1538,8 +1768,17 @@ export function ModelAssemble({ onStatusChange }: Props) {
       });
       setCenterViewMode('result');
       setResultViewMode('overlay');
+      appendAlignmentTrace('manual-landmark-svd-result', {
+        input: manualAlignmentPairs.source,
+        pairs: manualAlignmentPairs.count,
+        rmse: round3(result.rmse),
+        meanError: round3(result.meanError),
+        maxError: round3(result.maxError),
+        scale: round3(result.scale),
+        matrix: summarizeMatrix(result.matrix4x4),
+      });
       onStatusChange(
-        `${alignmentMode === 'rigid' ? 'Rigid' : 'Similarity'} 对齐完成，RMSE=${result.rmse.toFixed(4)}`,
+        `Similarity SVD 对齐完成：${manualPairSourceLabel} ${manualAlignmentPairs.count} 对，RMSE=${result.rmse.toFixed(4)}`,
         'success',
       );
     } catch (err) {
@@ -1547,6 +1786,97 @@ export function ModelAssemble({ onStatusChange }: Props) {
     } finally {
       setAligning(false);
     }
+  };
+
+  const handleRunIcpAlign = () => {
+    if (!alignResult) {
+      onStatusChange('请先执行 Landmark SVD，对 ICP 提供初始姿态', 'warning');
+      return;
+    }
+    if (!manualAlignmentPairs || manualAlignmentPairs.count < 3) {
+      onStatusChange('至少需要 3 对 landmark 或 partial-match 候选用于评估 ICP 结果', 'error');
+      return;
+    }
+
+    setAligning(true);
+    setTimeout(() => {
+      try {
+        const t0 = performance.now();
+        const runSeed = makeRandomAlignSeed();
+        appendAlignmentTrace('manual-icp-start', {
+          input: manualAlignmentPairs.source,
+          pairs: manualAlignmentPairs.count,
+          initialRmse: round3(alignResult.rmse),
+          tarRestrictVertices: tarRegion ? tarRegion.vertices.size : null,
+          seed: runSeed,
+          params: {
+            maxIterations: icpMaxIterations,
+            sampleCount: icpSampleCount,
+            rejectMultiplier: icpRejectMultiplier,
+            convergenceImprovement: icpConvergenceImprovement,
+            firstIterMode: ALIGNMENT_MODE,
+            subsequentMode: ALIGNMENT_MODE,
+          },
+        });
+        const icp = icpRefine(srcMesh.vertices, tarMesh.vertices, alignResult.matrix4x4, {
+          maxIterations: icpMaxIterations,
+          sampleCount: icpSampleCount,
+          rejectMultiplier: icpRejectMultiplier,
+          convergenceImprovement: icpConvergenceImprovement,
+          firstIterMode: ALIGNMENT_MODE,
+          subsequentMode: ALIGNMENT_MODE,
+          seed: runSeed,
+          tarRestrictVertices: tarRegion?.vertices,
+        });
+        const result = buildAlignmentResultFromMatrix(
+          srcMesh,
+          manualAlignmentPairs.sourcePoints,
+          manualAlignmentPairs.targetPoints,
+          icp.matrix4x4,
+        );
+        setAlignResult(result);
+        setResultPreview({
+          mode: result.mode,
+          originalVertices: srcMesh.vertices,
+          alignedVertices: result.transformedVertices,
+          alignedSrcLandmarks: result.alignedSrcLandmarks,
+          targetLandmarks: result.targetLandmarks,
+          faces: srcMesh.faces,
+          rmse: result.rmse,
+          meanError: result.meanError,
+          maxError: result.maxError,
+          scale: result.scale,
+        });
+        setCenterViewMode('result');
+        setResultViewMode('overlay');
+        const dt = performance.now() - t0;
+        appendAlignmentTrace('manual-icp-result', {
+          input: manualAlignmentPairs.source,
+          pairs: manualAlignmentPairs.count,
+          icpRmse: round3(icp.rmse),
+          landmarkRmse: round3(result.rmse),
+          scale: round3(result.scale),
+          bestIteration: icp.bestIteration,
+          stopReason: icp.stopReason,
+          iterations: icp.iterations.map((it, index) => ({
+            index,
+            rmse: round3(it.rmse),
+            pairsKept: it.pairsKept,
+            improvement: Number.isFinite(it.improvement) ? round3(it.improvement) : it.improvement,
+          })),
+          matrix: summarizeMatrix(result.matrix4x4),
+          elapsedMs: round3(dt),
+        });
+        onStatusChange(
+          `ICP refine 完成：${icp.iterations.length} 轮，landmark RMSE=${result.rmse.toFixed(4)}，ICP RMSE=${icp.rmse.toFixed(4)}`,
+          'success',
+        );
+      } catch (err) {
+        onStatusChange(`ICP refine 失败：${err instanceof Error ? err.message : '未知错误'}`, 'error');
+      } finally {
+        setAligning(false);
+      }
+    }, 16);
   };
 
   // Auto pipeline: partial-match → SVD landmark fit → ICP refine.
@@ -1776,6 +2106,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
         //    region during ICP causes scale collapse and biased fits
         //    when the region has holes or the source is partial.
         const icp = icpRefine(srcMesh.vertices, tarMesh.vertices, lmFit.matrix4x4, {
+          maxIterations: icpMaxIterations,
+          sampleCount: icpSampleCount,
+          rejectMultiplier: icpRejectMultiplier,
+          convergenceImprovement: icpConvergenceImprovement,
+          firstIterMode: ALIGNMENT_MODE,
+          subsequentMode: ALIGNMENT_MODE,
           seed: runSeed,
         });
 
@@ -1812,6 +2148,14 @@ export function ModelAssemble({ onStatusChange }: Props) {
           icp: {
             rmse: round3(icp.rmse),
             landmarkRmse: round3(icpLandmarkRmse),
+            params: {
+              maxIterations: icpMaxIterations,
+              sampleCount: icpSampleCount,
+              rejectMultiplier: icpRejectMultiplier,
+              convergenceImprovement: icpConvergenceImprovement,
+              firstIterMode: ALIGNMENT_MODE,
+              subsequentMode: ALIGNMENT_MODE,
+            },
             iterations: icp.iterations.length,
             bestIteration: icp.bestIteration + 1,
             stopReason: icp.stopReason,
@@ -1838,9 +2182,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         }
         const meanError = errs.reduce((s, v) => s + v, 0) / errs.length;
         const maxError = Math.max(...errs);
-        const sx = Math.sqrt(
-          finalMatrix[0][0] ** 2 + finalMatrix[1][0] ** 2 + finalMatrix[2][0] ** 2,
-        );
+        const sx = matrixSimilarityScale(finalMatrix);
 
         setCandidates(pm.pairs);
         setAcceptedCandidateIds(new Set(pm.pairs.map((_, i) => i)));
@@ -1931,6 +2273,10 @@ export function ModelAssemble({ onStatusChange }: Props) {
     orthoScale,
     orthoOffsetX,
     orthoOffsetY,
+    icpMaxIterations,
+    icpSampleCount,
+    icpRejectMultiplier,
+    icpConvergenceImprovement,
     buildTarRegionFromSet,
     onStatusChange,
   ]);
@@ -2038,6 +2384,153 @@ export function ModelAssemble({ onStatusChange }: Props) {
     cursor: 'pointer',
   };
 
+  const meshGalleryPanel = (
+    <div
+      style={{
+        borderTop: '1px solid var(--border-default)',
+        background: 'var(--bg-surface)',
+        padding: '8px 10px',
+        height: 172,
+        boxSizing: 'border-box',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 6,
+        flexShrink: 0,
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-primary)', flex: 1 }}>
+          Mesh Gallery
+        </div>
+        <Button
+          size="sm"
+          onClick={() => {
+            void refreshHighresGallery();
+          }}
+          loading={galleryLoading}
+        >
+          刷新
+        </Button>
+      </div>
+
+      {!project && (
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+          未打开工程，无法读取 Page2 的 highres 输出。
+        </div>
+      )}
+
+      {project && highresHistory.length === 0 && (
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+          Page2 暂无 Pipeline 当前使用的 3D Model。
+        </div>
+      )}
+
+      {project && highresHistory.length > 0 && (
+          <div
+            style={{
+              display: 'flex',
+              gap: 8,
+              overflowX: 'auto',
+              overflowY: 'hidden',
+              paddingBottom: 4,
+              minHeight: 104,
+            }}
+          >
+            {highresHistory.map((v) => {
+              const selected = selectedGalleryId === v.id;
+              const bound = sourceGalleryBinding?.pipelineKey === v.pipelineKey;
+              const snapshot = gallerySnapshots[v.id];
+              return (
+                <button
+                  key={v.id}
+                  onClick={() => {
+                    void handleSelectGalleryItem(v);
+                  }}
+                  onDoubleClick={() => {
+                    void handleOpenGalleryToSource(v);
+                  }}
+                  title="单击预览，双击加载到 Source。列表只显示 Page2 每条 Pipeline 当前选中的模型。"
+                  style={{
+                    flex: '0 0 320px',
+                    height: 104,
+                    textAlign: 'left',
+                    background: selected ? 'var(--bg-elevated)' : 'var(--bg-app)',
+                    border: selected ? '1px solid var(--accent-blue)' : '1px solid var(--border-default)',
+                    borderRadius: 4,
+                    padding: '8px 10px',
+                    color: 'var(--text-primary)',
+                    cursor: 'pointer',
+                    overflow: 'hidden',
+                    position: 'relative',
+                    display: 'flex',
+                    gap: 10,
+                    alignItems: 'stretch',
+                  }}
+                >
+                  {bound && (
+                    <div
+                      style={{
+                        position: 'absolute',
+                        top: 6,
+                        right: 8,
+                        fontSize: 10,
+                        color: '#7fd97f',
+                        fontWeight: 700,
+                      }}
+                    >
+                      Source
+                    </div>
+                  )}
+                  <div
+                    style={{
+                      flex: '0 0 96px',
+                      height: 76,
+                      alignSelf: 'center',
+                      border: '1px solid var(--border-subtle)',
+                      borderRadius: 3,
+                      background: '#20242a',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      overflow: 'hidden',
+                      color: 'var(--text-muted)',
+                      fontSize: 10,
+                    }}
+                  >
+                    {snapshot?.status === 'ready' && snapshot.dataUrl ? (
+                      <img
+                        src={snapshot.dataUrl}
+                        alt={`${v.pipelineName} front preview`}
+                        style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+                      />
+                    ) : snapshot?.status === 'error' ? (
+                      '预览失败'
+                    ) : (
+                      '生成中…'
+                    )}
+                  </div>
+                  <div style={{ minWidth: 0, flex: 1, paddingRight: 42 }}>
+                    <div style={{ fontSize: 10, color: 'var(--accent-blue)', fontWeight: 600, marginBottom: 4 }}>
+                      #{v.pipelineIndex + 1} · {v.pipelineName} · {v.pipelineMode === 'multiview' ? 'Jacket Extract' : 'General Extract'}
+                    </div>
+                    <div style={{ fontSize: 11, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {v.file}
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
+                      {new Date(v.timestamp).toLocaleString()}
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6 }}>
+                      静态正视图 · 双击载入 Source
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+    </div>
+  );
+
   return (
     <div
       style={{
@@ -2118,6 +2611,17 @@ export function ModelAssemble({ onStatusChange }: Props) {
                 <div>参考图：{refImageName ?? segPack.imageName}</div>
                 <div>Mask：{maskImageName ?? segPack.maskName}</div>
                 <div>检测到区域：{regionLabels.join(' / ')}</div>
+                <div>
+                  Target 正视图：{orthoRenderUrl ? '已自动渲染' : autoLocalizing ? '自动渲染中…' : '待渲染'}
+                </div>
+                <div>
+                  Mask 反投影：{maskReproj ? '已完成' : autoLocalizing ? '自动反投影中…' : '待执行'}
+                </div>
+                {tarRegion && tarRegionLabel && (
+                  <div style={{ color: '#7fd97f' }}>
+                    已定位目标区域：{tarRegionLabel} · {tarRegion.vertices.size} 顶点
+                  </div>
+                )}
               </>
             ) : (
               <div>请选择包含 segmentation.json、参考图和 mask 的目录。</div>
@@ -2540,108 +3044,6 @@ export function ModelAssemble({ onStatusChange }: Props) {
           </div>
         </PanelSection>}
 
-        <PanelSection title="Mesh Gallery (Page2 当前模型)" defaultCollapsed>
-          <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
-            <Button
-              size="sm"
-              onClick={() => {
-                void refreshHighresGallery();
-              }}
-              loading={galleryLoading}
-              style={{ flex: 1, justifyContent: 'center' }}
-            >
-              刷新列表
-            </Button>
-          </div>
-
-          {!project && (
-            <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>
-              未打开工程，无法读取 Page2 的 highres 输出。
-            </div>
-          )}
-
-          {project && highresHistory.length === 0 && (
-            <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>
-              Page2 暂无 Pipeline 当前使用的 3D Model。
-            </div>
-          )}
-
-          {project && selectedGalleryPreviewUrl && (
-            <div style={{ marginBottom: 8 }}>
-              <GLBThumbnail url={selectedGalleryPreviewUrl} height={110} autoRotateSpeed={0.35} />
-            </div>
-          )}
-
-          {project && highresHistory.length > 0 && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 190, overflow: 'auto' }}>
-              {highresHistory.map((v) => {
-                const selected = selectedGalleryId === v.id;
-                return (
-                  <button
-                    key={v.id}
-                    onClick={() => {
-                      void handleSelectGalleryItem(v);
-                    }}
-                    onDoubleClick={() => {
-                      void handleOpenGalleryToSource(v);
-                    }}
-                    title="单击预览，双击加载到 Source。列表只显示 Page2 每条 Pipeline 当前选中的模型。"
-                    style={{
-                      textAlign: 'left',
-                      background: selected ? 'var(--bg-elevated)' : 'var(--bg-app)',
-                      border: selected ? '1px solid var(--accent-blue)' : '1px solid var(--border-default)',
-                      borderRadius: 3,
-                      padding: '6px 8px',
-                      color: 'var(--text-primary)',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    <div style={{ fontSize: 10, color: 'var(--accent-blue)', fontWeight: 600, marginBottom: 2 }}>
-                      #{v.pipelineIndex + 1} · {v.pipelineName} · {v.pipelineMode === 'multiview' ? 'Jacket Extract' : 'General Extract'}
-                    </div>
-                    <div style={{ fontSize: 11, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                      {v.file}
-                    </div>
-                    <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
-                      {new Date(v.timestamp).toLocaleString()}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 8, lineHeight: 1.5 }}>
-            每条 Page2 Pipeline 只占一个条目；生成新模型或在 Page2 切换历史版本后，这里会自动替换为当前选中的那一份。双击条目可直接替换 Source 模型。
-          </div>
-        </PanelSection>
-
-        {showAdvanced && <PanelSection title="对齐模式" defaultCollapsed>
-          <div style={{ display: 'flex', gap: 6 }}>
-            <Button
-              size="sm"
-              variant={alignmentMode === 'similarity' ? 'primary' : 'secondary'}
-              onClick={() => setAlignmentMode('similarity')}
-              style={{ flex: 1, justifyContent: 'center' }}
-            >
-              Similarity
-            </Button>
-            <Button
-              size="sm"
-              variant={alignmentMode === 'rigid' ? 'primary' : 'secondary'}
-              onClick={() => setAlignmentMode('rigid')}
-              style={{ flex: 1, justifyContent: 'center' }}
-            >
-              Rigid
-            </Button>
-          </div>
-          <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>
-            {alignmentMode === 'similarity'
-              ? 'Similarity: 旋转 + 平移 + 统一缩放'
-              : 'Rigid: 仅旋转 + 平移'}
-          </div>
-        </PanelSection>}
-
         {showAdvanced && <PanelSection title="部分匹配 (Partial → Whole)" defaultCollapsed>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
             适用于 Source 是部件、Target 是包含该部件的整体（如：手臂 → 完整角色）。
@@ -2794,24 +3196,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
           <Button
             size="sm"
             variant="primary"
-            onClick={handleAutoAlign}
-            loading={partialLoading || aligning}
-            disabled={partialLoading || aligning}
-            style={{ width: '100%', justifyContent: 'center', marginBottom: 6 }}
-            title="一键：partial-match → SVD 对齐 → ICP refine。结果直接进入“重叠预览”。"
-          >
-            {(partialLoading || aligning) ? '计算中…' : '一键自动对齐 (partial + ICP)'}
-          </Button>
-
-          <Button
-            size="sm"
-            variant="secondary"
             onClick={handleFindPartial}
             loading={partialLoading}
             disabled={partialLoading}
             style={{ width: '100%', justifyContent: 'center' }}
           >
-            {partialLoading ? '计算中…' : '部分匹配查找'}
+            {partialLoading ? '计算中…' : 'Step 1 · Partial-match 查找候选'}
           </Button>
           <Button
             size="sm"
@@ -3204,6 +3594,8 @@ export function ModelAssemble({ onStatusChange }: Props) {
             />
           )}
         </div>
+
+        {meshGalleryPanel}
       </main>
 
       <aside
@@ -3386,33 +3778,117 @@ export function ModelAssemble({ onStatusChange }: Props) {
           </div>
         </PanelSection>}
 
-        {showAdvanced && <PanelSection title="Align Tools" defaultCollapsed>
+        {showAdvanced && <PanelSection title="Landmark SVD / ICP 手动对齐" defaultCollapsed>
           <div style={{ fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-            模式: {alignmentMode === 'similarity' ? 'Similarity' : 'Rigid'}
+            模式固定为 Similarity（旋转 + 平移 + 统一缩放）。
             <br />
-            规则: 3 对以上 landmarks，按顺序配对
+            当前输入：{manualPairSourceLabel}
+            {manualAlignmentPairs ? ` · ${manualAlignmentPairs.count} 对` : ' · 至少需要 3 对'}
           </div>
 
-          <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+          <Button
+            variant="primary"
+            size="sm"
+            loading={aligning}
+            onClick={handleRunAlign}
+            disabled={aligning || !manualAlignmentPairs}
+            style={{ width: '100%', justifyContent: 'center', marginTop: 8 }}
+            title="Step 2：使用当前 Landmark Pairs / 已接受候选 / Partial 候选执行 Similarity SVD 对齐"
+          >
+            Step 2 · Landmark SVD 对齐
+          </Button>
+
+          <div
+            style={{
+              marginTop: 10,
+              padding: 8,
+              border: '1px solid var(--border-default)',
+              borderRadius: 3,
+              background: 'var(--bg-app)',
+            }}
+          >
+            <div style={{ fontSize: 11, color: 'var(--text-primary)', fontWeight: 600, marginBottom: 6 }}>
+              Step 3 · ICP 参数
+            </div>
+
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>最大迭代数</div>
+            <input
+              type="range"
+              min={5}
+              max={80}
+              step={5}
+              value={icpMaxIterations}
+              onChange={(e) => setIcpMaxIterations(Number(e.target.value))}
+              style={{ width: '100%' }}
+            />
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+              {icpMaxIterations}
+            </div>
+
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Source 采样点数</div>
+            <input
+              type="range"
+              min={100}
+              max={1200}
+              step={50}
+              value={icpSampleCount}
+              onChange={(e) => setIcpSampleCount(Number(e.target.value))}
+              style={{ width: '100%' }}
+            />
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+              {icpSampleCount}
+            </div>
+
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>离群点拒绝倍数</div>
+            <input
+              type="range"
+              min={1}
+              max={5}
+              step={0.1}
+              value={icpRejectMultiplier}
+              onChange={(e) => setIcpRejectMultiplier(Number(e.target.value))}
+              style={{ width: '100%' }}
+            />
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+              {icpRejectMultiplier.toFixed(1)} × median distance
+            </div>
+
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>收敛阈值</div>
+            <input
+              type="range"
+              min={0.001}
+              max={0.02}
+              step={0.001}
+              value={icpConvergenceImprovement}
+              onChange={(e) => setIcpConvergenceImprovement(Number(e.target.value))}
+              style={{ width: '100%' }}
+            />
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8 }}>
+              {(icpConvergenceImprovement * 100).toFixed(1)}% improvement
+            </div>
+
             <Button
+              size="sm"
               variant="primary"
-              size="sm"
               loading={aligning}
-              onClick={handleRunAlign}
-              style={{ flex: 1, justifyContent: 'center' }}
+              onClick={handleRunIcpAlign}
+              disabled={aligning || !alignResult || !manualAlignmentPairs}
+              style={{ width: '100%', justifyContent: 'center' }}
+              title="Step 3：从当前 SVD 结果出发执行逐顶点 ICP refine"
             >
-              执行对齐
-            </Button>
-            <Button
-              size="sm"
-              onClick={handleApplyAlignedTransform}
-              disabled={!alignResult}
-              style={{ flex: 1, justifyContent: 'center' }}
-              title="将当前对齐结果真正写回 Source 网格与 Source landmarks"
-            >
-              应用变换
+              Step 3 · ICP refine
             </Button>
           </div>
+
+          <Button
+            size="sm"
+            onClick={handleApplyAlignedTransform}
+            disabled={!alignResult}
+            style={{ width: '100%', justifyContent: 'center', marginTop: 8 }}
+            title="将当前对齐结果真正写回 Source 网格与 Source landmarks"
+          >
+            应用变换
+          </Button>
 
           {alignResult && (
             <div
@@ -3428,12 +3904,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
               }}
             >
               <div style={{ color: 'var(--accent-green)' }}>
-                ✓ {alignResult.mode === 'rigid' ? 'Rigid' : 'Similarity'} Alignment Ready
+                ✓ Similarity Alignment Ready
               </div>
               <div>RMSE: {alignResult.rmse.toFixed(5)}</div>
               <div>Mean: {alignResult.meanError.toFixed(5)}</div>
               <div>Max: {alignResult.maxError.toFixed(5)}</div>
-              {alignResult.mode === 'similarity' && <div>Scale: {alignResult.scale.toFixed(5)}</div>}
+              <div>Scale: {alignResult.scale.toFixed(5)}</div>
             </div>
           )}
         </PanelSection>}
