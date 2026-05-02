@@ -9,7 +9,7 @@ import { GLBThumbnail } from '../../components/GLBThumbnail';
 import { useProject } from '../../contexts/ProjectContext';
 import {
   EXTRACT_JACKET_PROMPT,
-  MODIFY_HIGHRES_PROMPT,
+  MODIFY_HIGHRES_RETRY_PROMPT,
   extractWithPrompt,
   extractWithSAM3,
   removeBackgroundRMBG,
@@ -22,10 +22,9 @@ import { splitMultiView, smartCropAndEnlargeAuto } from '../../services/multivie
 import { runImageToModel, runMultiViewToModel, TripoServiceError, type MultiViewInputs } from '../../services/tripo';
 
 /**
- * Full node list (Mode 'multiview' = Jacket Extract pipeline). Mode
- * 'extraction' = General Extract pipeline omits the standalone `multiview`
- * node since the SAM3 extraction step already preserves the 4-view layout.
- * Use {@link getPartNodes} to obtain the mode-specific list.
+ * Full node list for Page2 part pipelines. Both Page2 modes keep the extracted
+ * 4-view sheet inside the Extraction node, so there is no standalone
+ * Multi-View node between Extraction and Modify/3D Model.
  *
  * The `extraction` node's display title is mode-dependent — see
  * {@link getPartNodes}. Mode 'multiview' uses the Banana Pro "Extract Jacket"
@@ -35,7 +34,6 @@ import { runImageToModel, runMultiViewToModel, TripoServiceError, type MultiView
 export const PART_NODES: NodeConfig[] = [
   { id: 'imageInput', title: 'Image Input', display: 'image' },
   { id: 'extraction', title: 'Jacket Extraction', display: 'image' },
-  { id: 'multiview', title: 'Multi-View', display: 'multiview' },
   { id: 'modify', title: 'Modify', display: 'image', optional: true },
   { id: 'highres', title: '3D Model', display: '3d' },
   { id: 'retex', title: 'Re-Texturing', display: '3d', optional: true },
@@ -45,14 +43,34 @@ export const PART_NODES: NodeConfig[] = [
 /** Returns the node list for a given pipeline mode. */
 export function getPartNodes(mode: PipelineMode): NodeConfig[] {
   if (mode === 'extraction') {
-    // General Extract pipeline: SAM3 mask is applied to the existing 4-view
-    // source, so no standalone Multi-View regen is needed. Rename the
-    // extraction node to reflect the actual runner.
+    // General Extract pipeline: rename the extraction node to reflect the
+    // actual runner.
     return PART_NODES
-      .filter((n) => n.id !== 'multiview')
       .map((n) => (n.id === 'extraction' ? { ...n, title: 'General Extraction' } : n));
   }
   return PART_NODES;
+}
+
+function initialNodeStatesFor(partNodes: NodeConfig[]): NodeState[] {
+  return partNodes.map((n) => (n.optional ? 'optional' : 'idle'));
+}
+
+/**
+ * Migrates old in-memory Jacket Extract rows that still contain the removed
+ * `multiview` node state at index 2.
+ */
+function normalizeNodeStatesForMode(mode: PipelineMode, states: NodeState[]): NodeState[] {
+  const partNodes = getPartNodes(mode);
+  if (states.length === partNodes.length) return states;
+
+  let next = states;
+  if (mode === 'multiview' && states.length === partNodes.length + 1) {
+    next = states.filter((_, idx) => idx !== 2);
+  }
+
+  if (next.length === partNodes.length) return next;
+  const defaults = initialNodeStatesFor(partNodes);
+  return partNodes.map((_, idx) => next[idx] ?? defaults[idx]);
 }
 
 /**
@@ -107,9 +125,10 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
   const [draftName, setDraftName] = useState(pipeline.name);
   const modelAbortRef = useRef<AbortController | null>(null);
 
-  // Mode-specific node list. Mode A · Extraction omits the standalone Multi-View
-  // node since the Extract Jacket node already produces a 4-view sheet directly.
+  // Mode-specific node list. Extraction keeps the 4-view sheet in the
+  // Extraction node; downstream 3D generation splits it on demand.
   const partNodes = getPartNodes(pipeline.mode);
+  const nodeStates = normalizeNodeStatesForMode(pipeline.mode, pipeline.nodeStates);
 
   // Extraction 节点历史版本（仅本 Pipeline 自己的，按 pipeline.name 前缀过滤）
   const [extractionHistory, setExtractionHistory] = useState<AssetVersion[]>([]);
@@ -120,9 +139,9 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
   // 图片大图预览
   const [preview, setPreview] = useState<{ url: string; title: string } | null>(null);
 
-  // Source image for Extraction (loaded from page1.multiview on the active project).
-  // Falls back to "no source available" if the project hasn't been opened or
-  // the Multi-View node is empty.
+  // Source image for Extraction (loaded from page1.multiview or page1.extraction
+  // on the active project). Falls back to "no source available" if the project
+  // hasn't been opened or the required Page1 output is empty.
   const [sourceFile, setSourceFile] = useState<File | null>(null);
   const [sourceUrl, setSourceUrl] = useState<string | null>(null);
   const sourceUrlRef = useRef<string | null>(null);
@@ -164,7 +183,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
         // only if they haven't been manually set to something more advanced.
         onUpdate(pipeline.id, {
           ...pipeline,
-          nodeStates: pipeline.nodeStates.map((v, idx) => {
+          nodeStates: nodeStates.map((v, idx) => {
             if (idx === 0 && v !== 'complete') return 'complete';
             if (idx === 1 && v === 'idle') return 'ready';
             return v;
@@ -265,7 +284,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
       onUpdate(pipeline.id, {
         ...pipeline,
         nodeStates: promoteDownstream(
-          pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'complete' : v)),
+          nodeStates.map((v, idx) => (idx === 1 ? 'complete' : v)),
           1,
           partNodes,
         ),
@@ -310,13 +329,14 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
       const modifyIdx = partNodes.findIndex((n) => n.id === 'modify');
       onUpdate(pipeline.id, {
         ...pipeline,
+        expanded: modifyIdx >= 0 ? { ...pipeline.expanded, [modifyIdx]: true } : pipeline.expanded,
         nodeStates: modifyIdx >= 0
           ? promoteDownstream(
-              pipeline.nodeStates.map((v, idx) => (idx === modifyIdx ? 'complete' : v)),
+              nodeStates.map((v, idx) => (idx === modifyIdx ? 'complete' : v)),
               modifyIdx,
               partNodes,
             )
-          : pipeline.nodeStates,
+          : nodeStates,
         modify: { ...modify, resultUrl: r.url, resultFile: fileName, error: undefined },
       });
       onStatus(`[${pipeline.name}] 已切换到 Modify：${fileName}`, 'success');
@@ -348,11 +368,11 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
         ...pipeline,
         nodeStates: modelIdx >= 0
           ? promoteDownstream(
-              pipeline.nodeStates.map((v, idx) => (idx === modelIdx ? 'complete' : v)),
+              nodeStates.map((v, idx) => (idx === modelIdx ? 'complete' : v)),
               modelIdx,
               partNodes,
             )
-          : pipeline.nodeStates,
+          : nodeStates,
         model3d: { ...model3d, glbUrl: r.url, glbFile: fileName, error: undefined },
       });
       onStatus(`[${pipeline.name}] 已切换到 3D Model：${fileName}`, 'success');
@@ -374,7 +394,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
     (i: number, s: NodeState) => {
       const next: PartPipelineState = {
         ...pipeline,
-        nodeStates: pipeline.nodeStates.map((v, idx) => (idx === i ? s : v)),
+        nodeStates: nodeStates.map((v, idx) => (idx === i ? s : v)),
       };
       onUpdate(pipeline.id, next);
     },
@@ -408,7 +428,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
     // Set running
     onUpdate(pipeline.id, {
       ...pipeline,
-      nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'running' : v)),
+      nodeStates: nodeStates.map((v, idx) => (idx === 1 ? 'running' : v)),
       extraction: { ...extraction, error: undefined },
     });
     onStatus(`[${pipeline.name}] ${modeLabel} 提取中…`, 'info');
@@ -536,7 +556,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
       onUpdate(pipeline.id, {
         ...pipeline,
         nodeStates: promoteDownstream(
-          pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'complete' : v)),
+          nodeStates.map((v, idx) => (idx === 1 ? 'complete' : v)),
           1,
           partNodes,
         ),
@@ -553,7 +573,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
         console.warn('[PartPipeline] SAM3 cancelled:', err);
         onUpdate(pipeline.id, {
           ...pipeline,
-          nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'ready' : v)),
+          nodeStates: nodeStates.map((v, idx) => (idx === 1 ? 'ready' : v)),
           extraction: { ...extraction, error: undefined },
         });
         onStatus(`[${pipeline.name}] 已取消 SAM3 标注`, 'warning');
@@ -568,7 +588,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
       console.error('[PartPipeline] extract jacket failed:', err);
       onUpdate(pipeline.id, {
         ...pipeline,
-        nodeStates: pipeline.nodeStates.map((v, idx) => (idx === 1 ? 'error' : v)),
+        nodeStates: nodeStates.map((v, idx) => (idx === 1 ? 'error' : v)),
         extraction: { ...extraction, error: friendlyMsg },
       });
       onStatus(`[${pipeline.name}] ${modeLabel} 失败：${friendlyMsg}`, 'error');
@@ -594,7 +614,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
 
     onUpdate(pipeline.id, {
       ...pipeline,
-      nodeStates: pipeline.nodeStates.map((v, idx) => (idx === modifyIdx ? 'running' : v)),
+      nodeStates: nodeStates.map((v, idx) => (idx === modifyIdx ? 'running' : v)),
       modify: { ...modify, error: undefined },
     });
     onStatus(`[${pipeline.name}] Modify · Banana Pro 高清化中…`, 'info');
@@ -602,8 +622,10 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
     try {
       const url = await extractWithPrompt({
         source: inputBlob,
-        prompt: MODIFY_HIGHRES_PROMPT,
-        statusAction: '绘制/高清化',
+        prompt: MODIFY_HIGHRES_RETRY_PROMPT,
+        statusAction: '重绘/高清化',
+        aspectRatio: 'auto',
+        resolution: '2K',
         onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
       });
       const blob = await (await fetch(url)).blob();
@@ -650,8 +672,9 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
 
       onUpdate(pipeline.id, {
         ...pipeline,
+        expanded: { ...pipeline.expanded, [modifyIdx]: true },
         nodeStates: promoteDownstream(
-          pipeline.nodeStates.map((v, idx) => (idx === modifyIdx ? 'complete' : v)),
+          nodeStates.map((v, idx) => (idx === modifyIdx ? 'complete' : v)),
           modifyIdx,
           partNodes,
         ),
@@ -665,7 +688,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
       console.error('[PartPipeline] modify failed:', err);
       onUpdate(pipeline.id, {
         ...pipeline,
-        nodeStates: pipeline.nodeStates.map((v, idx) => (idx === modifyIdx ? 'error' : v)),
+        nodeStates: nodeStates.map((v, idx) => (idx === modifyIdx ? 'error' : v)),
         modify: { ...modify, error: msg },
       });
       onStatus(`[${pipeline.name}] Modify 失败：${msg}`, 'error');
@@ -701,7 +724,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
 
     onUpdate(pipeline.id, {
       ...pipeline,
-      nodeStates: pipeline.nodeStates.map((v, idx) => (idx === modelIdx ? 'running' : v)),
+      nodeStates: nodeStates.map((v, idx) => (idx === modelIdx ? 'running' : v)),
       model3d: { ...model3d, error: undefined },
     });
     onStatus(`[${pipeline.name}] 3D Model · ${MODEL_3D_MODE_LABEL[mode]} 开始…`, 'info');
@@ -763,7 +786,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
       onUpdate(pipeline.id, {
         ...pipeline,
         nodeStates: promoteDownstream(
-          pipeline.nodeStates.map((v, idx) => (idx === modelIdx ? 'complete' : v)),
+          nodeStates.map((v, idx) => (idx === modelIdx ? 'complete' : v)),
           modelIdx,
           partNodes,
         ),
@@ -776,7 +799,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
       if (err instanceof TripoServiceError && err.message === '已取消') {
         onUpdate(pipeline.id, {
           ...pipeline,
-          nodeStates: pipeline.nodeStates.map((v, idx) => (idx === modelIdx ? 'ready' : v)),
+          nodeStates: nodeStates.map((v, idx) => (idx === modelIdx ? 'ready' : v)),
           model3d: { ...model3d, error: undefined },
         });
         onStatus(`[${pipeline.name}] 已取消 3D Model 生成`, 'warning');
@@ -793,7 +816,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
       console.error('[PartPipeline] 3D Model failed:', err);
       onUpdate(pipeline.id, {
         ...pipeline,
-        nodeStates: pipeline.nodeStates.map((v, idx) => (idx === modelIdx ? 'error' : v)),
+        nodeStates: nodeStates.map((v, idx) => (idx === modelIdx ? 'error' : v)),
         model3d: { ...model3d, error: msg },
       });
       onStatus(`[${pipeline.name}] 3D Model 失败：${msg}`, 'error');
@@ -809,8 +832,8 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
     onUpdate(pipeline.id, {
       ...pipeline,
       nodeStates: modifyIdx >= 0
-        ? pipeline.nodeStates.map((v, idx) => (idx === modifyIdx ? 'ready' : v))
-        : pipeline.nodeStates,
+        ? nodeStates.map((v, idx) => (idx === modifyIdx ? 'ready' : v))
+        : nodeStates,
       modify: { resultUrl: null, resultFile: null, error: undefined },
     });
     onStatus(`[${pipeline.name}] 已撤销 Modify 输出，3D Model 将使用 Extraction 输出`, 'info');
@@ -839,7 +862,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
       }
       const updated: PartPipelineState = {
         ...pipeline,
-        nodeStates: pipeline.nodeStates.map((v, idx) => (idx === i ? 'running' : v)),
+        nodeStates: nodeStates.map((v, idx) => (idx === i ? 'running' : v)),
       };
       onUpdate(pipeline.id, updated);
       onStatus(`[${pipeline.name}] 运行 ${partNodes[i].title} …`, 'info');
@@ -848,7 +871,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
         // Re-read latest by referencing current pipeline (closure captures pre-state, fine for mock)
         const after: PartPipelineState = {
           ...pipeline,
-          nodeStates: pipeline.nodeStates.map((v, idx) => {
+          nodeStates: nodeStates.map((v, idx) => {
             if (idx === i) return 'complete';
             // promote next non-optional node to ready
             if (idx === i + 1) {
@@ -963,7 +986,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
         </span>
         <span style={{ flex: 1 }} />
         <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-          {pipeline.nodeStates.filter((s) => s === 'complete').length} / {partNodes.length} 完成
+          {nodeStates.filter((s) => s === 'complete').length} / {partNodes.length} 完成
         </span>
         <Button variant="ghost" size="sm" onClick={() => onDelete(pipeline.id)}>
           🗑 删除
@@ -974,8 +997,9 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
       <div style={{ overflowX: 'auto', padding: '20px 12px' }}>
         <div style={{ display: 'flex', alignItems: 'center' }}>
           {partNodes.map((node, i) => {
-            const state = pipeline.nodeStates[i];
-            const expanded = !!pipeline.expanded[i];
+            const state = nodeStates[i];
+            const hasModifyOutput = node.id === 'modify' && !!(modify.resultUrl || modify.resultFile);
+            const expanded = pipeline.expanded[i] ?? hasModifyOutput;
 
             const headerExtra =
               node.id === 'extraction' && project && extractionHistory.length > 0 ? (
@@ -1102,7 +1126,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
                   {body}
                 </NodeCard>
                 {i < partNodes.length - 1 && (
-                  <NodeConnector fromState={state} toState={pipeline.nodeStates[i + 1]} />
+                  <NodeConnector fromState={state} toState={nodeStates[i + 1]} />
                 )}
               </div>
             );

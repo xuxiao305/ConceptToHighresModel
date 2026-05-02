@@ -93,7 +93,7 @@ function fromPersisted(pp: PersistedPipeline, index: number): PartPipelineState 
     name: pp.name,
     mode: pp.mode,
     nodeStates,
-    expanded: {},
+    expanded: pp.modifyFile && modifyIdx >= 0 ? { [modifyIdx]: true } : {},
     imageInput: {
       imageUrl: null,
       imageFile: pp.imageFile ?? null,

@@ -33,6 +33,10 @@ export interface GenerateImageOptions {
    *  `image_url` content part. */
   images?: Array<File | Blob | string>;
   model?: string;
+  /** Optional image aspect ratio hint for Gemini image models. */
+  aspectRatio?: string;
+  /** Optional output resolution hint, e.g. 1K / 2K / 4K. */
+  resolution?: string;
   /** Optional seed for reproducibility. If omitted, the API picks one. */
   seed?: number;
   /** Abort signal for cancellation. */
@@ -136,7 +140,10 @@ export async function generateImage(opts: GenerateImageOptions): Promise<string>
       { role: 'user', content },
     ],
     modalities: ['text', 'image'],
+    response_modalities: 'IMAGE+TEXT',
   };
+  if (opts.aspectRatio) body.aspect_ratio = opts.aspectRatio;
+  if (opts.resolution) body.resolution = opts.resolution;
   if (typeof opts.seed === 'number') body.seed = opts.seed;
 
   const res = await fetch(`${BASE}/v1/chat/completions`, {

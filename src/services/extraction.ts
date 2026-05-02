@@ -53,6 +53,11 @@ export const MODIFY_HIGHRES_PROMPT =
   'bottom right: back view \n\n' +
   'You need to make a higher resolution of the input image, but keep the art style same in general';
 
+/** Retry prompt used only when the first Modify result is detected as a near-identical copy. */
+export const MODIFY_HIGHRES_RETRY_PROMPT =
+  MODIFY_HIGHRES_PROMPT +
+  '\n\nImportant: do not return the original image unchanged. Redraw every view as a new high-quality generated image, adding sharper fabric folds, cleaner silhouettes, more texture detail, anti-aliased edges, and higher-resolution details while preserving the exact 2x2 layout, subject identity, colors, and general art style.';
+
 // ===========================================================================
 // Banana Pro extraction (Pipeline 1 step ①)
 // ===========================================================================
@@ -70,6 +75,10 @@ export interface ExtractWithPromptOptions {
   signal?: AbortSignal;
   /** Status verb shown in UI, defaults to “提取”. */
   statusAction?: string;
+  /** Optional output aspect ratio hint. */
+  aspectRatio?: string;
+  /** Optional output resolution hint. */
+  resolution?: string;
 }
 
 /**
@@ -87,6 +96,8 @@ export async function extractWithPrompt(
     images: [opts.source],
     seed,
     signal: opts.signal,
+    aspectRatio: opts.aspectRatio,
+    resolution: opts.resolution,
   });
   opts.onStatus?.(`Banana Pro ${action}完成`);
   return url;
