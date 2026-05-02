@@ -69,6 +69,39 @@ interface ResultPreview {
   scale: number;
 }
 
+interface AutoAlignSummary {
+  regionLabel: string | null;
+  pairs: number;
+  rmse: number;
+  scale: number;
+  method: 'SVD' | 'ICP';
+  elapsedMs: number;
+}
+
+function qualityLabel(summary: AutoAlignSummary): { label: string; color: string } {
+  if (summary.rmse < 1.0 && summary.pairs >= 20) return { label: '良好', color: '#7fd97f' };
+  if (summary.rmse < 1.8 && summary.pairs >= 15) return { label: '可用', color: '#e9d36c' };
+  return { label: '需要检查', color: '#e08a8a' };
+}
+
+function baseName(path: string): string {
+  return path.split(/[\\/]/).pop()?.toLowerCase() ?? path.toLowerCase();
+}
+
+function recommendRegionLabel(sourceName: string, labels: string[]): string | null {
+  if (labels.length === 0) return null;
+  const normalized = sourceName.toLowerCase().replace(/[\s_-]+/g, '');
+  const findLabel = (needles: string[]) =>
+    labels.find((label) => needles.some((needle) => label.toLowerCase().replace(/[\s_-]+/g, '').includes(needle))) ?? null;
+
+  if (normalized.includes('rightarm') || normalized.includes('armhires')) return findLabel(['rightarm']) ?? findLabel(['arm']);
+  if (normalized.includes('leftarm')) return findLabel(['leftarm']) ?? findLabel(['arm']);
+  if (normalized.includes('body') || normalized.includes('torso') || normalized.includes('jacket') || normalized.includes('coat')) {
+    return findLabel(['body', 'torso', 'jacket', 'coat']);
+  }
+  return labels[0] ?? null;
+}
+
 const DEMO_SOURCE: MeshData = {
   name: 'Demo Source',
   vertices: [
@@ -137,6 +170,8 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [galleryLoading, setGalleryLoading] = useState(false);
   const [selectedGalleryFile, setSelectedGalleryFile] = useState<string | null>(null);
   const [selectedGalleryPreviewUrl, setSelectedGalleryPreviewUrl] = useState<string | null>(null);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [autoAlignSummary, setAutoAlignSummary] = useState<AutoAlignSummary | null>(null);
 
   // ── Phase 1 region-grow state ─────────────────────────────────────────
   // NOTE: the manual seed-mode UI was removed in favour of SAM3 mask
@@ -146,6 +181,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
   // kept for future symmetry (source-side SAM3 region).
   const [srcRegion, setSrcRegion] = useState<MeshRegion | null>(null);
   const [tarRegion, setTarRegion] = useState<MeshRegion | null>(null);
+  const [tarRegionLabel, setTarRegionLabel] = useState<string | null>(null);
 
   // ── Phase 2 candidate list state ────────────────────────────────────────────
   // The "查找候选" UI for region-based local matching was removed; the
@@ -196,6 +232,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
   // union of region bboxes is the most reliable framing source.
   const [segPack, setSegPack] = useState<SegmentationPack | null>(null);
   const [segPackName, setSegPackName] = useState<string | null>(null);
+  const [selectedTargetRegionLabel, setSelectedTargetRegionLabel] = useState<string>('');
   const [orthoRenderUrl, setOrthoRenderUrl] = useState<string | null>(null);
   // Camera that was actually used for the most recent render. Required
   // for mask reprojection so the projection used to interpret a mask
@@ -212,6 +249,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const refImageInputRef = useRef<HTMLInputElement | null>(null);
   const maskImageInputRef = useRef<HTMLInputElement | null>(null);
   const segJsonInputRef = useRef<HTMLInputElement | null>(null);
+  const segPackDirInputRef = useRef<HTMLInputElement | null>(null);
 
   // The bbox actually used for fitting: JSON union > image auto-extract.
   const fitBBox = useMemo(() => {
@@ -220,6 +258,23 @@ export function ModelAssemble({ onStatusChange }: Props) {
       ? { x: refSubjectBBox.x, y: refSubjectBBox.y, w: refSubjectBBox.w, h: refSubjectBBox.h }
       : null;
   }, [segPack, refSubjectBBox]);
+
+  const regionLabels = useMemo(() => segPack?.regions.map((r) => r.label) ?? [], [segPack]);
+  const recommendedRegionLabel = useMemo(
+    () => recommendRegionLabel(srcMesh.name, regionLabels),
+    [srcMesh.name, regionLabels],
+  );
+
+  useEffect(() => {
+    if (regionLabels.length === 0) {
+      setSelectedTargetRegionLabel('');
+      return;
+    }
+    setSelectedTargetRegionLabel((prev) => {
+      if (prev && regionLabels.includes(prev)) return prev;
+      return recommendedRegionLabel ?? regionLabels[0];
+    });
+  }, [recommendedRegionLabel, regionLabels]);
 
   const srcAdjacency: MeshAdjacency = useMemo(
     () => buildMeshAdjacency(srcMesh.vertices, srcMesh.faces),
@@ -445,7 +500,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
       return;
     }
     setPartialLoading(true);
-    setTimeout(() => {
+    setTimeout(async () => {
     const t0 = performance.now();
     const dbg = computePartialDebug(
       { vertices: srcMesh.vertices, adjacency: srcAdjacency },
@@ -502,7 +557,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
       img.src = url;
     });
 
-  const handleLoadRefImage = useCallback(async (file: File) => {
+  const handleLoadRefImage = useCallback(async (file: File): Promise<{ w: number; h: number } | null> => {
     const url = URL.createObjectURL(file);
     try {
       const size = await loadImageDimensions(url);
@@ -540,26 +595,28 @@ export function ModelAssemble({ onStatusChange }: Props) {
           'warning',
         );
       }
+      return size;
     } catch (err) {
       URL.revokeObjectURL(url);
       onStatusChange(
         `参考图加载失败：${err instanceof Error ? err.message : '未知错误'}`,
         'error',
       );
+      return null;
     }
   }, [onStatusChange]);
 
-  const handleLoadMaskImage = useCallback(async (file: File) => {
+  const handleLoadMaskImage = useCallback(async (file: File, expectedSize = refImageSize): Promise<boolean> => {
     const url = URL.createObjectURL(file);
     try {
       const size = await loadImageDimensions(url);
-      if (refImageSize && (size.w !== refImageSize.w || size.h !== refImageSize.h)) {
+      if (expectedSize && (size.w !== expectedSize.w || size.h !== expectedSize.h)) {
         URL.revokeObjectURL(url);
         onStatusChange(
-          `Mask 尺寸 ${size.w}×${size.h} 与参考图 ${refImageSize.w}×${refImageSize.h} 不一致`,
+          `Mask 尺寸 ${size.w}×${size.h} 与参考图 ${expectedSize.w}×${expectedSize.h} 不一致`,
           'error',
         );
-        return;
+        return false;
       }
       setMaskImageUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
@@ -567,12 +624,14 @@ export function ModelAssemble({ onStatusChange }: Props) {
       });
       setMaskImageName(file.name);
       onStatusChange(`已加载 SAM3 mask：${file.name}`, 'success');
+      return true;
     } catch (err) {
       URL.revokeObjectURL(url);
       onStatusChange(
         `Mask 加载失败：${err instanceof Error ? err.message : '未知错误'}`,
         'error',
       );
+      return false;
     }
   }, [refImageSize, onStatusChange]);
 
@@ -664,6 +723,8 @@ export function ModelAssemble({ onStatusChange }: Props) {
         { projectionMode: 'through', splatRadiusPx: 1, maskDilatePx: 2 },
       );
       setMaskReproj(result);
+      setTarRegion(null);
+      setTarRegionLabel(null);
       const stats = Array.from(result.regions.entries())
         .map(([label, set]) => `${label}=${set.size}`)
         .join(', ');
@@ -683,14 +744,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
   // Adopt a reprojected SAM3 region as the partial-match Target seed.
   // Builds a synthetic MeshRegion (centroid + bounding radius) so the
   // existing soft-seed pipeline picks it up without code changes.
-  const handleAdoptRegionAsTarSeed = useCallback(
-    (label: string) => {
-      if (!maskReproj) return;
-      const set = maskReproj.regions.get(label);
-      if (!set || set.size === 0) {
-        onStatusChange(`区域 "${label}" 没有顶点可用作 seed`, 'warning');
-        return;
-      }
+  const buildTarRegionFromSet = useCallback(
+    (set: Set<number>): MeshRegion | null => {
+      if (set.size === 0) return null;
       let cx = 0, cy = 0, cz = 0;
       for (const idx of set) {
         const v = tarMesh.vertices[idx];
@@ -722,13 +778,30 @@ export function ModelAssemble({ onStatusChange }: Props) {
         finalSteps: 0,
         stopReason: 'frontier-empty',
       };
+      return region;
+    },
+    [tarMesh.vertices],
+  );
+
+  const handleAdoptRegionAsTarSeed = useCallback(
+    (label: string) => {
+      if (!maskReproj) return;
+      const set = maskReproj.regions.get(label);
+      if (!set || set.size === 0) {
+        onStatusChange(`区域 "${label}" 没有顶点可用作 seed`, 'warning');
+        return;
+      }
+      const region = buildTarRegionFromSet(set);
+      if (!region) return;
       setTarRegion(region);
+      setTarRegionLabel(label);
+      setSelectedTargetRegionLabel(label);
       onStatusChange(
-        `已将 SAM3 区域 "${label}" (${set.size} 顶点) 设为 Target seed · 中心=(${centroid[0].toFixed(3)}, ${centroid[1].toFixed(3)}, ${centroid[2].toFixed(3)}) · 半径=${boundingRadius.toFixed(3)}`,
+        `已将 SAM3 区域 "${label}" (${set.size} 顶点) 设为 Target seed · 中心=(${region.centroid[0].toFixed(3)}, ${region.centroid[1].toFixed(3)}, ${region.centroid[2].toFixed(3)}) · 半径=${region.boundingRadius.toFixed(3)}`,
         'success',
       );
     },
-    [maskReproj, tarMesh, onStatusChange],
+    [maskReproj, buildTarRegionFromSet, onStatusChange],
   );
 
   const onRefImageFileChange = useCallback(
@@ -760,6 +833,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
       const pack = parseSegmentationJson(text);
       setSegPack(pack);
       setSegPackName(file.name);
+      setMaskReproj(null);
+      setTarRegion(null);
+      setTarRegionLabel(null);
       const union = regionsUnionBBox(pack.regions);
       onStatusChange(
         `已加载 ${file.name} · ${pack.regions.length} 个区域：${pack.regions.map((r) => r.label).join(', ')}` +
@@ -774,6 +850,56 @@ export function ModelAssemble({ onStatusChange }: Props) {
     }
   }, [onStatusChange]);
 
+  const handleLoadSegPackFiles = useCallback(async (files: FileList | File[]) => {
+    const all = Array.from(files);
+    const jsonFile = all.find((f) => baseName((f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name) === 'segmentation.json')
+      ?? all.find((f) => f.name.toLowerCase().endsWith('.json'));
+    if (!jsonFile) {
+      onStatusChange('分割包目录中未找到 segmentation.json', 'error');
+      return;
+    }
+
+    try {
+      const text = await jsonFile.text();
+      const pack = parseSegmentationJson(text);
+      const findReferencedFile = (name: string) => {
+        const wanted = baseName(name);
+        return all.find((f) => baseName((f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name) === wanted)
+          ?? all.find((f) => baseName(f.name) === wanted);
+      };
+      const imageFile = findReferencedFile(pack.imageName);
+      const maskFile = findReferencedFile(pack.maskName);
+
+      setSegPack(pack);
+      setSegPackName(jsonFile.name);
+      setMaskReproj(null);
+      setTarRegion(null);
+      setTarRegionLabel(null);
+
+      let imageSize: { w: number; h: number } | null = null;
+      if (imageFile) {
+        imageSize = await handleLoadRefImage(imageFile);
+      }
+      if (maskFile) {
+        await handleLoadMaskImage(maskFile, imageSize ?? refImageSize);
+      }
+
+      const union = regionsUnionBBox(pack.regions);
+      onStatusChange(
+        `已加载 SAM3 分割包：${pack.regions.map((r) => r.label).join(' / ')}` +
+          (imageFile ? ` · 参考图 ${pack.imageName}` : ` · 未找到参考图 ${pack.imageName}`) +
+          (maskFile ? ` · Mask ${pack.maskName}` : ` · 未找到 Mask ${pack.maskName}`) +
+          (union ? ` · bbox ${union.w}×${union.h}@(${union.x},${union.y})` : ''),
+        imageFile && maskFile ? 'success' : 'warning',
+      );
+    } catch (err) {
+      onStatusChange(
+        `SAM3 分割包加载失败：${err instanceof Error ? err.message : '未知错误'}`,
+        'error',
+      );
+    }
+  }, [handleLoadMaskImage, handleLoadRefImage, onStatusChange, refImageSize]);
+
   const onSegJsonFileChange = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
@@ -782,6 +908,16 @@ export function ModelAssemble({ onStatusChange }: Props) {
       e.currentTarget.value = '';
     },
     [handleLoadSegJson],
+  );
+
+  const onSegPackDirChange = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = e.target.files;
+      if (!files || files.length === 0) return;
+      await handleLoadSegPackFiles(files);
+      e.currentTarget.value = '';
+    },
+    [handleLoadSegPackFiles],
   );
 
   // Cleanup blob URLs on unmount.
@@ -885,8 +1021,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const resetPreview = useCallback(() => {
     if (alignResult) setAlignResult(null);
     if (resultPreview) setResultPreview(null);
+    if (autoAlignSummary) setAutoAlignSummary(null);
     if (centerViewMode === 'result') setCenterViewMode('landmark');
-  }, [alignResult, centerViewMode, resultPreview]);
+  }, [alignResult, autoAlignSummary, centerViewMode, resultPreview]);
 
   const refreshHighresGallery = useCallback(async () => {
     if (!project) {
@@ -1011,6 +1148,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         setTarMesh(mesh);
         setSelectedTarIndex(null);
         setTarRegion(null);
+        setTarRegionLabel(null);
         // Camera & reprojection are bound to the previous mesh — drop them.
         setOrthoCamera(null);
         setMaskReproj(null);
@@ -1143,23 +1281,101 @@ export function ModelAssemble({ onStatusChange }: Props) {
       onStatusChange('Source/Target 尚未加载', 'warning');
       return;
     }
-    // Without a SAM3-reprojected target region, the geometry-only
-    // partial-match is structurally unstable on humanoid bodies (any
-    // self-similar part can satisfy the inlier consistency). Offline
-    // testing showed scale spread 0.245-0.509 and dist→target spread
-    // 0.4-6.0 across 5 RANSAC seeds in this case. Warn the user but
-    // still let them try.
-    if (!tarRegion) {
+    if (!selectedTargetRegionLabel) {
       onStatusChange(
-        '提示：未标记 Target seed（SAM3 区域）— 自动对齐结果可能不稳定。建议先在 “SAM3 重投影” 面板标定一个目标区域。',
-        'warning',
+        '请先加载 SAM3 分割包并选择目标区域，避免无约束匹配误对到身体。',
+        'error',
       );
+      return;
+    }
+    if (!maskReproj && (!segPack || !maskImageUrl || !refImageSize)) {
+      onStatusChange(
+        '目标区域尚未定位：请加载完整 SAM3 分割包（segmentation.json + 参考图 + mask）。',
+        'error',
+      );
+      return;
     }
     setPartialLoading(true);
     setAligning(true);
-    setTimeout(() => {
+    setTimeout(async () => {
       try {
         const t0 = performance.now();
+
+        let workingTarRegion =
+          tarRegion && tarRegionLabel === selectedTargetRegionLabel ? tarRegion : null;
+        let workingMaskReproj = maskReproj;
+
+        if (!workingTarRegion && selectedTargetRegionLabel) {
+          if (workingMaskReproj) {
+            const set = workingMaskReproj.regions.get(selectedTargetRegionLabel);
+            if (set && set.size > 0) {
+              workingTarRegion = buildTarRegionFromSet(set);
+              if (workingTarRegion) {
+                setTarRegion(workingTarRegion);
+                setTarRegionLabel(selectedTargetRegionLabel);
+              }
+            }
+          } else if (segPack && maskImageUrl && refImageSize) {
+            let camera = orthoCamera;
+            if (!camera) {
+              const useAuto = autoFit && !!fitBBox;
+              const rendered = renderOrthoFrontViewWithCamera(
+                tarMesh.vertices,
+                tarMesh.faces,
+                {
+                  width: refImageSize.w,
+                  height: refImageSize.h,
+                  background: null,
+                  meshColor: '#dddddd',
+                  ...(useAuto
+                    ? { fitToImageBBox: fitBBox! }
+                    : {
+                        scale: orthoScale,
+                        offsetX: orthoOffsetX,
+                        offsetY: orthoOffsetY,
+                      }),
+                },
+              );
+              setOrthoRenderUrl((prev) => {
+                if (prev) URL.revokeObjectURL(prev);
+                return rendered.dataUrl;
+              });
+              setOrthoCamera(rendered.camera);
+              camera = rendered.camera;
+            }
+
+            const mask = await loadMaskGray(maskImageUrl);
+            if (mask) {
+              const reproj = reprojectMaskToVertices(
+                tarMesh.vertices,
+                mask,
+                segPack.regions,
+                camera,
+                { projectionMode: 'through', splatRadiusPx: 1, maskDilatePx: 2 },
+              );
+              setMaskReproj(reproj);
+              workingMaskReproj = reproj;
+              const set = reproj.regions.get(selectedTargetRegionLabel);
+              if (set && set.size > 0) {
+                workingTarRegion = buildTarRegionFromSet(set);
+                if (workingTarRegion) {
+                  setTarRegion(workingTarRegion);
+                  setTarRegionLabel(selectedTargetRegionLabel);
+                }
+              }
+            }
+          }
+        }
+
+        if (!workingTarRegion) {
+          onStatusChange(
+            `目标区域 "${selectedTargetRegionLabel}" 没有可用顶点，已停止自动对齐以避免误匹配到身体。请检查 mask / 反投影结果。`,
+            'error',
+          );
+          setPartialLoading(false);
+          setAligning(false);
+          return;
+        }
 
         // 1. Partial match
         const pm = matchPartialToWhole(
@@ -1172,11 +1388,11 @@ export function ModelAssemble({ onStatusChange }: Props) {
             iterations: partialIterations,
             inlierThreshold: partialThresholdPct / 100,
             descriptor: partialDescriptor,
-            tarSeedCentroid: tarRegion?.centroid,
-            tarSeedRadius: tarRegion?.boundingRadius,
-            tarSeedWeight: tarRegion ? partialSeedWeight : 0,
-            tarConstraintVertices: tarRegion?.vertices,
-            tarConstraintUseSaliency: Boolean(tarRegion?.vertices?.size),
+            tarSeedCentroid: workingTarRegion?.centroid,
+            tarSeedRadius: workingTarRegion?.boundingRadius,
+            tarSeedWeight: workingTarRegion ? partialSeedWeight : 0,
+            tarConstraintVertices: workingTarRegion?.vertices,
+            tarConstraintUseSaliency: Boolean(workingTarRegion?.vertices?.size),
             axialWeight: partialAxialWeight,
           },
         );
@@ -1281,6 +1497,14 @@ export function ModelAssemble({ onStatusChange }: Props) {
         setResultViewMode('overlay');
 
         const dt = performance.now() - t0;
+        setAutoAlignSummary({
+          regionLabel: workingTarRegion ? selectedTargetRegionLabel || null : null,
+          pairs: pm.pairs.length,
+          rmse: finalRmse,
+          scale: sx,
+          method: useIcp ? 'ICP' : 'SVD',
+          elapsedMs: dt,
+        });
         const icpSummary = useIcp
           ? `ICP 收敛于 ${icp.iterations.length} 轮 (${icp.stopReason}, best#${icp.bestIteration + 1})`
           : `ICP 未改善 (lmFit RMSE=${lmFit.rmse.toFixed(4)} ≤ ICP=${icp.rmse.toFixed(4)})`;
@@ -1312,6 +1536,19 @@ export function ModelAssemble({ onStatusChange }: Props) {
     partialSeedWeight,
     partialAxialWeight,
     tarRegion,
+    tarRegionLabel,
+    selectedTargetRegionLabel,
+    maskReproj,
+    segPack,
+    maskImageUrl,
+    refImageSize,
+    orthoCamera,
+    autoFit,
+    fitBBox,
+    orthoScale,
+    orthoOffsetX,
+    orthoOffsetY,
+    buildTarRegionFromSet,
     onStatusChange,
   ]);
 
@@ -1331,6 +1568,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
     });
     
     setAlignResult(null);
+    setAutoAlignSummary(null);
     setSelectedSrcIndex(null);
     setCenterViewMode('landmark');
     onStatusChange('已将对齐结果应用到 Source 模型与 Source landmarks', 'success');
@@ -1358,10 +1596,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
       clearAllLandmarks();
       setAlignResult(null);
       setResultPreview(null);
+      setAutoAlignSummary(null);
       setSelectedSrcIndex(null);
       setSelectedTarIndex(null);
       setSrcRegion(null);
       setTarRegion(null);
+      setTarRegionLabel(null);
       setCandidates([]);
       setAcceptedCandidateIds(new Set());
       setCenterViewMode('landmark');
@@ -1377,10 +1617,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
       clearAllLandmarks();
       setAlignResult(null);
       setResultPreview(null);
+      setAutoAlignSummary(null);
       setSelectedSrcIndex(null);
       setSelectedTarIndex(null);
       setSrcRegion(null);
       setTarRegion(null);
+      setTarRegionLabel(null);
       setCandidates([]);
       setAcceptedCandidateIds(new Set());
       onStatusChange(
@@ -1458,7 +1700,131 @@ export function ModelAssemble({ onStatusChange }: Props) {
           </div>
         </PanelSection>
 
-        <PanelSection title="2D 定位 (SAM3 验证)">
+        <PanelSection title="自动对齐流程">
+          <div style={{ fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.6, marginBottom: 8 }}>
+            <div>Source 部件：<b>{srcMesh.name}</b></div>
+            <div>Target 模型：<b>{tarMesh.name}</b></div>
+          </div>
+
+          <div
+            style={{
+              padding: 8,
+              border: '1px solid var(--border-default)',
+              borderRadius: 3,
+              background: 'var(--bg-app)',
+              fontSize: 11,
+              color: 'var(--text-secondary)',
+              lineHeight: 1.6,
+              marginBottom: 8,
+            }}
+          >
+            <div style={{ color: segPack ? '#7fd97f' : 'var(--text-muted)', fontWeight: 600 }}>
+              SAM3 分割包：{segPack ? '已加载' : '未加载'}
+            </div>
+            {segPack ? (
+              <>
+                <div>参考图：{refImageName ?? segPack.imageName}</div>
+                <div>Mask：{maskImageName ?? segPack.maskName}</div>
+                <div>检测到区域：{regionLabels.join(' / ')}</div>
+              </>
+            ) : (
+              <div>请选择包含 segmentation.json、参考图和 mask 的目录。</div>
+            )}
+          </div>
+
+          <Button
+            size="sm"
+            onClick={() => segPackDirInputRef.current?.click()}
+            style={{ width: '100%', justifyContent: 'center', marginBottom: 8 }}
+            title="选择 SAM3 分割包目录，自动读取 segmentation.json、参考图和 mask"
+          >
+            加载 SAM3 分割包目录
+          </Button>
+
+          <input
+            ref={segPackDirInputRef}
+            type="file"
+            multiple
+            style={{ display: 'none' }}
+            onChange={onSegPackDirChange}
+            {...{ webkitdirectory: '', directory: '' }}
+          />
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>目标区域</div>
+          <select
+            value={selectedTargetRegionLabel}
+            onChange={(e) => {
+              const label = e.target.value;
+              setSelectedTargetRegionLabel(label);
+              setTarRegion(null);
+              setTarRegionLabel(null);
+              if (maskReproj && label) handleAdoptRegionAsTarSeed(label);
+            }}
+            disabled={regionLabels.length === 0}
+            style={{
+              width: '100%',
+              marginBottom: 6,
+              background: 'var(--bg-app)',
+              color: 'var(--text-primary)',
+              border: '1px solid var(--border-default)',
+              borderRadius: 3,
+              padding: '4px 6px',
+              fontSize: 11,
+            }}
+          >
+            {regionLabels.length === 0 && <option value="">未检测到区域</option>}
+            {regionLabels.map((label) => (
+              <option key={label} value={label}>{label}</option>
+            ))}
+          </select>
+          {recommendedRegionLabel && (
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8 }}>
+              系统推荐：{recommendedRegionLabel}，置信度：高（可修改）
+            </div>
+          )}
+
+          <Button
+            size="md"
+            variant="primary"
+            onClick={handleAutoAlign}
+            loading={partialLoading || aligning}
+            disabled={partialLoading || aligning || srcMesh.vertices.length === 0 || tarMesh.vertices.length === 0}
+            style={{ width: '100%', justifyContent: 'center', marginBottom: 8 }}
+            title="自动执行正视图渲染、mask 反投影、部分匹配、SVD/ICP 比较，并把结果应用到预览层"
+          >
+            {(partialLoading || aligning) ? '自动对齐中…' : '自动对齐到目标区域'}
+          </Button>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+            <Button
+              size="sm"
+              onClick={handleApplyAlignedTransform}
+              disabled={!alignResult}
+              style={{ justifyContent: 'center' }}
+            >
+              接受对齐
+            </Button>
+            <Button
+              size="sm"
+              onClick={resetPreview}
+              disabled={!alignResult && !resultPreview}
+              style={{ justifyContent: 'center' }}
+            >
+              撤销预览
+            </Button>
+          </div>
+
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => setShowAdvanced((v) => !v)}
+            style={{ width: '100%', justifyContent: 'center', marginTop: 8 }}
+          >
+            {showAdvanced ? '隐藏高级参数' : '显示高级参数'}
+          </Button>
+        </PanelSection>
+
+        {showAdvanced && <PanelSection title="2D 定位 (SAM3 验证)" defaultCollapsed>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
             用一张参考图（概念图 / Bot.png）+ SAM3 mask，对照 Target 的正交正视渲染图，
             肉眼判断标准虚拟相机是否对齐。三层叠加：参考图 / mask / 正视渲染。
@@ -1780,7 +2146,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           <div style={{ marginTop: 8, fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.5 }}>
             约定：相机沿 +X 看向 -X，up=+Y，画面右映射到世界 -Z（角色左侧）。
           </div>
-        </PanelSection>
+        </PanelSection>}
 
         <PanelSection title="Mesh Gallery (Page2 Highres)" defaultCollapsed>
           <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
@@ -1855,7 +2221,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           </div>
         </PanelSection>
 
-        <PanelSection title="对齐模式" defaultCollapsed>
+        {showAdvanced && <PanelSection title="对齐模式" defaultCollapsed>
           <div style={{ display: 'flex', gap: 6 }}>
             <Button
               size="sm"
@@ -1879,9 +2245,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
               ? 'Similarity: 旋转 + 平移 + 统一缩放'
               : 'Rigid: 仅旋转 + 平移'}
           </div>
-        </PanelSection>
+        </PanelSection>}
 
-        <PanelSection title="部分匹配 (Partial → Whole)">
+        {showAdvanced && <PanelSection title="部分匹配 (Partial → Whole)" defaultCollapsed>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
             适用于 Source 是部件、Target 是包含该部件的整体（如：手臂 → 完整角色）。
             <br />
@@ -2062,9 +2428,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
           >
             {partialLoading ? '计算中…' : '调试快照（看选点）'}
           </Button>
-        </PanelSection>
+        </PanelSection>}
 
-        {partialDebug && (
+        {showAdvanced && partialDebug && (
           <PanelSection title="调试可视化">
             <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
               暗色 = saliency 池；亮色 = FPS 采样；品红 = top-K 候选集合（target 端）。
@@ -2125,7 +2491,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           </PanelSection>
         )}
 
-        <PanelSection title="候选匹配 (Phase 2)">
+        {showAdvanced && <PanelSection title="候选匹配 (Phase 2)" defaultCollapsed>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6, lineHeight: 1.5 }}>
             partial-match 找到的 source ↔ target 顶点对都会出现在这里，
             可以单独审阅、接受或拒绝；接受后会写入 Landmark Pairs。
@@ -2223,9 +2589,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
               );
             })}
           </div>
-        </PanelSection>
+        </PanelSection>}
 
-        <PanelSection title="全网格查找 (Global)" defaultCollapsed>
+        {showAdvanced && <PanelSection title="全网格查找 (Global)" defaultCollapsed>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
             适用于 Source 与 Target 形态相近、但拓扑/transform 不同的情况。
             从整个网格上挑显著点 → 空间 FPS 散开 → 多尺度曲率配对。
@@ -2350,7 +2716,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           >
             RANSAC 精修当前候选
           </Button>
-        </PanelSection>
+        </PanelSection>}
       </aside>
 
       <main
@@ -2454,7 +2820,61 @@ export function ModelAssemble({ onStatusChange }: Props) {
           overflow: 'auto',
         }}
       >
-        <PanelSection title="Landmark 显示">
+        <PanelSection title="结果质量">
+          {autoAlignSummary ? (() => {
+            const q = qualityLabel(autoAlignSummary);
+            return (
+              <div
+                style={{
+                  padding: 8,
+                  borderRadius: 3,
+                  border: `1px solid ${q.color}`,
+                  background: 'var(--bg-app)',
+                  fontSize: 11,
+                  color: 'var(--text-primary)',
+                  lineHeight: 1.7,
+                }}
+              >
+                <div style={{ color: q.color, fontWeight: 700 }}>对齐质量：{q.label}</div>
+                <div>目标区域：{autoAlignSummary.regionLabel ?? '(未指定)'}</div>
+                <div>匹配点：{autoAlignSummary.pairs}</div>
+                <div>RMSE：{autoAlignSummary.rmse.toFixed(3)}</div>
+                <div>Scale：{autoAlignSummary.scale.toFixed(3)}</div>
+                <div>最终方法：{autoAlignSummary.method}</div>
+                <div>耗时：{(autoAlignSummary.elapsedMs / 1000).toFixed(1)}s</div>
+              </div>
+            );
+          })() : (
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+              点击“自动对齐到目标区域”后，这里会显示匹配点、RMSE、scale 和质量评级。
+            </div>
+          )}
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginTop: 8 }}>
+            <Button size="sm" variant="primary" onClick={handleApplyAlignedTransform} disabled={!alignResult} style={{ justifyContent: 'center' }}>
+              接受对齐
+            </Button>
+            <Button size="sm" onClick={resetPreview} disabled={!alignResult && !resultPreview} style={{ justifyContent: 'center' }}>
+              撤销
+            </Button>
+            <Button size="sm" onClick={handleAutoAlign} loading={partialLoading || aligning} disabled={partialLoading || aligning} style={{ justifyContent: 'center' }}>
+              重新匹配
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => {
+                setCenterViewMode('result');
+                setResultViewMode('overlay');
+              }}
+              disabled={!resultPreview}
+              style={{ justifyContent: 'center' }}
+            >
+              查看结果
+            </Button>
+          </div>
+        </PanelSection>
+
+        {showAdvanced && <PanelSection title="Landmark 显示">
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>
             <span style={{ whiteSpace: 'nowrap' }}>大小</span>
             <input
@@ -2468,9 +2888,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
             />
             <span style={{ width: 36, textAlign: 'right' }}>{landmarkSize.toFixed(3)}</span>
           </div>
-        </PanelSection>
+        </PanelSection>}
 
-        <PanelSection title="Landmark Pairs">
+        {showAdvanced && <PanelSection title="Landmark Pairs" defaultCollapsed>
           <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8 }}>
             Source 与 Target 按添加顺序一一配对。按住 Ctrl 在对应网格上左键点击可新增。
           </div>
@@ -2520,9 +2940,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
               清空 Target
             </Button>
           </div>
-        </PanelSection>
+        </PanelSection>}
 
-        <PanelSection title="Align Tools">
+        {showAdvanced && <PanelSection title="Align Tools" defaultCollapsed>
           <div style={{ fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
             模式: {alignmentMode === 'similarity' ? 'Similarity' : 'Rigid'}
             <br />
@@ -2572,7 +2992,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
               {alignResult.mode === 'similarity' && <div>Scale: {alignResult.scale.toFixed(5)}</div>}
             </div>
           )}
-        </PanelSection>
+        </PanelSection>}
 
         {resultPreview && (
           <PanelSection title="Result View">
