@@ -79,6 +79,19 @@ interface AutoAlignSummary {
   elapsedMs: number;
 }
 
+interface PartialMatchSummary {
+  status: 'success' | 'failed';
+  pairs: number;
+  bestInlierCount: number;
+  rawSrcSamples: number;
+  rawTarSamples: number;
+  topK: number;
+  iterationsRun: number;
+  thresholdUsed: number;
+  rmse: number;
+  elapsedMs: number;
+}
+
 interface AlignTraceEntry {
   time: string;
   stage: string;
@@ -312,6 +325,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [sourceGalleryBinding, setSourceGalleryBinding] = useState<SourceGalleryBinding | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [autoAlignSummary, setAutoAlignSummary] = useState<AutoAlignSummary | null>(null);
+  const [partialMatchSummary, setPartialMatchSummary] = useState<PartialMatchSummary | null>(null);
   const [alignmentTrace, setAlignmentTrace] = useState<AlignTraceEntry[]>([]);
 
   const appendAlignmentTrace = useCallback((stage: string, data: Record<string, unknown> = {}) => {
@@ -470,6 +484,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const clearCandidates = useCallback(() => {
     setCandidates([]);
     setAcceptedCandidateIds(new Set());
+    setPartialMatchSummary(null);
   }, []);
 
   const handleAcceptCandidate = useCallback(
@@ -602,6 +617,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
       onStatusChange('Source/Target 尚未加载', 'warning');
       return;
     }
+    setPartialMatchSummary(null);
     setPartialLoading(true);
     // Defer to next frame so React can render the loading state first
     setTimeout(() => {
@@ -646,8 +662,20 @@ export function ModelAssemble({ onStatusChange }: Props) {
     if (!r.matrix4x4 || r.pairs.length < 3) {
       setCandidates([]);
       setAcceptedCandidateIds(new Set());
+      setPartialMatchSummary({
+        status: 'failed',
+        pairs: r.pairs.length,
+        bestInlierCount: r.bestInlierCount,
+        rawSrcSamples: r.rawSrcSamples,
+        rawTarSamples: r.rawTarSamples,
+        topK: partialTopK,
+        iterationsRun: r.iterationsRun,
+        thresholdUsed: r.thresholdUsed,
+        rmse: r.rmse,
+        elapsedMs: dt,
+      });
       onStatusChange(
-        `部分匹配失败：inliers=${r.bestInlierCount}（threshold=${(partialThresholdPct).toFixed(1)}% src bbox）` +
+        `Step 1 失败：RANSAC inliers=${r.bestInlierCount}（threshold=${(partialThresholdPct).toFixed(1)}% src bbox）` +
           ` — 试着加大 topK / 迭代数 / threshold`,
         'error',
       );
@@ -656,6 +684,18 @@ export function ModelAssemble({ onStatusChange }: Props) {
     }
     setCandidates(r.pairs);
     setAcceptedCandidateIds(new Set());
+    setPartialMatchSummary({
+      status: 'success',
+      pairs: r.pairs.length,
+      bestInlierCount: r.bestInlierCount,
+      rawSrcSamples: r.rawSrcSamples,
+      rawTarSamples: r.rawTarSamples,
+      topK: partialTopK,
+      iterationsRun: r.iterationsRun,
+      thresholdUsed: r.thresholdUsed,
+      rmse: r.rmse,
+      elapsedMs: dt,
+    });
     appendAlignmentTrace('manual-partial-result', {
       pairs: r.pairs.length,
       rmse: round3(r.rmse),
@@ -667,7 +707,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
       elapsedMs: round3(dt),
     });
     onStatusChange(
-      `部分匹配：${r.pairs.length} 对（RMSE=${r.rmse.toFixed(4)} src 单位） — ${dt.toFixed(1)}ms`,
+      `Step 1 完成：RANSAC inliers=${r.bestInlierCount}，输出 ${r.pairs.length} 对候选，RMSE=${r.rmse.toFixed(4)}，threshold=${r.thresholdUsed.toFixed(4)} — ${dt.toFixed(1)}ms`,
       'success',
     );
     setPartialLoading(false);
@@ -716,9 +756,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
     const dt = performance.now() - t0;
     setPartialDebug(dbg);
     onStatusChange(
-      `调试快照: 显著池 src=${dbg.srcSaliencyTop.length} tar=${dbg.tarSaliencyTop.length}` +
+      `采样诊断完成：Saliency src=${dbg.srcSaliencyTop.length} tar=${dbg.tarSaliencyTop.length}` +
         ` | FPS src=${dbg.srcFPS.length} tar=${dbg.tarFPS.length}` +
-        ` | 平均最佳 top-1 距离=${dbg.avgBestDist.toFixed(4)} — ${dt.toFixed(1)}ms`,
+        ` | Top-K=${partialTopK} | 平均最佳 top-1 距离=${dbg.avgBestDist.toFixed(4)} — ${dt.toFixed(1)}ms。该结果仅用于可视化，不会进入 Step 2。`,
       'info',
     );
     setPartialLoading(false);
@@ -1311,6 +1351,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
   useEffect(() => {
     setCandidates([]);
     setAcceptedCandidateIds(new Set());
+    setPartialMatchSummary(null);
   }, [srcRegion, tarRegion]);
 
   const pairCount = Math.min(srcLandmarks.length, tarLandmarks.length);
@@ -2100,12 +2141,10 @@ export function ModelAssemble({ onStatusChange }: Props) {
         );
 
         // 3. ICP refine starting from the SVD initial transform.
-        //    Note: we intentionally do NOT pass tarRestrictVertices
-        //    here. The SAM3-reprojected region is already used as a
-        //    soft seed inside partial-match (tarSeedCentroid +
-        //    tarConstraintVertices); hard-restricting NN to that
-        //    region during ICP causes scale collapse and biased fits
-        //    when the region has holes or the source is partial.
+        //    Mirror the manual Step 3 path: once SAM3 has localized the
+        //    target part, nearest-neighbor search should stay inside that
+        //    region. Otherwise a partial source can be pulled toward the
+        //    closest unrelated body surface.
         const icp = icpRefine(srcMesh.vertices, tarMesh.vertices, lmFit.matrix4x4, {
           maxIterations: icpMaxIterations,
           sampleCount: icpSampleCount,
@@ -2114,15 +2153,14 @@ export function ModelAssemble({ onStatusChange }: Props) {
           firstIterMode: ALIGNMENT_MODE,
           subsequentMode: ALIGNMENT_MODE,
           seed: runSeed,
+          tarRestrictVertices: workingTarRegion?.vertices,
         });
 
-        // Pick the best of {SVD-only, ICP-best} using a COMMON metric
-        // — RMSE on the partial-match landmark pairs under each
-        // transform.  We can't compare `lmFit.rmse` to `icp.rmse`
-        // directly: lmFit's RMSE is on ~30 landmark pairs while
-        // icp.rmse is on its sampled inlier subset (different point
-        // sets, different counts).  Re-evaluating both transforms on
-        // the landmark pairs gives an apples-to-apples comparison.
+        // Landmark RMSE and ICP RMSE measure different goals.  SVD
+        // optimizes the sparse RANSAC landmark pairs; ICP optimizes dense
+        // surface fit inside the target region.  Manual testing shows ICP
+        // can visibly improve alignment while increasing landmark RMSE, so
+        // do not reject ICP just because sparse landmark RMSE is higher.
         const evalRmseOnLandmarks = (m: number[][]): number => {
           let s = 0;
           for (const p of pm.pairs) {
@@ -2136,9 +2174,14 @@ export function ModelAssemble({ onStatusChange }: Props) {
         };
         const lmFitLandmarkRmse = evalRmseOnLandmarks(lmFit.matrix4x4);
         const icpLandmarkRmse = evalRmseOnLandmarks(icp.matrix4x4);
-        const useIcp = icpLandmarkRmse < lmFitLandmarkRmse;
+        const bestIcpIter = icp.iterations[icp.bestIteration];
+        const minIcpPairsKept = Math.min(30, Math.max(6, Math.floor(icpSampleCount * 0.1)));
+        const useIcp = Number.isFinite(icp.rmse)
+          && icp.iterations.length > 0
+          && !!bestIcpIter
+          && bestIcpIter.pairsKept >= minIcpPairsKept;
         const finalMatrix = useIcp ? icp.matrix4x4 : lmFit.matrix4x4;
-        const finalRmse = useIcp ? icpLandmarkRmse : lmFitLandmarkRmse;
+        const finalRmse = useIcp ? icp.rmse : lmFitLandmarkRmse;
         appendAlignmentTrace('auto-fit-compare', {
           lmFit: {
             rmse: round3(lmFit.rmse),
@@ -2156,9 +2199,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
               convergenceImprovement: icpConvergenceImprovement,
               firstIterMode: ALIGNMENT_MODE,
               subsequentMode: ALIGNMENT_MODE,
+              tarRestrictVertices: workingTarRegion?.vertices.size ?? 0,
+              minPairsKept: minIcpPairsKept,
             },
             iterations: icp.iterations.length,
             bestIteration: icp.bestIteration + 1,
+            bestPairsKept: bestIcpIter?.pairsKept ?? 0,
             stopReason: icp.stopReason,
             matrix: summarizeMatrix(icp.matrix4x4),
           },
@@ -2232,8 +2278,8 @@ export function ModelAssemble({ onStatusChange }: Props) {
           elapsedMs: dt,
         });
         const icpSummary = useIcp
-          ? `ICP 收敛于 ${icp.iterations.length} 轮 (${icp.stopReason}, best#${icp.bestIteration + 1})`
-          : `ICP 未改善 (landmark RMSE SVD=${lmFitLandmarkRmse.toFixed(4)} ≤ ICP=${icpLandmarkRmse.toFixed(4)})`;
+          ? `ICP 已采用：surface RMSE=${icp.rmse.toFixed(4)}，kept=${bestIcpIter?.pairsKept ?? 0}，${icp.iterations.length} 轮 (${icp.stopReason}, best#${icp.bestIteration + 1})`
+          : `ICP 未采用：kept=${bestIcpIter?.pairsKept ?? 0} < ${minIcpPairsKept} 或 RMSE 无效`;
         onStatusChange(
           `自动对齐完成 · partial=${pm.pairs.length} 对 · ${icpSummary} · 最终 RMSE=${finalRmse.toFixed(4)} · ${dt.toFixed(0)}ms`,
           'success',
@@ -3201,8 +3247,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
             loading={partialLoading}
             disabled={partialLoading}
             style={{ width: '100%', justifyContent: 'center' }}
+            title="执行完整 partial-match：采样、descriptor top-K、RANSAC 筛选，并生成供 Step 2 使用的候选对应点"
           >
-            {partialLoading ? '计算中…' : 'Step 1 · Partial-match 查找候选'}
+            {partialLoading ? '计算中…' : 'Step 1 · RANSAC 生成候选对'}
           </Button>
           <Button
             size="sm"
@@ -3210,10 +3257,46 @@ export function ModelAssemble({ onStatusChange }: Props) {
             loading={partialLoading}
             disabled={partialLoading}
             style={{ width: '100%', justifyContent: 'center', marginTop: 6 }}
-            title="只跑前几步（saliency + FPS + top-K），不跑 RANSAC，方便看选点情况"
+            title="仅用于调参诊断：预览 Saliency、FPS 和 Top-K 候选，不生成候选对，不进入 Step 2"
           >
-            {partialLoading ? '计算中…' : '调试快照（看选点）'}
+            {partialLoading ? '计算中…' : '诊断：预览采样点 / Top-K'}
           </Button>
+
+          {partialMatchSummary && (
+            <div
+              style={{
+                marginTop: 8,
+                padding: 8,
+                background: 'var(--bg-app)',
+                border: '1px solid var(--border-default)',
+                borderRadius: 3,
+                fontSize: 10,
+                color: 'var(--text-secondary)',
+                lineHeight: 1.5,
+              }}
+            >
+              <div
+                style={{
+                  fontWeight: 600,
+                  color: partialMatchSummary.status === 'success' ? '#7fd97f' : '#e08a8a',
+                  marginBottom: 4,
+                }}
+              >
+                RANSAC 结果：{partialMatchSummary.status === 'success' ? '成功' : '失败'}
+              </div>
+              <div>Source samples：{partialMatchSummary.rawSrcSamples}</div>
+              <div>Target samples：{partialMatchSummary.rawTarSamples}</div>
+              <div>Top-K：{partialMatchSummary.topK}</div>
+              <div>Iterations：{partialMatchSummary.iterationsRun}</div>
+              <div>Best inliers：{partialMatchSummary.bestInlierCount}</div>
+              <div>Final pairs：{partialMatchSummary.pairs}</div>
+              <div>Threshold：{partialMatchSummary.thresholdUsed.toFixed(4)}</div>
+              <div>
+                RMSE：{Number.isFinite(partialMatchSummary.rmse) ? partialMatchSummary.rmse.toFixed(4) : '∞'}
+              </div>
+              <div>耗时：{partialMatchSummary.elapsedMs.toFixed(1)}ms</div>
+            </div>
+          )}
         </PanelSection>}
 
         {showAdvanced && partialDebug && (
@@ -3277,10 +3360,10 @@ export function ModelAssemble({ onStatusChange }: Props) {
           </PanelSection>
         )}
 
-        {showAdvanced && <PanelSection title="候选匹配 (Phase 2)" defaultCollapsed>
+        {showAdvanced && <PanelSection title="RANSAC 候选对" defaultCollapsed>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6, lineHeight: 1.5 }}>
-            partial-match 找到的 source ↔ target 顶点对都会出现在这里，
-            可以单独审阅、接受或拒绝；接受后会写入 Landmark Pairs。
+            这里显示 Step 1 RANSAC 筛选后的 source ↔ target 对应点，
+            可以单独审阅、接受或拒绝；接受后用于 Step 2 Landmark SVD。
           </div>
 
           <div style={{ display: 'flex', gap: 6 }}>
@@ -3308,7 +3391,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
             {candidates.length === 0 && (
               <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-                运行 “一键自动对齐” 或 “部分匹配查找” 后，候选对会出现在这里。
+                运行 “一键自动对齐” 或 “Step 1 · RANSAC 生成候选对” 后，候选对会出现在这里。
               </div>
             )}
             {candidates.map((c, i) => {
@@ -3779,7 +3862,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           </div>
         </PanelSection>}
 
-        {showAdvanced && <PanelSection title="Landmark SVD / ICP 手动对齐" defaultCollapsed>
+        {showAdvanced && <PanelSection title="Step 2/3 · Landmark SVD / ICP 手动对齐">
           <div style={{ fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
             模式固定为 Similarity（旋转 + 平移 + 统一缩放）。
             <br />
