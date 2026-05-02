@@ -555,6 +555,8 @@ export async function loadLatestSegmentSet(
 
 /** 单条 Pipeline 的可持久化字段（存到 page2_highres/pipelines.json） */
 export interface PersistedPipeline {
+  /** Pipeline 稳定 ID（用于跨页面同步当前输出；旧工程可能缺失） */
+  id?: string;
   /** Pipeline 名称（用户可编辑） */
   name: string;
   /** 源图片模式：'extraction' = General Extract（SAM3），'multiview' = Jacket Extract（Banana+RMBG） */

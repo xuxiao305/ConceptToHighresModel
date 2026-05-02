@@ -205,6 +205,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     async (pipelines: PersistedPipeline[]) => {
       if (!project) return;
       await savePipelines(project, pipelines);
+      window.dispatchEvent(new CustomEvent('page2:pipelines-updated'));
     },
     [project],
   );

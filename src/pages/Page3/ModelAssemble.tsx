@@ -41,7 +41,7 @@ import {
   type AlignmentResult,
   applyTransform,
 } from '../../three/alignment';
-import type { AssetVersion } from '../../services/projectStore';
+import type { AssetVersion, PersistedPipeline } from '../../services/projectStore';
 
 interface Props {
   onStatusChange: (msg: string, status?: 'info' | 'success' | 'warning' | 'error') => void;
@@ -76,6 +76,86 @@ interface AutoAlignSummary {
   scale: number;
   method: 'SVD' | 'ICP';
   elapsedMs: number;
+}
+
+interface AlignTraceEntry {
+  time: string;
+  stage: string;
+  data: Record<string, unknown>;
+}
+
+interface HighresGalleryItem extends AssetVersion {
+  id: string;
+  pipelineKey: string;
+  pipelineIndex: number;
+  pipelineName: string;
+  pipelineMode: PersistedPipeline['mode'];
+}
+
+interface SourceGalleryBinding {
+  pipelineKey: string;
+  pipelineIndex: number;
+  pipelineName: string;
+  pipelineMode: PersistedPipeline['mode'];
+  file: string;
+}
+
+const TRACE_LIMIT = 200;
+
+function round3(v: number): number {
+  return Math.round(v * 1000) / 1000;
+}
+
+function roundVec(v: Vec3 | undefined): Vec3 | null {
+  return v ? [round3(v[0]), round3(v[1]), round3(v[2])] : null;
+}
+
+function summarizeCamera(camera: OrthoFrontCamera | null): Record<string, unknown> | null {
+  if (!camera) return null;
+  return {
+    width: camera.width,
+    height: camera.height,
+    camY: round3(camera.camY),
+    camZ: round3(camera.camZ),
+    worldPerPx: round3(camera.worldPerPx),
+    meshFrontX: round3(camera.meshFrontX),
+  };
+}
+
+function summarizeRegion(region: MeshRegion | null): Record<string, unknown> | null {
+  if (!region) return null;
+  return {
+    seedVertex: region.seedVertex,
+    vertices: region.vertices.size,
+    centroid: roundVec(region.centroid),
+    boundingRadius: round3(region.boundingRadius),
+  };
+}
+
+function summarizeMaskReprojection(result: MaskReprojectionResult | null): Record<string, unknown> | null {
+  if (!result) return null;
+  return {
+    regions: Array.from(result.regions.entries()).map(([label, set]) => ({
+      label,
+      vertices: set.size,
+      pixelHits: result.perRegionPixelHits.get(label) ?? 0,
+    })),
+    unassignedPixels: result.unassignedPixels,
+  };
+}
+
+function summarizePairs(pairs: LandmarkCandidate[], max = 12): Array<Record<string, unknown>> {
+  return pairs.slice(0, max).map((p, i) => ({
+    i: i + 1,
+    srcVertex: p.srcVertex,
+    tarVertex: p.tarVertex,
+    confidence: round3(p.confidence),
+    descriptorDist: round3(p.descriptorDist),
+  }));
+}
+
+function summarizeMatrix(m: number[][]): number[][] {
+  return m.map((row) => row.map(round3));
 }
 
 function qualityLabel(summary: AutoAlignSummary): { label: string; color: string } {
@@ -128,6 +208,10 @@ const DEMO_SOURCE: MeshData = {
   ],
 };
 
+function makeRandomAlignSeed(): number {
+  return Math.floor(Math.random() * 0x7fffffff);
+}
+
 function makeDemoTarget(source: MeshData): MeshData {
   const angleY = Math.PI * 0.28;
   const c = Math.cos(angleY);
@@ -151,7 +235,7 @@ function makeDemoTarget(source: MeshData): MeshData {
 }
 
 export function ModelAssemble({ onStatusChange }: Props) {
-  const { project, listHistory, loadByName } = useProject();
+  const { project, listHistory, loadByName, loadPipelines } = useProject();
   const demoTarget = useMemo(() => makeDemoTarget(DEMO_SOURCE), []);
 
   const [srcMesh, setSrcMesh] = useState<MeshData>(DEMO_SOURCE);
@@ -166,12 +250,33 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [resultPreview, setResultPreview] = useState<ResultPreview | null>(null);
   const [selectedSrcIndex, setSelectedSrcIndex] = useState<number | null>(null);
   const [selectedTarIndex, setSelectedTarIndex] = useState<number | null>(null);
-  const [highresHistory, setHighresHistory] = useState<AssetVersion[]>([]);
+  const [highresHistory, setHighresHistory] = useState<HighresGalleryItem[]>([]);
   const [galleryLoading, setGalleryLoading] = useState(false);
-  const [selectedGalleryFile, setSelectedGalleryFile] = useState<string | null>(null);
+  const [selectedGalleryId, setSelectedGalleryId] = useState<string | null>(null);
   const [selectedGalleryPreviewUrl, setSelectedGalleryPreviewUrl] = useState<string | null>(null);
+  const [sourceGalleryBinding, setSourceGalleryBinding] = useState<SourceGalleryBinding | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [autoAlignSummary, setAutoAlignSummary] = useState<AutoAlignSummary | null>(null);
+  const [alignmentTrace, setAlignmentTrace] = useState<AlignTraceEntry[]>([]);
+
+  const appendAlignmentTrace = useCallback((stage: string, data: Record<string, unknown> = {}) => {
+    const entry: AlignTraceEntry = {
+      time: new Date().toISOString().slice(11, 23),
+      stage,
+      data,
+    };
+    console.info('[Page3Align]', stage, data);
+    setAlignmentTrace((prev) => {
+      const next = [...prev, entry].slice(-TRACE_LIMIT);
+      (window as unknown as { __PAGE3_ALIGN_TRACE__?: AlignTraceEntry[] }).__PAGE3_ALIGN_TRACE__ = next;
+      return next;
+    });
+  }, []);
+
+  const clearAlignmentTrace = useCallback(() => {
+    setAlignmentTrace([]);
+    (window as unknown as { __PAGE3_ALIGN_TRACE__?: AlignTraceEntry[] }).__PAGE3_ALIGN_TRACE__ = [];
+  }, []);
 
   // ── Phase 1 region-grow state ─────────────────────────────────────────
   // NOTE: the manual seed-mode UI was removed in favour of SAM3 mask
@@ -439,6 +544,23 @@ export function ModelAssemble({ onStatusChange }: Props) {
     // Defer to next frame so React can render the loading state first
     setTimeout(() => {
     const t0 = performance.now();
+    const runSeed = makeRandomAlignSeed();
+    appendAlignmentTrace('manual-partial-start', {
+      source: { name: srcMesh.name, vertices: srcMesh.vertices.length, faces: srcMesh.faces.length },
+      target: { name: tarMesh.name, vertices: tarMesh.vertices.length, faces: tarMesh.faces.length },
+      params: {
+        numSrcSamples: partialSrcSamples,
+        numTarSamples: partialTarSamples,
+        topK: partialTopK,
+        iterations: partialIterations,
+        inlierThreshold: partialThresholdPct / 100,
+        descriptor: partialDescriptor,
+        tarSeedWeight: tarRegion ? partialSeedWeight : 0,
+        axialWeight: partialAxialWeight,
+        seed: runSeed,
+      },
+      targetRegion: summarizeRegion(tarRegion),
+    });
     const r = matchPartialToWhole(
       { vertices: srcMesh.vertices, adjacency: srcAdjacency },
       { vertices: tarMesh.vertices, adjacency: tarAdjacency },
@@ -455,6 +577,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         tarConstraintVertices: tarRegion?.vertices,
         tarConstraintUseSaliency: Boolean(tarRegion?.vertices?.size),
         axialWeight: partialAxialWeight,
+        seed: runSeed,
       },
     );
     const dt = performance.now() - t0;
@@ -471,6 +594,16 @@ export function ModelAssemble({ onStatusChange }: Props) {
     }
     setCandidates(r.pairs);
     setAcceptedCandidateIds(new Set());
+    appendAlignmentTrace('manual-partial-result', {
+      pairs: r.pairs.length,
+      rmse: round3(r.rmse),
+      bestInlierCount: r.bestInlierCount,
+      rawSrcSamples: r.rawSrcSamples,
+      rawTarSamples: r.rawTarSamples,
+      thresholdUsed: round3(r.thresholdUsed),
+      firstPairs: summarizePairs(r.pairs),
+      elapsedMs: round3(dt),
+    });
     onStatusChange(
       `部分匹配：${r.pairs.length} 对（RMSE=${r.rmse.toFixed(4)} src 单位） — ${dt.toFixed(1)}ms`,
       'success',
@@ -572,12 +705,24 @@ export function ModelAssemble({ onStatusChange }: Props) {
         if (prev) URL.revokeObjectURL(prev);
         return null;
       });
+      setOrthoCamera(null);
+      setMaskReproj(null);
+      setTarRegion(null);
+      setTarRegionLabel(null);
+      appendAlignmentTrace('load-ref-image', {
+        file: file.name,
+        size,
+      });
       // Auto-extract subject bbox so the renderer can fit the target
       // mesh to the same image-space framing as the reference image.
       try {
         const bbox = await extractImageSubjectBBox(url);
         setRefSubjectBBox(bbox);
         if (bbox) {
+          appendAlignmentTrace('ref-image-bbox', {
+            file: file.name,
+            bbox: { x: bbox.x, y: bbox.y, w: bbox.w, h: bbox.h, method: bbox.method },
+          });
           onStatusChange(
             `已加载参考图：${file.name} (${size.w}×${size.h}) · 主体 bbox=${bbox.w}×${bbox.h}@(${bbox.x},${bbox.y}) [${bbox.method}]`,
             'success',
@@ -623,6 +768,14 @@ export function ModelAssemble({ onStatusChange }: Props) {
         return url;
       });
       setMaskImageName(file.name);
+      setMaskReproj(null);
+      setTarRegion(null);
+      setTarRegionLabel(null);
+      appendAlignmentTrace('load-mask-image', {
+        file: file.name,
+        size,
+        expectedSize,
+      });
       onStatusChange(`已加载 SAM3 mask：${file.name}`, 'success');
       return true;
     } catch (err) {
@@ -670,6 +823,16 @@ export function ModelAssemble({ onStatusChange }: Props) {
       setOrthoCamera(camera);
       // Render geometry/camera changed → previous reprojection is stale.
       setMaskReproj(null);
+      setTarRegion(null);
+      setTarRegionLabel(null);
+      appendAlignmentTrace('render-ortho', {
+        useAuto,
+        refImageSize,
+        fitBBox,
+        manualFit: { scale: orthoScale, offsetX: orthoOffsetX, offsetY: orthoOffsetY },
+        camera: summarizeCamera(camera),
+        targetMesh: { vertices: tarMesh.vertices.length, faces: tarMesh.faces.length },
+      });
       if (useAuto) {
         const b = fitBBox!;
         const src = segPack ? `${segPack.regions.length}-region 并集` : '图像主体';
@@ -725,6 +888,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
       setMaskReproj(result);
       setTarRegion(null);
       setTarRegionLabel(null);
+      appendAlignmentTrace('manual-reproject-mask', {
+        camera: summarizeCamera(orthoCamera),
+        mask: maskImageName,
+        segmentation: segPackName,
+        result: summarizeMaskReprojection(result),
+      });
       const stats = Array.from(result.regions.entries())
         .map(([label, set]) => `${label}=${set.size}`)
         .join(', ');
@@ -796,6 +965,10 @@ export function ModelAssemble({ onStatusChange }: Props) {
       setTarRegion(region);
       setTarRegionLabel(label);
       setSelectedTargetRegionLabel(label);
+      appendAlignmentTrace('adopt-target-region', {
+        label,
+        region: summarizeRegion(region),
+      });
       onStatusChange(
         `已将 SAM3 区域 "${label}" (${set.size} 顶点) 设为 Target seed · 中心=(${region.centroid[0].toFixed(3)}, ${region.centroid[1].toFixed(3)}, ${region.centroid[2].toFixed(3)}) · 半径=${region.boundingRadius.toFixed(3)}`,
         'success',
@@ -833,9 +1006,20 @@ export function ModelAssemble({ onStatusChange }: Props) {
       const pack = parseSegmentationJson(text);
       setSegPack(pack);
       setSegPackName(file.name);
+      setOrthoRenderUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+      setOrthoCamera(null);
       setMaskReproj(null);
       setTarRegion(null);
       setTarRegionLabel(null);
+      appendAlignmentTrace('load-seg-json', {
+        file: file.name,
+        imageName: pack.imageName,
+        maskName: pack.maskName,
+        regions: pack.regions.map((r) => ({ label: r.label, mask: r.mask_value, bbox: r.bbox })),
+      });
       const union = regionsUnionBBox(pack.regions);
       onStatusChange(
         `已加载 ${file.name} · ${pack.regions.length} 个区域：${pack.regions.map((r) => r.label).join(', ')}` +
@@ -872,9 +1056,22 @@ export function ModelAssemble({ onStatusChange }: Props) {
 
       setSegPack(pack);
       setSegPackName(jsonFile.name);
+      setOrthoRenderUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+      setOrthoCamera(null);
       setMaskReproj(null);
       setTarRegion(null);
       setTarRegionLabel(null);
+      appendAlignmentTrace('load-seg-pack', {
+        jsonFile: jsonFile.name,
+        imageFile: imageFile?.name ?? null,
+        maskFile: maskFile?.name ?? null,
+        imageName: pack.imageName,
+        maskName: pack.maskName,
+        regions: pack.regions.map((r) => ({ label: r.label, mask: r.mask_value, bbox: r.bbox })),
+      });
 
       let imageSize: { w: number; h: number } | null = null;
       if (imageFile) {
@@ -1025,10 +1222,60 @@ export function ModelAssemble({ onStatusChange }: Props) {
     if (centerViewMode === 'result') setCenterViewMode('landmark');
   }, [alignResult, autoAlignSummary, centerViewMode, resultPreview]);
 
+  const loadGalleryItemToSource = useCallback(async (
+    item: HighresGalleryItem,
+    options: { autoSync?: boolean } = {},
+  ) => {
+    let loadedUrlToRevoke: string | null = null;
+    try {
+      onStatusChange(
+        options.autoSync
+          ? `正在同步 Source：${item.pipelineName} → ${item.file}`
+          : `正在从 Mesh Gallery 打开：${item.file}`,
+        'info',
+      );
+      const loaded = await loadByName('page2.highres', item.file);
+      if (!loaded) {
+        onStatusChange('加载失败：未找到该 highres 模型版本', 'error');
+        return;
+      }
+      loadedUrlToRevoke = loaded.url;
+
+      const mesh = await loadGlbAsMesh(loaded.url);
+      setSrcMesh({
+        name: item.file,
+        vertices: mesh.vertices,
+        faces: mesh.faces,
+      });
+      setSourceGalleryBinding({
+        pipelineKey: item.pipelineKey,
+        pipelineIndex: item.pipelineIndex,
+        pipelineName: item.pipelineName,
+        pipelineMode: item.pipelineMode,
+        file: item.file,
+      });
+      setSelectedSrcIndex(null);
+      setSrcRegion(null);
+      clearAllLandmarks();
+      resetPreview();
+      onStatusChange(
+        options.autoSync
+          ? `Source 已跟随 ${item.pipelineName} 更新为：${item.file}`
+          : `已将 ${item.file} 加载到 Source，并绑定到 ${item.pipelineName}`,
+        'success',
+      );
+    } catch (err) {
+      onStatusChange(`打开失败：${err instanceof Error ? err.message : '未知错误'}`, 'error');
+    } finally {
+      if (loadedUrlToRevoke) URL.revokeObjectURL(loadedUrlToRevoke);
+    }
+  }, [clearAllLandmarks, loadByName, onStatusChange, resetPreview]);
+
   const refreshHighresGallery = useCallback(async () => {
     if (!project) {
       setHighresHistory([]);
-      setSelectedGalleryFile(null);
+      setSelectedGalleryId(null);
+      setSourceGalleryBinding(null);
       setSelectedGalleryPreviewUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
         return null;
@@ -1038,11 +1285,31 @@ export function ModelAssemble({ onStatusChange }: Props) {
 
     setGalleryLoading(true);
     try {
-      const history = await listHistory('page2.highres');
-      setHighresHistory(history);
+      const [pipelinesIndex, history] = await Promise.all([
+        loadPipelines(),
+        listHistory('page2.highres'),
+      ]);
+      const historyByFile = new Map(history.map((v) => [v.file, v]));
+      const currentModels = (pipelinesIndex?.pipelines ?? [])
+        .map((pipeline, pipelineIndex): HighresGalleryItem | null => {
+          if (!pipeline.modelFile) return null;
+          const version = historyByFile.get(pipeline.modelFile);
+          if (!version) return null;
+          const pipelineKey = pipeline.id ?? `index:${pipelineIndex}`;
+          return {
+            ...version,
+            id: `${pipelineKey}:${version.file}`,
+            pipelineKey,
+            pipelineIndex,
+            pipelineName: pipeline.name,
+            pipelineMode: pipeline.mode,
+          };
+        })
+        .filter((v): v is HighresGalleryItem => v !== null);
+      setHighresHistory(currentModels);
 
-      if (history.length === 0) {
-        setSelectedGalleryFile(null);
+      if (currentModels.length === 0) {
+        setSelectedGalleryId(null);
         setSelectedGalleryPreviewUrl((prev) => {
           if (prev) URL.revokeObjectURL(prev);
           return null;
@@ -1050,19 +1317,40 @@ export function ModelAssemble({ onStatusChange }: Props) {
         return;
       }
 
-      const nextFile = selectedGalleryFile && history.some((v) => v.file === selectedGalleryFile)
-        ? selectedGalleryFile
-        : history[0].file;
+      if (sourceGalleryBinding) {
+        const boundCurrent = currentModels.find((v) => v.pipelineKey === sourceGalleryBinding.pipelineKey);
+        if (!boundCurrent) {
+          setSourceGalleryBinding(null);
+        } else if (boundCurrent.file !== sourceGalleryBinding.file) {
+          await loadGalleryItemToSource(boundCurrent, { autoSync: true });
+        } else if (
+          boundCurrent.pipelineName !== sourceGalleryBinding.pipelineName ||
+          boundCurrent.pipelineIndex !== sourceGalleryBinding.pipelineIndex ||
+          boundCurrent.pipelineMode !== sourceGalleryBinding.pipelineMode
+        ) {
+          setSourceGalleryBinding({
+            pipelineKey: boundCurrent.pipelineKey,
+            pipelineIndex: boundCurrent.pipelineIndex,
+            pipelineName: boundCurrent.pipelineName,
+            pipelineMode: boundCurrent.pipelineMode,
+            file: boundCurrent.file,
+          });
+        }
+      }
 
-      setSelectedGalleryFile(nextFile);
-      const preview = await loadByName('page2.highres', nextFile);
+      const nextItem = selectedGalleryId
+        ? currentModels.find((v) => v.id === selectedGalleryId) ?? currentModels[0]
+        : currentModels[0];
+
+      setSelectedGalleryId(nextItem.id);
+      const preview = await loadByName('page2.highres', nextItem.file);
       setSelectedGalleryPreviewUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
         return preview?.url ?? null;
       });
     } catch {
       setHighresHistory([]);
-      setSelectedGalleryFile(null);
+      setSelectedGalleryId(null);
       setSelectedGalleryPreviewUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
         return null;
@@ -1070,10 +1358,18 @@ export function ModelAssemble({ onStatusChange }: Props) {
     } finally {
       setGalleryLoading(false);
     }
-  }, [listHistory, loadByName, project, selectedGalleryFile]);
+  }, [listHistory, loadByName, loadGalleryItemToSource, loadPipelines, project, selectedGalleryId, sourceGalleryBinding]);
 
   useEffect(() => {
     void refreshHighresGallery();
+  }, [refreshHighresGallery]);
+
+  useEffect(() => {
+    const handlePipelinesUpdated = () => {
+      void refreshHighresGallery();
+    };
+    window.addEventListener('page2:pipelines-updated', handlePipelinesUpdated);
+    return () => window.removeEventListener('page2:pipelines-updated', handlePipelinesUpdated);
   }, [refreshHighresGallery]);
 
   useEffect(() => {
@@ -1082,43 +1378,18 @@ export function ModelAssemble({ onStatusChange }: Props) {
     };
   }, [selectedGalleryPreviewUrl]);
 
-  const handleSelectGalleryItem = useCallback(async (fileName: string) => {
-    setSelectedGalleryFile(fileName);
-    const preview = await loadByName('page2.highres', fileName);
+  const handleSelectGalleryItem = useCallback(async (item: HighresGalleryItem) => {
+    setSelectedGalleryId(item.id);
+    const preview = await loadByName('page2.highres', item.file);
     setSelectedGalleryPreviewUrl((prev) => {
       if (prev) URL.revokeObjectURL(prev);
       return preview?.url ?? null;
     });
   }, [loadByName]);
 
-  const handleOpenGalleryToSource = useCallback(async (fileName: string) => {
-    let loadedUrlToRevoke: string | null = null;
-    try {
-      onStatusChange(`正在从 Mesh Gallery 打开：${fileName}`, 'info');
-      const loaded = await loadByName('page2.highres', fileName);
-      if (!loaded) {
-        onStatusChange('加载失败：未找到该 highres 模型版本', 'error');
-        return;
-      }
-      loadedUrlToRevoke = loaded.url;
-
-      const mesh = await loadGlbAsMesh(loaded.url);
-      setSrcMesh({
-        name: fileName,
-        vertices: mesh.vertices,
-        faces: mesh.faces,
-      });
-      setSelectedSrcIndex(null);
-      setSrcRegion(null);
-      clearAllLandmarks();
-      resetPreview();
-      onStatusChange(`已将 ${fileName} 加载到 Source`, 'success');
-    } catch (err) {
-      onStatusChange(`打开失败：${err instanceof Error ? err.message : '未知错误'}`, 'error');
-    } finally {
-      if (loadedUrlToRevoke) URL.revokeObjectURL(loadedUrlToRevoke);
-    }
-  }, [clearAllLandmarks, loadByName, onStatusChange, resetPreview]);
+  const handleOpenGalleryToSource = useCallback(async (item: HighresGalleryItem) => {
+    await loadGalleryItemToSource(item);
+  }, [loadGalleryItemToSource]);
 
   const selectSourceLandmark = (index: number) => {
     setSelectedSrcIndex(index);
@@ -1142,6 +1413,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
       };
       if (side === 'source') {
         setSrcMesh(mesh);
+        setSourceGalleryBinding(null);
         setSelectedSrcIndex(null);
         setSrcRegion(null);
       } else {
@@ -1150,6 +1422,10 @@ export function ModelAssemble({ onStatusChange }: Props) {
         setTarRegion(null);
         setTarRegionLabel(null);
         // Camera & reprojection are bound to the previous mesh — drop them.
+        setOrthoRenderUrl((prev) => {
+          if (prev) URL.revokeObjectURL(prev);
+          return null;
+        });
         setOrthoCamera(null);
         setMaskReproj(null);
       }
@@ -1295,6 +1571,23 @@ export function ModelAssemble({ onStatusChange }: Props) {
       );
       return;
     }
+    clearAlignmentTrace();
+    const runSeed = makeRandomAlignSeed();
+    appendAlignmentTrace('auto-align-click', {
+      seed: runSeed,
+      selectedTargetRegionLabel,
+      tarRegionLabel,
+      hasTarRegion: Boolean(tarRegion),
+      hasMaskReproj: Boolean(maskReproj),
+      hasOrthoCamera: Boolean(orthoCamera),
+      segPackName,
+      refImageName,
+      maskImageName,
+      refImageSize,
+      fitBBox,
+      source: { name: srcMesh.name, vertices: srcMesh.vertices.length, faces: srcMesh.faces.length },
+      target: { name: tarMesh.name, vertices: tarMesh.vertices.length, faces: tarMesh.faces.length },
+    });
     setPartialLoading(true);
     setAligning(true);
     setTimeout(async () => {
@@ -1304,6 +1597,14 @@ export function ModelAssemble({ onStatusChange }: Props) {
         let workingTarRegion =
           tarRegion && tarRegionLabel === selectedTargetRegionLabel ? tarRegion : null;
         let workingMaskReproj = maskReproj;
+        appendAlignmentTrace('auto-region-initial', {
+          selectedTargetRegionLabel,
+          tarRegionLabel,
+          usingCachedRegion: Boolean(workingTarRegion),
+          cachedRegion: summarizeRegion(workingTarRegion),
+          maskReproj: summarizeMaskReprojection(workingMaskReproj),
+          camera: summarizeCamera(orthoCamera),
+        });
 
         if (!workingTarRegion && selectedTargetRegionLabel) {
           if (workingMaskReproj) {
@@ -1314,6 +1615,10 @@ export function ModelAssemble({ onStatusChange }: Props) {
                 setTarRegion(workingTarRegion);
                 setTarRegionLabel(selectedTargetRegionLabel);
               }
+              appendAlignmentTrace('auto-region-from-existing-reprojection', {
+                label: selectedTargetRegionLabel,
+                region: summarizeRegion(workingTarRegion),
+              });
             }
           } else if (segPack && maskImageUrl && refImageSize) {
             let camera = orthoCamera;
@@ -1342,6 +1647,13 @@ export function ModelAssemble({ onStatusChange }: Props) {
               });
               setOrthoCamera(rendered.camera);
               camera = rendered.camera;
+              appendAlignmentTrace('auto-render-ortho', {
+                useAuto,
+                refImageSize,
+                fitBBox,
+                manualFit: { scale: orthoScale, offsetX: orthoOffsetX, offsetY: orthoOffsetY },
+                camera: summarizeCamera(camera),
+              });
             }
 
             const mask = await loadMaskGray(maskImageUrl);
@@ -1355,6 +1667,13 @@ export function ModelAssemble({ onStatusChange }: Props) {
               );
               setMaskReproj(reproj);
               workingMaskReproj = reproj;
+              appendAlignmentTrace('auto-reproject-mask', {
+                label: selectedTargetRegionLabel,
+                camera: summarizeCamera(camera),
+                mask: maskImageName,
+                segmentation: segPackName,
+                result: summarizeMaskReprojection(reproj),
+              });
               const set = reproj.regions.get(selectedTargetRegionLabel);
               if (set && set.size > 0) {
                 workingTarRegion = buildTarRegionFromSet(set);
@@ -1362,6 +1681,10 @@ export function ModelAssemble({ onStatusChange }: Props) {
                   setTarRegion(workingTarRegion);
                   setTarRegionLabel(selectedTargetRegionLabel);
                 }
+                appendAlignmentTrace('auto-region-from-new-reprojection', {
+                  label: selectedTargetRegionLabel,
+                  region: summarizeRegion(workingTarRegion),
+                });
               }
             }
           }
@@ -1378,6 +1701,21 @@ export function ModelAssemble({ onStatusChange }: Props) {
         }
 
         // 1. Partial match
+        appendAlignmentTrace('auto-partial-start', {
+          params: {
+            numSrcSamples: partialSrcSamples,
+            numTarSamples: partialTarSamples,
+            topK: partialTopK,
+            iterations: partialIterations,
+            inlierThreshold: partialThresholdPct / 100,
+            descriptor: partialDescriptor,
+            tarSeedWeight: workingTarRegion ? partialSeedWeight : 0,
+            axialWeight: partialAxialWeight,
+            seed: runSeed,
+          },
+          targetRegionLabel: selectedTargetRegionLabel,
+          targetRegion: summarizeRegion(workingTarRegion),
+        });
         const pm = matchPartialToWhole(
           { vertices: srcMesh.vertices, adjacency: srcAdjacency },
           { vertices: tarMesh.vertices, adjacency: tarAdjacency },
@@ -1394,9 +1732,15 @@ export function ModelAssemble({ onStatusChange }: Props) {
             tarConstraintVertices: workingTarRegion?.vertices,
             tarConstraintUseSaliency: Boolean(workingTarRegion?.vertices?.size),
             axialWeight: partialAxialWeight,
+            seed: runSeed,
           },
         );
         if (!pm.matrix4x4 || pm.pairs.length < 3) {
+          appendAlignmentTrace('auto-partial-failed', {
+            bestInlierCount: pm.bestInlierCount,
+            rawSrcSamples: pm.rawSrcSamples,
+            rawTarSamples: pm.rawTarSamples,
+          });
           onStatusChange(
             `自动对齐：partial-match 失败 (inliers=${pm.bestInlierCount})`,
             'error',
@@ -1405,6 +1749,16 @@ export function ModelAssemble({ onStatusChange }: Props) {
           setAligning(false);
           return;
         }
+        appendAlignmentTrace('auto-partial-result', {
+          pairs: pm.pairs.length,
+          rmse: round3(pm.rmse),
+          bestInlierCount: pm.bestInlierCount,
+          rawSrcSamples: pm.rawSrcSamples,
+          rawTarSamples: pm.rawTarSamples,
+          thresholdUsed: round3(pm.thresholdUsed),
+          firstPairs: summarizePairs(pm.pairs),
+          matrix: pm.matrix4x4 ? summarizeMatrix(pm.matrix4x4) : null,
+        });
 
         // 2. SVD landmark fit on accepted pairs (similarity).
         const lmFit = alignSourceMeshByLandmarks(
@@ -1421,7 +1775,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
         //    tarConstraintVertices); hard-restricting NN to that
         //    region during ICP causes scale collapse and biased fits
         //    when the region has holes or the source is partial.
-        const icp = icpRefine(srcMesh.vertices, tarMesh.vertices, lmFit.matrix4x4);
+        const icp = icpRefine(srcMesh.vertices, tarMesh.vertices, lmFit.matrix4x4, {
+          seed: runSeed,
+        });
 
         // Pick the best of {SVD-only, ICP-best} using a COMMON metric
         // — RMSE on the partial-match landmark pairs under each
@@ -1446,6 +1802,24 @@ export function ModelAssemble({ onStatusChange }: Props) {
         const useIcp = icpLandmarkRmse < lmFitLandmarkRmse;
         const finalMatrix = useIcp ? icp.matrix4x4 : lmFit.matrix4x4;
         const finalRmse = useIcp ? icpLandmarkRmse : lmFitLandmarkRmse;
+        appendAlignmentTrace('auto-fit-compare', {
+          lmFit: {
+            rmse: round3(lmFit.rmse),
+            landmarkRmse: round3(lmFitLandmarkRmse),
+            scale: round3(lmFit.scale),
+            matrix: summarizeMatrix(lmFit.matrix4x4),
+          },
+          icp: {
+            rmse: round3(icp.rmse),
+            landmarkRmse: round3(icpLandmarkRmse),
+            iterations: icp.iterations.length,
+            bestIteration: icp.bestIteration + 1,
+            stopReason: icp.stopReason,
+            matrix: summarizeMatrix(icp.matrix4x4),
+          },
+          finalMethod: useIcp ? 'ICP' : 'SVD',
+          finalRmse: round3(finalRmse),
+        });
 
         const transformedVertices = srcMesh.vertices.map((v) =>
           applyTransform(v, finalMatrix),
@@ -1497,6 +1871,15 @@ export function ModelAssemble({ onStatusChange }: Props) {
         setResultViewMode('overlay');
 
         const dt = performance.now() - t0;
+        appendAlignmentTrace('auto-final-preview', {
+          method: useIcp ? 'ICP' : 'SVD',
+          pairs: pm.pairs.length,
+          rmse: round3(finalRmse),
+          meanError: round3(meanError),
+          maxError: round3(maxError),
+          scale: round3(sx),
+          elapsedMs: round3(dt),
+        });
         setAutoAlignSummary({
           regionLabel: workingTarRegion ? selectedTargetRegionLabel || null : null,
           pairs: pm.pairs.length,
@@ -1507,7 +1890,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         });
         const icpSummary = useIcp
           ? `ICP 收敛于 ${icp.iterations.length} 轮 (${icp.stopReason}, best#${icp.bestIteration + 1})`
-          : `ICP 未改善 (lmFit RMSE=${lmFit.rmse.toFixed(4)} ≤ ICP=${icp.rmse.toFixed(4)})`;
+          : `ICP 未改善 (landmark RMSE SVD=${lmFitLandmarkRmse.toFixed(4)} ≤ ICP=${icpLandmarkRmse.toFixed(4)})`;
         onStatusChange(
           `自动对齐完成 · partial=${pm.pairs.length} 对 · ${icpSummary} · 最终 RMSE=${finalRmse.toFixed(4)} · ${dt.toFixed(0)}ms`,
           'success',
@@ -1569,6 +1952,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
     
     setAlignResult(null);
     setAutoAlignSummary(null);
+    setSourceGalleryBinding(null);
     setSelectedSrcIndex(null);
     setCenterViewMode('landmark');
     onStatusChange('已将对齐结果应用到 Source 模型与 Source landmarks', 'success');
@@ -1588,6 +1972,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         vertices: srcLoaded.vertices,
         faces: srcLoaded.faces,
       });
+      setSourceGalleryBinding(null);
       setTarMesh({
         name: 'alignmenttest_bot.glb',
         vertices: tarLoaded.vertices,
@@ -1613,6 +1998,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
     } catch (err) {
       // Fallback: tiny inline demo so the page is still usable
       setSrcMesh(DEMO_SOURCE);
+      setSourceGalleryBinding(null);
       setTarMesh(demoTarget);
       clearAllLandmarks();
       setAlignResult(null);
@@ -1693,6 +2079,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
             Source: {srcMesh.name}
             <br />
             V/F: {srcMesh.vertices.length} / {srcMesh.faces.length}
+            {sourceGalleryBinding && (
+              <>
+                <br />
+                Source 同步：#{sourceGalleryBinding.pipelineIndex + 1} · {sourceGalleryBinding.pipelineName}
+              </>
+            )}
             <br />
             Target: {tarMesh.name}
             <br />
@@ -2148,7 +2540,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           </div>
         </PanelSection>}
 
-        <PanelSection title="Mesh Gallery (Page2 Highres)" defaultCollapsed>
+        <PanelSection title="Mesh Gallery (Page2 当前模型)" defaultCollapsed>
           <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
             <Button
               size="sm"
@@ -2170,7 +2562,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
 
           {project && highresHistory.length === 0 && (
             <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>
-              暂无 highres 模型历史。
+              Page2 暂无 Pipeline 当前使用的 3D Model。
             </div>
           )}
 
@@ -2183,17 +2575,17 @@ export function ModelAssemble({ onStatusChange }: Props) {
           {project && highresHistory.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 190, overflow: 'auto' }}>
               {highresHistory.map((v) => {
-                const selected = selectedGalleryFile === v.file;
+                const selected = selectedGalleryId === v.id;
                 return (
                   <button
-                    key={v.file}
+                    key={v.id}
                     onClick={() => {
-                      void handleSelectGalleryItem(v.file);
+                      void handleSelectGalleryItem(v);
                     }}
                     onDoubleClick={() => {
-                      void handleOpenGalleryToSource(v.file);
+                      void handleOpenGalleryToSource(v);
                     }}
-                    title="单击预览，双击加载到 Source"
+                    title="单击预览，双击加载到 Source。列表只显示 Page2 每条 Pipeline 当前选中的模型。"
                     style={{
                       textAlign: 'left',
                       background: selected ? 'var(--bg-elevated)' : 'var(--bg-app)',
@@ -2204,6 +2596,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
                       cursor: 'pointer',
                     }}
                   >
+                    <div style={{ fontSize: 10, color: 'var(--accent-blue)', fontWeight: 600, marginBottom: 2 }}>
+                      #{v.pipelineIndex + 1} · {v.pipelineName} · {v.pipelineMode === 'multiview' ? 'Jacket Extract' : 'General Extract'}
+                    </div>
                     <div style={{ fontSize: 11, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {v.file}
                     </div>
@@ -2217,7 +2612,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           )}
 
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 8, lineHeight: 1.5 }}>
-            双击任意条目可直接替换 Source 模型。
+            每条 Page2 Pipeline 只占一个条目；生成新模型或在 Page2 切换历史版本后，这里会自动替换为当前选中的那一份。双击条目可直接替换 Source 模型。
           </div>
         </PanelSection>
 
@@ -2873,6 +3268,55 @@ export function ModelAssemble({ onStatusChange }: Props) {
             </Button>
           </div>
         </PanelSection>
+
+        {(showAdvanced || alignmentTrace.length > 0) && (
+          <PanelSection title="对齐诊断日志" defaultCollapsed={alignmentTrace.length === 0}>
+            <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+              <Button
+                size="sm"
+                onClick={() => {
+                  void navigator.clipboard?.writeText(JSON.stringify(alignmentTrace, null, 2));
+                  onStatusChange('已复制对齐诊断日志', 'success');
+                }}
+                disabled={alignmentTrace.length === 0}
+                style={{ flex: 1, justifyContent: 'center' }}
+              >
+                复制日志
+              </Button>
+              <Button
+                size="sm"
+                onClick={clearAlignmentTrace}
+                disabled={alignmentTrace.length === 0}
+                style={{ flex: 1, justifyContent: 'center' }}
+              >
+                清空
+              </Button>
+            </div>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6, lineHeight: 1.5 }}>
+              同时会输出到浏览器控制台：<b>[Page3Align]</b>。
+            </div>
+            <pre
+              style={{
+                maxHeight: 360,
+                overflow: 'auto',
+                margin: 0,
+                padding: 8,
+                background: 'var(--bg-app)',
+                border: '1px solid var(--border-default)',
+                borderRadius: 3,
+                color: 'var(--text-secondary)',
+                fontSize: 10,
+                lineHeight: 1.45,
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+              }}
+            >
+              {alignmentTrace.length === 0
+                ? '暂无日志。运行自动对齐或手动反投影后会显示。'
+                : alignmentTrace.map((e) => `${e.time} ${e.stage}\n${JSON.stringify(e.data, null, 2)}`).join('\n\n')}
+            </pre>
+          </PanelSection>
+        )}
 
         {showAdvanced && <PanelSection title="Landmark 显示">
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>

@@ -51,6 +51,7 @@ const makePart = (idx: number, mode: PipelineMode = 'extraction'): PartPipelineS
 /** PartPipelineState → 可持久化的精简表示 */
 function toPersisted(p: PartPipelineState): PersistedPipeline {
   return {
+    id: p.id,
     name: p.name,
     mode: p.mode,
     imageFile: p.imageInput?.imageFile ?? null,
@@ -89,7 +90,7 @@ function fromPersisted(pp: PersistedPipeline, index: number): PartPipelineState 
     }
   }
   return {
-    id: `part-${Date.now()}-${index}`,
+    id: pp.id ?? `part-${Date.now()}-${index}`,
     name: pp.name,
     mode: pp.mode,
     nodeStates,
