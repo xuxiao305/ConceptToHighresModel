@@ -203,6 +203,7 @@ export async function createTask(
  *   index 1 = left
  *   index 2 = back
  *   index 3 = right
+ * 留空槽位必须传 `{}`，不能传 `file_token: ''`。
  */
 export interface TripoMultiViewTokens {
   front: string | null;
@@ -224,7 +225,7 @@ export async function createMultiViewTask(
   }
 
   const slot = (t: string | null) =>
-    t ? { type: 'jpg', file_token: t } : { type: 'jpg', file_token: '' };
+    t ? { type: 'jpg', file_token: t } : {};
 
   const payload: Record<string, unknown> = {
     type: 'multiview_to_model',
