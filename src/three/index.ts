@@ -42,7 +42,20 @@ export type { GlobalMatchOptions } from './globalCandidates';
 export { ransacFilterCandidates } from './ransacAlign';
 export type { RansacOptions, RansacResult } from './ransacAlign';
 export { matchPartialToWhole, computePartialDebug } from './partialMatch';
-export type { PartialMatchOptions, PartialMatchResult, PartialDebugResult } from './partialMatch';
+export type {
+  PartialMatchOptions,
+  PartialMatchResult,
+  PartialMatchTimingReport,
+  PartialMatchAxialTrialTiming,
+  PartialDebugResult,
+} from './partialMatch';
+export { matchLimbStructureToWhole } from './limbStructureMatch';
+export type {
+  LimbStructureMatchOptions,
+  LimbStructureMatchResult,
+  LimbAnchorSet,
+  AnchorPoint,
+} from './limbStructureMatch';
 export { computeFPFH, computeMultiScaleFPFH, FPFH_DIM } from './fpfh';
 export {
   computeOrthoFrontFrustum,

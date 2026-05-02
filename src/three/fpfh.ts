@@ -25,6 +25,24 @@ import type { Vec3, MeshAdjacency } from './types';
 
 export const FPFH_DIM = 33; // 3 channels × 11 bins (at default subdivisions)
 
+export interface FPFHTimingEvent {
+  label?: string;
+  scaleIndex: number;
+  radius: number;
+  seedCount: number;
+  vertexCount: number;
+  subdivisions: number;
+  spatialHashMs: number;
+  fpfhSpfhMs: number;
+}
+
+interface FPFHTimingOptions {
+  label?: string;
+  onTiming?: (event: FPFHTimingEvent) => void;
+}
+
+const nowMs = () => performance.now();
+
 // ---------------------------------------------------------------------------
 // Spatial hash (replaces BFS for radius queries)
 // ---------------------------------------------------------------------------
@@ -160,9 +178,25 @@ export function computeFPFH(
   adjacency: MeshAdjacency,
   radius: number,
   subdivisions = 11,
+  timing?: FPFHTimingOptions,
 ): Float32Array {
+  const hashT0 = nowMs();
   const hash = buildSpatialHash(vertices, radius / 2);
-  return computeSPFHBatch(seedIndices, vertices, adjacency.vertexNormals, hash, radius, subdivisions);
+  const spatialHashMs = nowMs() - hashT0;
+  const spfhT0 = nowMs();
+  const out = computeSPFHBatch(seedIndices, vertices, adjacency.vertexNormals, hash, radius, subdivisions);
+  const fpfhSpfhMs = nowMs() - spfhT0;
+  timing?.onTiming?.({
+    label: timing.label,
+    scaleIndex: 0,
+    radius,
+    seedCount: seedIndices.length,
+    vertexCount: vertices.length,
+    subdivisions,
+    spatialHashMs,
+    fpfhSpfhMs,
+  });
+  return out;
 }
 
 /**
@@ -175,6 +209,7 @@ export function computeMultiScaleFPFH(
   adjacency: MeshAdjacency,
   radiusList: number[],
   subdivisions = 11,
+  timing?: FPFHTimingOptions,
 ): Float32Array {
   const dimPerScale = subdivisions * 3;
   const totalDim = radiusList.length * dimPerScale;
@@ -182,8 +217,23 @@ export function computeMultiScaleFPFH(
   const normals = adjacency.vertexNormals;
 
   for (let ri = 0; ri < radiusList.length; ri++) {
-    const hash = buildSpatialHash(vertices, radiusList[ri] / 2);
-    const part = computeSPFHBatch(seedIndices, vertices, normals, hash, radiusList[ri], subdivisions);
+    const radius = radiusList[ri];
+    const hashT0 = nowMs();
+    const hash = buildSpatialHash(vertices, radius / 2);
+    const spatialHashMs = nowMs() - hashT0;
+    const spfhT0 = nowMs();
+    const part = computeSPFHBatch(seedIndices, vertices, normals, hash, radius, subdivisions);
+    const fpfhSpfhMs = nowMs() - spfhT0;
+    timing?.onTiming?.({
+      label: timing.label,
+      scaleIndex: ri,
+      radius,
+      seedCount: seedIndices.length,
+      vertexCount: vertices.length,
+      subdivisions,
+      spatialHashMs,
+      fpfhSpfhMs,
+    });
     for (let si = 0; si < seedIndices.length; si++) {
       const baseOut = si * totalDim + ri * dimPerScale;
       const basePart = si * dimPerScale;

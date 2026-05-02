@@ -1,0 +1,329 @@
+[
+  {
+    "time": "12:38:01.712",
+    "stage": "auto-align-click",
+    "data": {
+      "seed": 306934501,
+      "selectedTargetRegionLabel": "RightArm",
+      "tarRegionLabel": "RightArm",
+      "hasTarRegion": true,
+      "hasMaskReproj": true,
+      "hasOrthoCamera": true,
+      "segPackName": "segmentation.json",
+      "refImageName": "Bot.png",
+      "maskImageName": "segmentation_mask.png",
+      "refImageSize": {
+        "w": 624,
+        "h": 763
+      },
+      "fitBBox": {
+        "x": 185,
+        "y": 33,
+        "w": 291,
+        "h": 686
+      },
+      "source": {
+        "name": "alignmenttest_arm_hires.glb",
+        "vertices": 72203,
+        "faces": 138004
+      },
+      "target": {
+        "name": "alignmenttest_bot.glb",
+        "vertices": 746352,
+        "faces": 1434140
+      }
+    }
+  },
+  {
+    "time": "12:38:01.736",
+    "stage": "auto-region-initial",
+    "data": {
+      "selectedTargetRegionLabel": "RightArm",
+      "tarRegionLabel": "RightArm",
+      "usingCachedRegion": true,
+      "cachedRegion": {
+        "seedVertex": 29,
+        "vertices": 75863,
+        "centroid": [
+          0.383,
+          10.534,
+          15.578
+        ],
+        "boundingRadius": 25.373
+      },
+      "maskReproj": {
+        "regions": [
+          {
+            "label": "RightArm",
+            "vertices": 75863,
+            "pixelHits": 12443
+          },
+          {
+            "label": "Body",
+            "vertices": 377968,
+            "pixelHits": 61555
+          },
+          {
+            "label": "LeftArm",
+            "vertices": 73031,
+            "pixelHits": 12337
+          }
+        ],
+        "unassignedPixels": 0
+      },
+      "camera": {
+        "width": 624,
+        "height": 763,
+        "camY": -0.808,
+        "camZ": 2.517,
+        "worldPerPx": 0.147,
+        "meshFrontX": 50.684
+      }
+    }
+  },
+  {
+    "time": "12:38:01.736",
+    "stage": "auto-partial-start",
+    "data": {
+      "params": {
+        "numSrcSamples": 25,
+        "numTarSamples": 80,
+        "topK": 8,
+        "iterations": 600,
+        "inlierThreshold": 0.05,
+        "descriptor": "fpfh",
+        "tarSeedWeight": 5,
+        "axialWeight": 5,
+        "seed": 306934501
+      },
+      "targetRegionLabel": "RightArm",
+      "targetRegion": {
+        "seedVertex": 29,
+        "vertices": 75863,
+        "centroid": [
+          0.383,
+          10.534,
+          15.578
+        ],
+        "boundingRadius": 25.373
+      }
+    }
+  },
+  {
+    "time": "12:38:24.809",
+    "stage": "auto-partial-result",
+    "data": {
+      "pairs": 25,
+      "rmse": 1.347,
+      "bestInlierCount": 25,
+      "rawSrcSamples": 25,
+      "rawTarSamples": 80,
+      "thresholdUsed": 4.694,
+      "firstPairs": [
+        {
+          "i": 1,
+          "srcVertex": 13638,
+          "tarVertex": 719427,
+          "confidence": 0.812,
+          "descriptorDist": 0.49
+        },
+        {
+          "i": 2,
+          "srcVertex": 11197,
+          "tarVertex": 685784,
+          "confidence": 0.773,
+          "descriptorDist": 0.605
+        },
+        {
+          "i": 3,
+          "srcVertex": 65278,
+          "tarVertex": 739170,
+          "confidence": 0.747,
+          "descriptorDist": 0.686
+        },
+        {
+          "i": 4,
+          "srcVertex": 5486,
+          "tarVertex": 696670,
+          "confidence": 0.745,
+          "descriptorDist": 0.69
+        },
+        {
+          "i": 5,
+          "srcVertex": 54559,
+          "tarVertex": 742564,
+          "confidence": 0.715,
+          "descriptorDist": 0.788
+        },
+        {
+          "i": 6,
+          "srcVertex": 65314,
+          "tarVertex": 665910,
+          "confidence": 0.696,
+          "descriptorDist": 0.851
+        },
+        {
+          "i": 7,
+          "srcVertex": 24528,
+          "tarVertex": 696443,
+          "confidence": 0.692,
+          "descriptorDist": 0.863
+        },
+        {
+          "i": 8,
+          "srcVertex": 63552,
+          "tarVertex": 684093,
+          "confidence": 0.691,
+          "descriptorDist": 0.868
+        },
+        {
+          "i": 9,
+          "srcVertex": 61766,
+          "tarVertex": 695821,
+          "confidence": 0.689,
+          "descriptorDist": 0.876
+        },
+        {
+          "i": 10,
+          "srcVertex": 22163,
+          "tarVertex": 739628,
+          "confidence": 0.669,
+          "descriptorDist": 0.943
+        },
+        {
+          "i": 11,
+          "srcVertex": 54765,
+          "tarVertex": 726134,
+          "confidence": 0.666,
+          "descriptorDist": 0.955
+        },
+        {
+          "i": 12,
+          "srcVertex": 16480,
+          "tarVertex": 705718,
+          "confidence": 0.662,
+          "descriptorDist": 0.966
+        }
+      ],
+      "matrix": [
+        [
+          0.508,
+          0.042,
+          0.099,
+          -6.047
+        ],
+        [
+          -0.001,
+          0.479,
+          -0.2,
+          16.229
+        ],
+        [
+          -0.108,
+          0.196,
+          0.469,
+          -14.261
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
+    }
+  },
+  {
+    "time": "12:38:27.537",
+    "stage": "auto-fit-compare",
+    "data": {
+      "lmFit": {
+        "rmse": 1.321,
+        "landmarkRmse": 1.321,
+        "scale": 0.522,
+        "matrix": [
+          [
+            0.515,
+            0.032,
+            0.077,
+            -4.738
+          ],
+          [
+            0.001,
+            0.481,
+            -0.203,
+            16.494
+          ],
+          [
+            -0.084,
+            0.201,
+            0.474,
+            -14.737
+          ],
+          [
+            0,
+            0,
+            0,
+            1
+          ]
+        ]
+      },
+      "icp": {
+        "rmse": 0.093,
+        "landmarkRmse": 1.717,
+        "params": {
+          "maxIterations": 30,
+          "sampleCount": 400,
+          "rejectMultiplier": 2.5,
+          "convergenceImprovement": 0.005,
+          "firstIterMode": "similarity",
+          "subsequentMode": "similarity"
+        },
+        "iterations": 30,
+        "bestIteration": 30,
+        "stopReason": "max-iterations",
+        "matrix": [
+          [
+            0.535,
+            -0.033,
+            0.004,
+            0.064
+          ],
+          [
+            0.032,
+            0.488,
+            -0.219,
+            18.044
+          ],
+          [
+            0.01,
+            0.219,
+            0.489,
+            -15.853
+          ],
+          [
+            0,
+            0,
+            0,
+            1
+          ]
+        ]
+      },
+      "finalMethod": "SVD",
+      "finalRmse": 1.321
+    }
+  },
+  {
+    "time": "12:38:27.538",
+    "stage": "auto-final-preview",
+    "data": {
+      "method": "SVD",
+      "pairs": 25,
+      "rmse": 1.321,
+      "meanError": 1.138,
+      "maxError": 4.028,
+      "scale": 0.522,
+      "elapsedMs": 25802.4
+    }
+  }
+]

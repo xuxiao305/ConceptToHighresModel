@@ -17,6 +17,7 @@ import {
   matchGlobalCandidates,
   ransacFilterCandidates,
   matchPartialToWhole,
+  matchLimbStructureToWhole,
   computePartialDebug,
   bboxDiagonal,
   renderOrthoFrontViewWithCamera,
@@ -32,6 +33,7 @@ import {
   type MeshRegion,
   type LandmarkCandidate,
   type PartialDebugResult,
+  type PartialMatchTimingReport,
   type SubjectBBox,
   type OrthoFrontCamera,
   type MaskReprojectionResult,
@@ -57,6 +59,7 @@ interface MeshData {
 type CenterViewMode = 'landmark' | 'result';
 type ResultViewMode = 'overlay' | 'aligned' | 'target' | 'original';
 type TargetRegionSelectionMode = 'auto' | 'manual';
+type PartialMatchMode = 'surface' | 'limb-structure';
 
 interface ResultPreview {
   mode: AlignmentMode;
@@ -72,6 +75,7 @@ interface ResultPreview {
 }
 
 interface AutoAlignSummary {
+  mode: PartialMatchMode;
   regionLabel: string | null;
   pairs: number;
   rmse: number;
@@ -81,6 +85,7 @@ interface AutoAlignSummary {
 }
 
 interface PartialMatchSummary {
+  mode: PartialMatchMode;
   status: 'success' | 'failed';
   pairs: number;
   bestInlierCount: number;
@@ -91,6 +96,9 @@ interface PartialMatchSummary {
   thresholdUsed: number;
   rmse: number;
   elapsedMs: number;
+  timings?: PartialMatchTimingReport;
+  diagnostics?: Record<string, unknown>;
+  warnings?: string[];
 }
 
 interface AlignTraceEntry {
@@ -139,6 +147,46 @@ function roundVec(v: Vec3 | undefined): Vec3 | null {
   return v ? [round3(v[0]), round3(v[1]), round3(v[2])] : null;
 }
 
+function summarizePartialTimings(timings?: PartialMatchTimingReport) {
+  if (!timings) return undefined;
+  return {
+    totalMs: round3(timings.totalMs),
+    saliencyMs: round3(timings.saliencyMs),
+    samplingMs: round3(timings.samplingMs),
+    axialFrameMs: round3(timings.axialFrameMs),
+    descriptorBuildMs: round3(timings.descriptorBuildMs),
+    spatialHashMs: round3(timings.spatialHashMs),
+    fpfhSpfhMs: round3(timings.fpfhSpfhMs),
+    topKMs: round3(timings.topKMs),
+    ransacMs: round3(timings.ransacMs),
+    refitAndFinalizeMs: round3(timings.refitAndFinalizeMs),
+    axialTrials: timings.axialTrials.map((trial) => ({
+      flipTarAxial: trial.flipTarAxial,
+      flipTarAxis2: trial.flipTarAxis2,
+      flipTarAxis3: trial.flipTarAxis3,
+      totalMs: round3(trial.totalMs),
+      descriptorBuildMs: round3(trial.descriptorBuildMs),
+      spatialHashMs: round3(trial.spatialHashMs),
+      fpfhSpfhMs: round3(trial.fpfhSpfhMs),
+      topKMs: round3(trial.topKMs),
+      ransacMs: round3(trial.ransacMs),
+      refitAndFinalizeMs: round3(trial.refitAndFinalizeMs),
+      bestInlierCount: trial.bestInlierCount,
+      pairs: trial.pairs,
+    })),
+    fpfhEvents: timings.fpfhEvents.map((event) => ({
+      label: event.label,
+      scaleIndex: event.scaleIndex,
+      radius: round3(event.radius),
+      seedCount: event.seedCount,
+      vertexCount: event.vertexCount,
+      subdivisions: event.subdivisions,
+      spatialHashMs: round3(event.spatialHashMs),
+      fpfhSpfhMs: round3(event.fpfhSpfhMs),
+    })),
+  };
+}
+
 function summarizeCamera(camera: OrthoFrontCamera | null): Record<string, unknown> | null {
   if (!camera) return null;
   return {
@@ -183,6 +231,24 @@ function summarizePairs(pairs: LandmarkCandidate[], max = 12): Array<Record<stri
   }));
 }
 
+function regionSignature(region: MeshRegion | null, label: string | null = null): string {
+  if (!region) return 'none';
+  let checksum = 0;
+  for (const idx of region.vertices) {
+    checksum = (checksum + ((idx + 1) * 2654435761)) >>> 0;
+  }
+  return [
+    label ?? '',
+    region.vertices.size,
+    region.seedVertex,
+    checksum,
+    round3(region.centroid[0]),
+    round3(region.centroid[1]),
+    round3(region.centroid[2]),
+    round3(region.boundingRadius),
+  ].join(':');
+}
+
 function summarizeMatrix(m: number[][]): number[][] {
   return m.map((row) => row.map(round3));
 }
@@ -194,6 +260,8 @@ function qualityLabel(summary: AutoAlignSummary): { label: string; color: string
 }
 
 const ALIGNMENT_MODE: AlignmentMode = 'similarity';
+const PARTIAL_SAMPLE_POOL_MODE = 'robust' as const;
+const PARTIAL_RADIUS_FRACTIONS = [0.08, 0.16, 0.32];
 
 function matrixSimilarityScale(matrix4x4: number[][]): number {
   const sx = Math.sqrt(matrix4x4[0][0] ** 2 + matrix4x4[1][0] ** 2 + matrix4x4[2][0] ** 2);
@@ -254,6 +322,58 @@ function recommendRegionLabel(sourceName: string, labels: string[]): string | nu
     return findLabel(['body', 'torso', 'jacket', 'coat']);
   }
   return labels[0] ?? null;
+}
+
+function normalizedLabel(label: string): string {
+  return label.toLowerCase().replace(/[\s_-]+/g, '');
+}
+
+function findMaskRegion(
+  regions: Map<string, Set<number>> | undefined,
+  needles: string[],
+): Set<number> | undefined {
+  if (!regions) return undefined;
+  const normalizedNeedles = needles.map(normalizedLabel);
+  for (const [label, vertices] of regions) {
+    const normalized = normalizedLabel(label);
+    if (normalizedNeedles.some((needle) => normalized.includes(needle))) return vertices;
+  }
+  return undefined;
+}
+
+function diagnosticNumber(diagnostics: Record<string, unknown> | undefined, key: string): number | null {
+  const value = diagnostics?.[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function diagnosticString(diagnostics: Record<string, unknown> | undefined, key: string): string | null {
+  const value = diagnostics?.[key];
+  return typeof value === 'string' ? value : null;
+}
+
+function buildPartialWarnings(
+  mode: PartialMatchMode,
+  diagnostics: Record<string, unknown> | undefined,
+  tarRegion: MeshRegion | null,
+  targetVertexCount: number,
+): string[] {
+  if (mode !== 'limb-structure') return [];
+  const warnings: string[] = [];
+  if (!tarRegion) {
+    warnings.push('结构模式建议先用 mask / seed 限定目标肢体区域，否则 root/end 可能取到身体整体端点。');
+  } else if (targetVertexCount > 0) {
+    const ratio = tarRegion.vertices.size / targetVertexCount;
+    if (ratio > 0.45) warnings.push('目标区域占整模比例偏大，可能不是单独肢体区域。');
+    if (ratio < 0.002) warnings.push('目标区域顶点很少，结构锚点可能不稳定。');
+  }
+  const srcBendStrength = diagnosticNumber(diagnostics, 'srcBendStrength');
+  const tarBendStrength = diagnosticNumber(diagnostics, 'tarBendStrength');
+  if (srcBendStrength !== null && srcBendStrength < 0.025) warnings.push('Source 弯折强度较低：肘/膝方向可能不明显。');
+  if (tarBendStrength !== null && tarBendStrength < 0.025) warnings.push('Target 弯折强度较低：肘/膝方向可能不明显。');
+  if (diagnosticString(diagnostics, 'targetRootBy') === 'target-centroid') {
+    warnings.push('未找到 Body/Torso 区域，root 判断退化为 target centroid。');
+  }
+  return warnings;
 }
 
 function chooseRegionLabel(sourceName: string, labels: string[], previous = ''): string {
@@ -391,10 +511,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [partialThresholdPct, setPartialThresholdPct] = useState(5);
   const [partialIterations, setPartialIterations] = useState(600);
   const [partialDescriptor, setPartialDescriptor] = useState<'curvature' | 'fpfh'>('fpfh');
+  const [partialMatchMode, setPartialMatchMode] = useState<PartialMatchMode>('surface');
   const [partialSeedWeight, setPartialSeedWeight] = useState(5.0);
   // PCA axial+radial feature weight. Critical for cylindrical parts
   // like arms / legs where pure FPFH collapses to a single feature.
   const [partialAxialWeight, setPartialAxialWeight] = useState(5.0);
+  const [partialMacroSaliencyRings, setPartialMacroSaliencyRings] = useState(6);
   const [partialLoading, setPartialLoading] = useState(false);
 
   // ── ICP manual/refine parameters ─────────────────────────────────────
@@ -480,6 +602,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
 
   const srcInputRef = useRef<HTMLInputElement | null>(null);
   const tarInputRef = useRef<HTMLInputElement | null>(null);
+  const activeSeedSignatureRef = useRef<string>('none|none');
 
   const srcLandmarks = useLandmarkStore((s) => s.srcLandmarks);
   const tarLandmarks = useLandmarkStore((s) => s.tarLandmarks);
@@ -493,11 +616,35 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const clearTarLandmarks = useLandmarkStore((s) => s.clearTarLandmarks);
   const clearAllLandmarks = useLandmarkStore((s) => s.clearAll);
 
+  const srcRegionSignature = useMemo(() => regionSignature(srcRegion), [srcRegion]);
+  const tarRegionSignature = useMemo(
+    () => regionSignature(tarRegion, tarRegionLabel),
+    [tarRegion, tarRegionLabel],
+  );
+  const activeSeedSignature = `${srcRegionSignature}|${tarRegionSignature}`;
+
+  useEffect(() => {
+    activeSeedSignatureRef.current = activeSeedSignature;
+  }, [activeSeedSignature]);
+
   const clearCandidates = useCallback(() => {
     setCandidates([]);
     setAcceptedCandidateIds(new Set());
     setPartialMatchSummary(null);
   }, []);
+
+  const handleSetPartialMatchMode = useCallback((mode: PartialMatchMode) => {
+    setPartialMatchMode(mode);
+    setPartialMatchSummary(null);
+    setPartialDebug(null);
+    setAcceptedCandidateIds(new Set());
+    onStatusChange(
+      mode === 'limb-structure'
+        ? 'Step 1 已切换到实验模式：肢体大结构（root / bend / end 三锚点）'
+        : 'Step 1 已切换到旧模式：表面 RANSAC（FPFH/曲率 + RANSAC）',
+      'info',
+    );
+  }, [onStatusChange]);
 
   const handleAcceptCandidate = useCallback(
     (i: number) => {
@@ -629,6 +776,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
       onStatusChange('Source/Target 尚未加载', 'warning');
       return;
     }
+    const runSeedSignature = activeSeedSignatureRef.current;
     setPartialMatchSummary(null);
     setPartialLoading(true);
     // Defer to next frame so React can render the loading state first
@@ -639,42 +787,74 @@ export function ModelAssemble({ onStatusChange }: Props) {
       source: { name: srcMesh.name, vertices: srcMesh.vertices.length, faces: srcMesh.faces.length },
       target: { name: tarMesh.name, vertices: tarMesh.vertices.length, faces: tarMesh.faces.length },
       params: {
+        mode: partialMatchMode,
         numSrcSamples: partialSrcSamples,
         numTarSamples: partialTarSamples,
         topK: partialTopK,
         iterations: partialIterations,
         inlierThreshold: partialThresholdPct / 100,
         descriptor: partialDescriptor,
+        samplePoolMode: PARTIAL_SAMPLE_POOL_MODE,
+        radiusFractions: PARTIAL_RADIUS_FRACTIONS,
+        macroSaliencyRings: partialMacroSaliencyRings,
         tarSeedWeight: tarRegion ? partialSeedWeight : 0,
         axialWeight: partialAxialWeight,
         seed: runSeed,
       },
       targetRegion: summarizeRegion(tarRegion),
     });
-    const r = matchPartialToWhole(
-      { vertices: srcMesh.vertices, adjacency: srcAdjacency },
-      { vertices: tarMesh.vertices, adjacency: tarAdjacency },
-      {
-        numSrcSamples: partialSrcSamples,
-        numTarSamples: partialTarSamples,
-        topK: partialTopK,
-        iterations: partialIterations,
-        inlierThreshold: partialThresholdPct / 100,
-        descriptor: partialDescriptor,
-        tarSeedCentroid: tarRegion?.centroid,
-        tarSeedRadius: tarRegion?.boundingRadius,
-        tarSeedWeight: tarRegion ? partialSeedWeight : 0,
-        tarConstraintVertices: tarRegion?.vertices,
-        tarConstraintUseSaliency: Boolean(tarRegion?.vertices?.size),
-        axialWeight: partialAxialWeight,
-        seed: runSeed,
-      },
-    );
+    const tarBodyVertices = findMaskRegion(maskReproj?.regions, ['body', 'torso']);
+    const r = partialMatchMode === 'limb-structure'
+      ? matchLimbStructureToWhole(
+          { vertices: srcMesh.vertices },
+          { vertices: tarMesh.vertices },
+          {
+            tarConstraintVertices: tarRegion?.vertices,
+            tarBodyVertices,
+            mode: ALIGNMENT_MODE,
+          },
+        )
+      : matchPartialToWhole(
+          { vertices: srcMesh.vertices, adjacency: srcAdjacency },
+          { vertices: tarMesh.vertices, adjacency: tarAdjacency },
+          {
+            numSrcSamples: partialSrcSamples,
+            numTarSamples: partialTarSamples,
+            topK: partialTopK,
+            iterations: partialIterations,
+            inlierThreshold: partialThresholdPct / 100,
+            descriptor: partialDescriptor,
+            samplePoolMode: PARTIAL_SAMPLE_POOL_MODE,
+            radiusFractions: PARTIAL_RADIUS_FRACTIONS,
+            macroSaliencyRings: partialMacroSaliencyRings,
+            tarSeedCentroid: tarRegion?.centroid,
+            tarSeedRadius: tarRegion?.boundingRadius,
+            tarSeedWeight: tarRegion ? partialSeedWeight : 0,
+            tarConstraintVertices: tarRegion?.vertices,
+            tarConstraintUseSaliency: Boolean(tarRegion?.vertices?.size),
+            axialWeight: partialAxialWeight,
+            seed: runSeed,
+          },
+        );
+    const partialTimings = 'timings' in r ? r.timings : undefined;
+    const partialDiagnostics = 'diagnostics' in r ? r.diagnostics : undefined;
+    const partialWarnings = buildPartialWarnings(partialMatchMode, partialDiagnostics, tarRegion, tarMesh.vertices.length);
     const dt = performance.now() - t0;
+    if (activeSeedSignatureRef.current !== runSeedSignature) {
+      appendAlignmentTrace('manual-partial-stale-discarded', {
+        runSeedSignature,
+        currentSeedSignature: activeSeedSignatureRef.current,
+        elapsedMs: round3(dt),
+      });
+      onStatusChange('Step 1 结果已丢弃：Target seed 在计算期间发生变化，请重新运行 Step 1', 'warning');
+      setPartialLoading(false);
+      return;
+    }
     if (!r.matrix4x4 || r.pairs.length < 3) {
       setCandidates([]);
       setAcceptedCandidateIds(new Set());
       setPartialMatchSummary({
+        mode: partialMatchMode,
         status: 'failed',
         pairs: r.pairs.length,
         bestInlierCount: r.bestInlierCount,
@@ -685,10 +865,26 @@ export function ModelAssemble({ onStatusChange }: Props) {
         thresholdUsed: r.thresholdUsed,
         rmse: r.rmse,
         elapsedMs: dt,
+        timings: partialTimings,
+        diagnostics: partialDiagnostics,
+        warnings: partialWarnings,
+      });
+      appendAlignmentTrace('manual-partial-failed', {
+        mode: partialMatchMode,
+        pairs: r.pairs.length,
+        bestInlierCount: r.bestInlierCount,
+        rawSrcSamples: r.rawSrcSamples,
+        rawTarSamples: r.rawTarSamples,
+        elapsedMs: round3(dt),
+        timings: summarizePartialTimings(partialTimings),
+        warnings: partialWarnings,
+        diagnostics: partialDiagnostics,
       });
       onStatusChange(
-        `Step 1 失败：RANSAC inliers=${r.bestInlierCount}（threshold=${(partialThresholdPct).toFixed(1)}% src bbox）` +
-          ` — 试着加大 topK / 迭代数 / threshold`,
+        partialMatchMode === 'limb-structure'
+          ? `Step 1 失败：结构锚点不足或退化（pairs=${r.pairs.length}）。请检查目标肢体区域 / Body 区域。`
+          : `Step 1 失败：RANSAC inliers=${r.bestInlierCount}（threshold=${(partialThresholdPct).toFixed(1)}% src bbox）` +
+            ` — 试着加大 topK / 迭代数 / threshold`,
         'error',
       );
       setPartialLoading(false);
@@ -697,6 +893,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
     setCandidates(r.pairs);
     setAcceptedCandidateIds(new Set());
     setPartialMatchSummary({
+      mode: partialMatchMode,
       status: 'success',
       pairs: r.pairs.length,
       bestInlierCount: r.bestInlierCount,
@@ -707,8 +904,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
       thresholdUsed: r.thresholdUsed,
       rmse: r.rmse,
       elapsedMs: dt,
+      timings: partialTimings,
+      diagnostics: partialDiagnostics,
+      warnings: partialWarnings,
     });
     appendAlignmentTrace('manual-partial-result', {
+      mode: partialMatchMode,
       pairs: r.pairs.length,
       rmse: round3(r.rmse),
       bestInlierCount: r.bestInlierCount,
@@ -717,10 +918,16 @@ export function ModelAssemble({ onStatusChange }: Props) {
       thresholdUsed: round3(r.thresholdUsed),
       firstPairs: summarizePairs(r.pairs),
       elapsedMs: round3(dt),
+      timings: summarizePartialTimings(partialTimings),
+      warnings: partialWarnings,
+      diagnostics: partialDiagnostics,
     });
+    appendAlignmentTrace('manual-partial-timing', summarizePartialTimings(partialTimings) ?? {});
     onStatusChange(
-      `Step 1 完成：RANSAC inliers=${r.bestInlierCount}，输出 ${r.pairs.length} 对候选，RMSE=${r.rmse.toFixed(4)}，threshold=${r.thresholdUsed.toFixed(4)} — ${dt.toFixed(1)}ms`,
-      'success',
+      partialMatchMode === 'limb-structure'
+        ? `Step 1 完成：结构锚点 ${r.pairs.length} 对（root/bend/end），RMSE=${r.rmse.toFixed(4)} — ${dt.toFixed(1)}ms${partialWarnings.length ? ' · 有诊断警告' : ''}`
+        : `Step 1 完成：RANSAC inliers=${r.bestInlierCount}，输出 ${r.pairs.length} 对候选，RMSE=${r.rmse.toFixed(4)}，threshold=${r.thresholdUsed.toFixed(4)} — ${dt.toFixed(1)}ms`,
+      partialWarnings.length ? 'warning' : 'success',
     );
     setPartialLoading(false);
     }, 16);
@@ -735,9 +942,13 @@ export function ModelAssemble({ onStatusChange }: Props) {
     partialIterations,
     partialThresholdPct,
     partialDescriptor,
+    partialMatchMode,
     partialSeedWeight,
     partialAxialWeight,
+    partialMacroSaliencyRings,
     tarRegion,
+    maskReproj,
+    appendAlignmentTrace,
     onStatusChange,
   ]);
 
@@ -757,6 +968,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
         numTarSamples: partialTarSamples,
         topK: partialTopK,
         descriptor: partialDescriptor,
+        samplePoolMode: PARTIAL_SAMPLE_POOL_MODE,
+        radiusFractions: PARTIAL_RADIUS_FRACTIONS,
+        macroSaliencyRings: partialMacroSaliencyRings,
         tarSeedCentroid: tarRegion?.centroid,
         tarSeedRadius: tarRegion?.boundingRadius,
         tarSeedWeight: tarRegion ? partialSeedWeight : 0,
@@ -786,6 +1000,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
     partialDescriptor,
     partialSeedWeight,
     partialAxialWeight,
+    partialMacroSaliencyRings,
     tarRegion,
     onStatusChange,
   ]);
@@ -1410,12 +1625,16 @@ export function ModelAssemble({ onStatusChange }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Stale-candidate guard: invalidate suggestions when seed regions change.
+  // Stale-candidate guard: invalidate suggestions when seed regions really
+  // change.  Do not key this on the MeshRegion object itself: auto-localize
+  // and region-sync can rebuild an equivalent object asynchronously, which
+  // previously made freshly-rendered Step 1 candidate dots disappear a moment
+  // later even though the semantic seed had not changed.
   useEffect(() => {
     setCandidates([]);
     setAcceptedCandidateIds(new Set());
     setPartialMatchSummary(null);
-  }, [srcRegion, tarRegion]);
+  }, [srcRegionSignature, tarRegionSignature]);
 
   const pairCount = Math.min(srcLandmarks.length, tarLandmarks.length);
   const isBalanced = srcLandmarks.length === tarLandmarks.length && srcLandmarks.length > 0;
@@ -1986,10 +2205,10 @@ export function ModelAssemble({ onStatusChange }: Props) {
     }, 16);
   };
 
-  // Auto pipeline: partial-match → SVD landmark fit → ICP refine.
-  // One button does everything; result lands in resultPreview so the
-  // "重叠预览" button lights up immediately.
-  const handleAutoAlign = useCallback(() => {
+  // Auto pipeline: structural/RANSAC match → SVD landmark fit → ICP refine.
+  // Explicit mode buttons avoid relying on hidden Step 1 mode state.
+  const handleAutoAlign = useCallback((modeOverride?: PartialMatchMode) => {
+    const runMode = modeOverride ?? partialMatchMode;
     if (srcMesh.vertices.length === 0 || tarMesh.vertices.length === 0) {
       onStatusChange('Source/Target 尚未加载', 'warning');
       return;
@@ -2009,9 +2228,11 @@ export function ModelAssemble({ onStatusChange }: Props) {
       );
       return;
     }
+    setPartialMatchMode(runMode);
     clearAlignmentTrace();
     const runSeed = makeRandomAlignSeed();
     appendAlignmentTrace('auto-align-click', {
+      mode: runMode,
       seed: runSeed,
       targetRegionLabel,
       selectionMode: targetRegionSelectionMode,
@@ -2145,12 +2366,16 @@ export function ModelAssemble({ onStatusChange }: Props) {
         // 1. Partial match
         appendAlignmentTrace('auto-partial-start', {
           params: {
+            mode: runMode,
             numSrcSamples: partialSrcSamples,
             numTarSamples: partialTarSamples,
             topK: partialTopK,
             iterations: partialIterations,
             inlierThreshold: partialThresholdPct / 100,
             descriptor: partialDescriptor,
+            samplePoolMode: PARTIAL_SAMPLE_POOL_MODE,
+            radiusFractions: PARTIAL_RADIUS_FRACTIONS,
+            macroSaliencyRings: partialMacroSaliencyRings,
             tarSeedWeight: workingTarRegion ? partialSeedWeight : 0,
             axialWeight: partialAxialWeight,
             seed: runSeed,
@@ -2158,33 +2383,56 @@ export function ModelAssemble({ onStatusChange }: Props) {
           targetRegionLabel,
           targetRegion: summarizeRegion(workingTarRegion),
         });
-        const pm = matchPartialToWhole(
-          { vertices: srcMesh.vertices, adjacency: srcAdjacency },
-          { vertices: tarMesh.vertices, adjacency: tarAdjacency },
-          {
-            numSrcSamples: partialSrcSamples,
-            numTarSamples: partialTarSamples,
-            topK: partialTopK,
-            iterations: partialIterations,
-            inlierThreshold: partialThresholdPct / 100,
-            descriptor: partialDescriptor,
-            tarSeedCentroid: workingTarRegion?.centroid,
-            tarSeedRadius: workingTarRegion?.boundingRadius,
-            tarSeedWeight: workingTarRegion ? partialSeedWeight : 0,
-            tarConstraintVertices: workingTarRegion?.vertices,
-            tarConstraintUseSaliency: Boolean(workingTarRegion?.vertices?.size),
-            axialWeight: partialAxialWeight,
-            seed: runSeed,
-          },
-        );
+        const workingTarBodyVertices = findMaskRegion(workingMaskReproj?.regions, ['body', 'torso']);
+        const pm = runMode === 'limb-structure'
+          ? matchLimbStructureToWhole(
+              { vertices: srcMesh.vertices },
+              { vertices: tarMesh.vertices },
+              {
+                tarConstraintVertices: workingTarRegion?.vertices,
+                tarBodyVertices: workingTarBodyVertices,
+                mode: ALIGNMENT_MODE,
+              },
+            )
+          : matchPartialToWhole(
+              { vertices: srcMesh.vertices, adjacency: srcAdjacency },
+              { vertices: tarMesh.vertices, adjacency: tarAdjacency },
+              {
+                numSrcSamples: partialSrcSamples,
+                numTarSamples: partialTarSamples,
+                topK: partialTopK,
+                iterations: partialIterations,
+                inlierThreshold: partialThresholdPct / 100,
+                descriptor: partialDescriptor,
+                samplePoolMode: PARTIAL_SAMPLE_POOL_MODE,
+                radiusFractions: PARTIAL_RADIUS_FRACTIONS,
+                macroSaliencyRings: partialMacroSaliencyRings,
+                tarSeedCentroid: workingTarRegion?.centroid,
+                tarSeedRadius: workingTarRegion?.boundingRadius,
+                tarSeedWeight: workingTarRegion ? partialSeedWeight : 0,
+                tarConstraintVertices: workingTarRegion?.vertices,
+                tarConstraintUseSaliency: Boolean(workingTarRegion?.vertices?.size),
+                axialWeight: partialAxialWeight,
+                seed: runSeed,
+              },
+            );
+        const partialTimings = 'timings' in pm ? pm.timings : undefined;
+        const partialDiagnostics = 'diagnostics' in pm ? pm.diagnostics : undefined;
+        const partialWarnings = buildPartialWarnings(runMode, partialDiagnostics, workingTarRegion, tarMesh.vertices.length);
         if (!pm.matrix4x4 || pm.pairs.length < 3) {
           appendAlignmentTrace('auto-partial-failed', {
+            mode: runMode,
             bestInlierCount: pm.bestInlierCount,
             rawSrcSamples: pm.rawSrcSamples,
             rawTarSamples: pm.rawTarSamples,
+            timings: summarizePartialTimings(partialTimings),
+            warnings: partialWarnings,
+            diagnostics: partialDiagnostics,
           });
           onStatusChange(
-            `自动对齐：partial-match 失败 (inliers=${pm.bestInlierCount})`,
+            runMode === 'limb-structure'
+              ? `自动对齐：结构锚点匹配失败（pairs=${pm.pairs.length}）`
+              : `自动对齐：partial-match 失败 (inliers=${pm.bestInlierCount})`,
             'error',
           );
           setPartialLoading(false);
@@ -2192,6 +2440,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           return;
         }
         appendAlignmentTrace('auto-partial-result', {
+          mode: runMode,
           pairs: pm.pairs.length,
           rmse: round3(pm.rmse),
           bestInlierCount: pm.bestInlierCount,
@@ -2200,6 +2449,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
           thresholdUsed: round3(pm.thresholdUsed),
           firstPairs: summarizePairs(pm.pairs),
           matrix: pm.matrix4x4 ? summarizeMatrix(pm.matrix4x4) : null,
+          timings: summarizePartialTimings(partialTimings),
+          warnings: partialWarnings,
+          diagnostics: partialDiagnostics,
         });
 
         // 2. SVD landmark fit on accepted pairs (similarity).
@@ -2331,6 +2583,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
 
         const dt = performance.now() - t0;
         appendAlignmentTrace('auto-final-preview', {
+          mode: runMode,
           method: useIcp ? 'ICP' : 'SVD',
           pairs: pm.pairs.length,
           rmse: round3(finalRmse),
@@ -2340,6 +2593,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           elapsedMs: round3(dt),
         });
         setAutoAlignSummary({
+          mode: runMode,
           regionLabel: workingTarRegion ? targetRegionLabel : null,
           pairs: pm.pairs.length,
           rmse: finalRmse,
@@ -2350,8 +2604,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
         const icpSummary = useIcp
           ? `ICP 已采用：surface RMSE=${icp.rmse.toFixed(4)}，kept=${bestIcpIter?.pairsKept ?? 0}，${icp.iterations.length} 轮 (${icp.stopReason}, best#${icp.bestIteration + 1})`
           : `ICP 未采用：kept=${bestIcpIter?.pairsKept ?? 0} < ${minIcpPairsKept} 或 RMSE 无效`;
+        const modeLabel = runMode === 'limb-structure' ? '四肢大结构' : 'RANSAC';
         onStatusChange(
-          `自动对齐完成 · partial=${pm.pairs.length} 对 · ${icpSummary} · 最终 RMSE=${finalRmse.toFixed(4)} · ${dt.toFixed(0)}ms`,
+          `自动对齐完成 · ${modeLabel} · partial=${pm.pairs.length} 对 · ${icpSummary} · 最终 RMSE=${finalRmse.toFixed(4)} · ${dt.toFixed(0)}ms`,
           'success',
         );
       } catch (err) {
@@ -2377,6 +2632,8 @@ export function ModelAssemble({ onStatusChange }: Props) {
     partialDescriptor,
     partialSeedWeight,
     partialAxialWeight,
+    partialMacroSaliencyRings,
+    partialMatchMode,
     tarRegion,
     tarRegionLabel,
     activeTargetRegionLabel,
@@ -2424,16 +2681,16 @@ export function ModelAssemble({ onStatusChange }: Props) {
   };
 
   const restoreDemo = useCallback(async () => {
-    const srcUrl = '/demo/alignmenttest_arm_hires.glb';
+    const srcUrl = '/demo/alignmenttest_arm_hires_Deformed.glb';
     const tarUrl = '/demo/alignmenttest_bot.glb';
     try {
-      onStatusChange('正在加载 Demo: arm_hires (源) + bot (目标整身)…', 'info');
+      onStatusChange('正在加载 Demo: arm_hires_Deformed (源) + bot (目标整身)…', 'info');
       const [srcLoaded, tarLoaded] = await Promise.all([
         loadGlbAsMesh(srcUrl),
         loadGlbAsMesh(tarUrl),
       ]);
       setSrcMesh({
-        name: 'alignmenttest_arm_hires.glb',
+        name: 'alignmenttest_arm_hires_Deformed.glb',
         vertices: srcLoaded.vertices,
         faces: srcLoaded.faces,
       });
@@ -2497,7 +2754,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
     }
   }, [clearAllLandmarks, demoTarget, onStatusChange]);
 
-  // 页面挂载时自动加载 Demo (arm hires)，作为初始模型
+  // 页面挂载时自动加载 Demo (arm hires Deformed)，作为初始模型
   const initialDemoLoadedRef = useRef(false);
   useEffect(() => {
     if (initialDemoLoadedRef.current) return;
@@ -2694,9 +2951,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
               onClick={() => {
                 void restoreDemo();
               }}
-              title="加载 alignmenttest_arm_hires.glb (源手臂) + alignmenttest_bot.glb (整身角色)"
+              title="加载 alignmenttest_arm_hires_Deformed.glb (源手臂) + alignmenttest_bot.glb (整身角色)"
             >
-              加载 Demo (arm hires)
+              加载 Demo (arm deformed)
             </Button>
           </div>
           <input ref={srcInputRef} type="file" accept=".glb" style={{ display: 'none' }} onChange={onSrcFileChange} />
@@ -2816,17 +3073,30 @@ export function ModelAssemble({ onStatusChange }: Props) {
             </div>
           )}
 
-          <Button
-            size="md"
-            variant="primary"
-            onClick={handleAutoAlign}
-            loading={partialLoading || aligning}
-            disabled={partialLoading || aligning || srcMesh.vertices.length === 0 || tarMesh.vertices.length === 0}
-            style={{ width: '100%', justifyContent: 'center', marginBottom: 8 }}
-            title="自动执行正视图渲染、mask 反投影、部分匹配、SVD/ICP 比较，并把结果应用到预览层"
-          >
-            {(partialLoading || aligning) ? '自动对齐中…' : '自动对齐到目标区域'}
-          </Button>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 8 }}>
+            <Button
+              size="md"
+              variant="primary"
+              onClick={() => handleAutoAlign('limb-structure')}
+              loading={partialLoading || aligning}
+              disabled={partialLoading || aligning || srcMesh.vertices.length === 0 || tarMesh.vertices.length === 0}
+              style={{ justifyContent: 'center' }}
+              title="推荐用于手臂/腿：先用根部、弯折、末端三点做大结构对齐，再用 ICP 内点细化"
+            >
+              {(partialLoading || aligning) ? '自动对齐中…' : '一键 · 四肢大结构对齐'}
+            </Button>
+            <Button
+              size="md"
+              variant="secondary"
+              onClick={() => handleAutoAlign('surface')}
+              loading={partialLoading || aligning}
+              disabled={partialLoading || aligning || srcMesh.vertices.length === 0 || tarMesh.vertices.length === 0}
+              style={{ justifyContent: 'center' }}
+              title="保留旧流程：使用表面描述子 + RANSAC 生成候选对，再用 SVD/ICP 对齐"
+            >
+              {(partialLoading || aligning) ? '自动对齐中…' : '一键 · RANSAC 对齐'}
+            </Button>
+          </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
             <Button
@@ -3212,6 +3482,68 @@ export function ModelAssemble({ onStatusChange }: Props) {
             </>
           )}
 
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>
+            Step 1 匹配模式
+          </div>
+          <div
+            style={{
+              marginBottom: 6,
+              padding: '4px 6px',
+              borderRadius: 3,
+              background: partialMatchMode === 'limb-structure' ? 'rgba(127,217,127,0.12)' : 'var(--bg-app)',
+              border: partialMatchMode === 'limb-structure'
+                ? '1px solid rgba(127,217,127,0.45)'
+                : '1px solid var(--border-default)',
+              color: partialMatchMode === 'limb-structure' ? '#7fd97f' : 'var(--text-secondary)',
+              fontSize: 10,
+              fontWeight: 600,
+            }}
+          >
+            当前模式：{partialMatchMode === 'limb-structure' ? '实验 · 肢体大结构' : '旧模式 · 表面 RANSAC'}
+          </div>
+          <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+            <Button
+              size="sm"
+              variant={partialMatchMode === 'limb-structure' ? 'primary' : 'secondary'}
+              onClick={() => handleSetPartialMatchMode('limb-structure')}
+              style={{ flex: 1, justifyContent: 'center' }}
+              title="用 PCA 主轴、根端、弯折面、末端做大结构对齐；适合手臂/腿"
+            >
+              {partialMatchMode === 'limb-structure' ? '✓ ' : ''}肢体大结构
+            </Button>
+            <Button
+              size="sm"
+              variant={partialMatchMode === 'surface' ? 'primary' : 'secondary'}
+              onClick={() => handleSetPartialMatchMode('surface')}
+              style={{ flex: 1, justifyContent: 'center' }}
+              title="旧模式：局部表面描述子 + RANSAC，适合形态基本一致的部件"
+            >
+              {partialMatchMode === 'surface' ? '✓ ' : ''}表面 RANSAC
+            </Button>
+          </div>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8 }}>
+            当前：{partialMatchMode === 'limb-structure'
+              ? '只输出肩/肘/手（或髋/膝/脚）3 个大结构锚点，优先对齐 PCA 方向与弯折朝向。'
+              : '输出多组局部表面候选点，仍受局部细节影响。'}
+          </div>
+
+          {partialMatchMode === 'limb-structure' && (
+            <div
+              style={{
+                marginBottom: 8,
+                padding: 8,
+                border: '1px solid rgba(127,217,127,0.35)',
+                borderRadius: 3,
+                background: 'rgba(127,217,127,0.06)',
+                fontSize: 10,
+                color: 'var(--text-secondary)',
+                lineHeight: 1.5,
+              }}
+            >
+              实验模式：Step 1 会直接检测 root / bend / end 三个结构锚点；下方采样数、Top-K、RANSAC、描述子参数只影响“表面 RANSAC”模式。
+            </div>
+          )}
+
           <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
             主轴 (axial) 特征权重（圆柱形部件必备，0=关闭）
           </div>
@@ -3226,6 +3558,22 @@ export function ModelAssemble({ onStatusChange }: Props) {
           />
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
             {partialAxialWeight.toFixed(1)} {partialAxialWeight === 0 ? '(关闭)' : ''}
+          </div>
+
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            Macro saliency rings（抗小突起；越大越看大形）
+          </div>
+          <input
+            type="range"
+            min={1}
+            max={12}
+            step={1}
+            value={partialMacroSaliencyRings}
+            onChange={(e) => setPartialMacroSaliencyRings(Number(e.target.value))}
+            style={{ width: '100%' }}
+          />
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {partialMacroSaliencyRings} rings · 当前描述半径：{PARTIAL_RADIUS_FRACTIONS.join(' / ')} × src bbox
           </div>
 
           <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
@@ -3337,9 +3685,13 @@ export function ModelAssemble({ onStatusChange }: Props) {
             loading={partialLoading}
             disabled={partialLoading}
             style={{ width: '100%', justifyContent: 'center' }}
-            title="执行完整 partial-match：采样、descriptor top-K、RANSAC 筛选，并生成供 Step 2 使用的候选对应点"
+            title={partialMatchMode === 'limb-structure'
+              ? '执行结构匹配：检测 root / bend / end 三个大结构锚点，并生成供 Step 2 使用的对应点'
+              : '执行完整 partial-match：采样、descriptor top-K、RANSAC 筛选，并生成供 Step 2 使用的候选对应点'}
           >
-            {partialLoading ? '计算中…' : 'Step 1 · RANSAC 生成候选对'}
+            {partialLoading ? '计算中…' : partialMatchMode === 'limb-structure'
+              ? 'Step 1 · 结构锚点生成候选对'
+              : 'Step 1 · RANSAC 生成候选对'}
           </Button>
           <Button
             size="sm"
@@ -3372,19 +3724,50 @@ export function ModelAssemble({ onStatusChange }: Props) {
                   marginBottom: 4,
                 }}
               >
-                RANSAC 结果：{partialMatchSummary.status === 'success' ? '成功' : '失败'}
+                {partialMatchSummary.mode === 'limb-structure' ? '结构锚点结果' : 'RANSAC 结果'}：{partialMatchSummary.status === 'success' ? '成功' : '失败'}
               </div>
-              <div>Source samples：{partialMatchSummary.rawSrcSamples}</div>
-              <div>Target samples：{partialMatchSummary.rawTarSamples}</div>
-              <div>Top-K：{partialMatchSummary.topK}</div>
-              <div>Iterations：{partialMatchSummary.iterationsRun}</div>
-              <div>Best inliers：{partialMatchSummary.bestInlierCount}</div>
-              <div>Final pairs：{partialMatchSummary.pairs}</div>
-              <div>Threshold：{partialMatchSummary.thresholdUsed.toFixed(4)}</div>
+              {partialMatchSummary.mode === 'limb-structure' ? (
+                <>
+                  <div>Anchors：root / bend / end</div>
+                  <div>Source bend strength：{diagnosticNumber(partialMatchSummary.diagnostics, 'srcBendStrength')?.toFixed(4) ?? '-'}</div>
+                  <div>Target bend strength：{diagnosticNumber(partialMatchSummary.diagnostics, 'tarBendStrength')?.toFixed(4) ?? '-'}</div>
+                  <div>Target root by：{diagnosticString(partialMatchSummary.diagnostics, 'targetRootBy') ?? '-'}</div>
+                  <div>Final pairs：{partialMatchSummary.pairs}</div>
+                </>
+              ) : (
+                <>
+                  <div>Source samples：{partialMatchSummary.rawSrcSamples}</div>
+                  <div>Target samples：{partialMatchSummary.rawTarSamples}</div>
+                  <div>Top-K：{partialMatchSummary.topK}</div>
+                  <div>Iterations：{partialMatchSummary.iterationsRun}</div>
+                  <div>Best inliers：{partialMatchSummary.bestInlierCount}</div>
+                  <div>Final pairs：{partialMatchSummary.pairs}</div>
+                  <div>Threshold：{partialMatchSummary.thresholdUsed.toFixed(4)}</div>
+                </>
+              )}
               <div>
                 RMSE：{Number.isFinite(partialMatchSummary.rmse) ? partialMatchSummary.rmse.toFixed(4) : '∞'}
               </div>
               <div>耗时：{partialMatchSummary.elapsedMs.toFixed(1)}ms</div>
+              {partialMatchSummary.warnings && partialMatchSummary.warnings.length > 0 && (
+                <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid var(--border-default)', color: '#e9d36c' }}>
+                  {partialMatchSummary.warnings.map((warning, i) => (
+                    <div key={i}>⚠ {warning}</div>
+                  ))}
+                </div>
+              )}
+              {partialMatchSummary.timings && (
+                <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid var(--border-default)' }}>
+                  <div>计时 total：{partialMatchSummary.timings.totalMs.toFixed(1)}ms</div>
+                  <div>saliency：{partialMatchSummary.timings.saliencyMs.toFixed(1)}ms</div>
+                  <div>sampling：{partialMatchSummary.timings.samplingMs.toFixed(1)}ms</div>
+                  <div>spatial hash：{partialMatchSummary.timings.spatialHashMs.toFixed(1)}ms</div>
+                  <div>FPFH/SPFH：{partialMatchSummary.timings.fpfhSpfhMs.toFixed(1)}ms</div>
+                  <div>topK：{partialMatchSummary.timings.topKMs.toFixed(1)}ms</div>
+                  <div>RANSAC：{partialMatchSummary.timings.ransacMs.toFixed(1)}ms</div>
+                  <div>axial trials：{partialMatchSummary.timings.axialTrials.length}</div>
+                </div>
+              )}
             </div>
           )}
         </PanelSection>}
@@ -3450,9 +3833,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
           </PanelSection>
         )}
 
-        {showAdvanced && <PanelSection title="RANSAC 候选对" defaultCollapsed>
+        {showAdvanced && <PanelSection title="Step 1 候选对 / 结构锚点" defaultCollapsed>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6, lineHeight: 1.5 }}>
-            这里显示 Step 1 RANSAC 筛选后的 source ↔ target 对应点，
+            这里显示 Step 1 输出的 source ↔ target 对应点：结构模式通常是 root / bend / end 3 对，表面模式是 RANSAC 筛选后的候选点。
             可以单独审阅、接受或拒绝；接受后用于 Step 2 Landmark SVD。
           </div>
 
@@ -3481,7 +3864,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
             {candidates.length === 0 && (
               <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-                运行 “一键自动对齐” 或 “Step 1 · RANSAC 生成候选对” 后，候选对会出现在这里。
+                运行“一键 · 四肢大结构对齐 / RANSAC 对齐”或 Step 1 后，候选对会出现在这里。
               </div>
             )}
             {candidates.map((c, i) => {
@@ -3798,6 +4181,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
               >
                 <div style={{ color: q.color, fontWeight: 700 }}>对齐质量：{q.label}</div>
                 <div>目标区域：{autoAlignSummary.regionLabel ?? '(未指定)'}</div>
+                <div>一键模式：{autoAlignSummary.mode === 'limb-structure' ? '四肢大结构' : 'RANSAC'}</div>
                 <div>匹配点：{autoAlignSummary.pairs}</div>
                 <div>RMSE：{autoAlignSummary.rmse.toFixed(3)}</div>
                 <div>Scale：{autoAlignSummary.scale.toFixed(3)}</div>
@@ -3807,7 +4191,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
             );
           })() : (
             <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6 }}>
-              点击“自动对齐到目标区域”后，这里会显示匹配点、RMSE、scale 和质量评级。
+              点击“一键 · 四肢大结构对齐”或“一键 · RANSAC 对齐”后，这里会显示匹配点、RMSE、scale 和质量评级。
             </div>
           )}
 
@@ -3818,8 +4202,11 @@ export function ModelAssemble({ onStatusChange }: Props) {
             <Button size="sm" onClick={resetPreview} disabled={!alignResult && !resultPreview} style={{ justifyContent: 'center' }}>
               撤销
             </Button>
-            <Button size="sm" onClick={handleAutoAlign} loading={partialLoading || aligning} disabled={partialLoading || aligning} style={{ justifyContent: 'center' }}>
-              重新匹配
+            <Button size="sm" onClick={() => handleAutoAlign('limb-structure')} loading={partialLoading || aligning} disabled={partialLoading || aligning} style={{ justifyContent: 'center' }}>
+              重跑大结构
+            </Button>
+            <Button size="sm" onClick={() => handleAutoAlign('surface')} loading={partialLoading || aligning} disabled={partialLoading || aligning} style={{ justifyContent: 'center' }}>
+              重跑 RANSAC
             </Button>
             <Button
               size="sm"
