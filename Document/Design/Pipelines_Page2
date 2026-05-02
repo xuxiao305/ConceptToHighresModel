@@ -11,6 +11,7 @@ Pipeline名：Jacket Extract
     - 1. 使用Banana Pro的提取外套提示词，获取外套的四合一图片
     - 2. 得到输出的结果以后，自动调用和comfyui workflow里类似算法，对图片进行remove background (make background white), smart crop & enlarge
     - 3. 将四合一的图片作为节点预览，切割好的图片作为输出给下一个节点
+- 不再保留独立的 3. Multi-View 节点；四视图切分作为 Jacket Extraction 的内部输出处理，后续节点直接接 Jacket Extraction
 
 - 后续几个节点保持不变
 
