@@ -25,8 +25,8 @@ const NODES: NodeConfig[] = [
   { id: 'concept', title: 'Concept', display: 'image', description: '上传概念设计稿' },
   { id: 'tpose', title: 'T Pose', display: 'image', description: '生成标准 T Pose 正视图' },
   { id: 'multiview', title: 'Multi-View', display: 'multiview', description: '生成多角度视图' },
-  { id: 'rough', title: 'Rough Model', display: '3d', description: 'Tripo AI 生成 3D 粗模 (GLB)' },
-  { id: 'rigging', title: 'Rough Model Rigging', display: '3d', description: '骨骼绑定' },
+  { id: 'rough', title: '3D Model', display: '3d', description: 'Tripo / TRELLIS.2 生成 3D 模型 (GLB)' },
+  { id: 'rigging', title: '3D Model Rigging', display: '3d', description: '骨骼绑定' },
   // 独立节点，与上游不走连线（输入从 Multi-View 读，输出单独供 Page 2 使用）
   { id: 'extraction', title: 'Remove Jacket', display: 'image', description: '基于 Multi-View，使用 Banana Pro 移除外套' },
 ];
@@ -42,7 +42,7 @@ const NODE_KEYS = [
 ];
 
 // ----------------------------------------------------------------------------
-// Rough Model 后端选择
+// 3D Model 后端选择
 // ----------------------------------------------------------------------------
 type RoughBackend = 'tripo' | 'trellis2';
 
@@ -86,9 +86,9 @@ interface NodeOutputs {
   conceptUrl: string | null;
   tposeUrl: string | null;
   multiviewUrl: string | null;
-  /** Rough model（GLB）blob URL，用于触发浏览器下载 */
+  /** 3D Model（GLB）blob URL，用于触发浏览器下载 */
   roughUrl: string | null;
-  /** Rough model 工程文件名（用于显示） */
+  /** 3D Model 工程文件名（用于显示） */
   roughFile: string | null;
   /** Extraction（Banana Pro）输出 */
   extractionUrl: string | null;
@@ -114,7 +114,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
   });
   const roughAbortRef = useRef<AbortController | null>(null);
 
-  // Rough Model 后端选择 + 各后端参数（持久化到 localStorage）
+  // 3D Model 后端选择 + 各后端参数（持久化到 localStorage）
   const [roughBackend, setRoughBackend] = useState<RoughBackend>(loadRoughBackend);
   const [trellis2Params, setTrellis2Params] = useState<Trellis2Params>(loadTrellis2Params);
   // 仅当 backend === 'trellis2' 时显示参数面板
@@ -138,7 +138,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
   const [selectedFiles, setSelectedFiles] = useState<Record<number, string>>({});
   // 大图预览
   const [preview, setPreview] = useState<{ url: string; title: string } | null>(null);
-  // 3D Mesh Viewer 当前显示的 GLB URL（双击 Rough Model 节点设置）
+  // 3D Mesh Viewer 当前显示的 GLB URL（双击 3D Model 节点设置）
   const [viewerUrl, setViewerUrl] = useState<string | null>(null);
   const [viewerLabel, setViewerLabel] = useState<string | null>(null);
   // 链式运行中标记，避免并发
@@ -221,7 +221,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         else if (tpose) next[2] = 'ready';
         if (rough) next[3] = 'complete';
         else if (multiview) next[3] = 'ready';
-        // Extraction 是独立节点：源是 Multi-View，但不阻塞 Rough Model 链路。
+        // Extraction 是独立节点：源是 Multi-View，但不阻塞 3D Model 链路。
         if (extraction) next[5] = 'complete';
         else if (multiview) next[5] = 'ready';
         return next;
@@ -231,7 +231,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (concept) loaded.push('Concept');
       if (tpose) loaded.push('T Pose');
       if (multiview) loaded.push('Multi-View');
-      if (rough) loaded.push('Rough Model');
+      if (rough) loaded.push('3D Model');
       if (extraction) loaded.push('Extraction');
       onStatusChange(
         loaded.length
@@ -484,7 +484,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     }
   }, [onStatusChange, setNodeState, project, saveAsset, saveSegments, refreshHistory]);
 
-  // ---- Rough Model node (Tripo / TRELLIS.2 image → GLB) ----------------
+  // ---- 3D Model node (Tripo / TRELLIS.2 image → GLB) ----------------
   const runRoughModel = useCallback(async (sourceUrl?: string): Promise<string | null> => {
     // 防御：当作为 button onClick handler 直接绑定时，会收到 SyntheticEvent 作为参数
     const mvUrl = (typeof sourceUrl === 'string' ? sourceUrl : null) ?? outputsRef.current.multiviewUrl;
@@ -499,7 +499,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     roughAbortRef.current = ctrl;
 
     const backend = roughBackend;
-    onStatusChange(`Rough Model: 使用后端 ${BACKEND_LABEL[backend]}`, 'info');
+    onStatusChange(`3D Model: 使用后端 ${BACKEND_LABEL[backend]}`, 'info');
 
     try {
       // 读取多视图切分（front/left/back/right）—— Tripo 多视图模式与 trellis2 单图模式都依赖 front 视图
@@ -538,7 +538,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                 'info',
               );
               console.log(
-                `[Rough Model] 多视图源（dir=${seg.dirName}, source=${seg.index.source}）:\n` +
+                `[3D Model] 多视图源（dir=${seg.dirName}, source=${seg.index.source}）:\n` +
                   `  front: ${fileMap.front ?? '(缺失)'}\n` +
                   `  left:  ${fileMap.left  ?? '(缺失)'}\n` +
                   `  back:  ${fileMap.back  ?? '(缺失)'}\n` +
@@ -547,7 +547,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
             }
           }
         } catch (e) {
-          console.warn('[Rough Model] 读取切分集失败：', e);
+          console.warn('[3D Model] 读取切分集失败：', e);
         }
       }
 
@@ -582,7 +582,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         blob = t2Result.blob;
         saveLabel = `trellis2 seed=${t2Result.meta.seed} ` +
           `gen=${t2Result.meta.elapsedGenSec}s bake=${t2Result.meta.elapsedBakeSec}s`;
-        console.log('[Rough Model] TRELLIS.2 meta:', t2Result.meta);
+        console.log('[3D Model] TRELLIS.2 meta:', t2Result.meta);
         onStatusChange(
           `TRELLIS.2 完成 · 总 ${t2Result.meta.elapsedTotalSec}s（生成 ${t2Result.meta.elapsedGenSec}s + 烘焙 ${t2Result.meta.elapsedBakeSec}s）· ${(t2Result.meta.glbBytes / 1024 / 1024).toFixed(1)} MB`,
           'success',
@@ -615,13 +615,13 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           );
           if (v) {
             savedFile = v.file;
-            onStatusChange(`粗模已保存到工程：${v.file}`, 'success');
+            onStatusChange(`3D Model 已保存到工程：${v.file}`, 'success');
             setSelectedFiles((prev) => ({ ...prev, 3: v.file }));
             refreshHistory(3);
           }
         } catch (e) {
           onStatusChange(
-            `粗模保存失败：${e instanceof Error ? e.message : String(e)}`,
+            `3D Model 保存失败：${e instanceof Error ? e.message : String(e)}`,
             'error'
           );
         }
@@ -642,7 +642,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         if (next[4] === 'idle') next[4] = 'ready';
         return next;
       });
-      onStatusChange('Rough Model 生成完成', 'success');
+      onStatusChange('3D Model 生成完成', 'success');
       return url;
     } catch (err) {
       const msg =
@@ -653,10 +653,10 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           : err instanceof Error
           ? err.message
           : String(err);
-      console.error('[Rough Model] failed:', err);
+      console.error('[3D Model] failed:', err);
       setNodeState(3, 'error');
       setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 3: msg } }));
-      onStatusChange(`Rough Model 生成失败：${msg}`, 'error');
+      onStatusChange(`3D Model 生成失败：${msg}`, 'error');
       return null;
     } finally {
       roughAbortRef.current = null;
@@ -755,7 +755,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     }
   }, [onStatusChange, setNodeState, project, saveAsset, saveSegments, refreshHistory]);
 
-  // ---- Mock runner for nodes 3..4 (Rough Model / Rigging) -----------------
+  // ---- Mock runner for nodes 3..4 (3D Model / Rigging) -----------------
   const runMockNode = useCallback(
     (idx: number): Promise<boolean> => {
       setNodeState(idx, 'running');
@@ -1279,7 +1279,7 @@ function renderActions(
 }
 
 // ---------------------------------------------------------------------------
-// Rough Model 后端选择 + TRELLIS.2 参数面板
+// 3D Model 后端选择 + TRELLIS.2 参数面板
 // ---------------------------------------------------------------------------
 
 interface RoughBackendPanelProps {

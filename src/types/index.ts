@@ -36,6 +36,9 @@ export interface NodeConfig {
  */
 export type PipelineMode = 'extraction' | 'multiview';
 
+/** Page2 3D Model generation mode. */
+export type Model3DMode = 'single' | 'frontBack' | 'fourView';
+
 export interface ExtractionState {
   /** 当前展示的图片 blob: URL（生成结果或选中的历史版本） */
   resultUrl: string | null;
@@ -52,6 +55,17 @@ export interface ImageInputState {
   imageFile?: string | null;
 }
 
+export interface Model3DState {
+  /** 当前展示的 GLB blob: URL */
+  glbUrl: string | null;
+  /** 当前 GLB 对应的工程文件名 */
+  glbFile?: string | null;
+  /** 生成模式 */
+  mode?: Model3DMode;
+  /** 错误信息（若有） */
+  error?: string;
+}
+
 export interface PartPipelineState {
   id: string;
   name: string;
@@ -64,6 +78,8 @@ export interface PartPipelineState {
   imageInput?: ImageInputState;
   /** Extraction 节点模式 + 结果（在 React state 中维护，未持久化到工程目录） */
   extraction?: ExtractionState;
+  /** 3D Model 节点结果 */
+  model3d?: Model3DState;
 }
 
 export type PageId = 'page1' | 'page2' | 'page3';

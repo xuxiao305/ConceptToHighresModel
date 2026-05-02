@@ -1,6 +1,6 @@
 /**
  * GLBThumbnail — compact textured 3D preview for use inside node cards
- * (e.g. the Rough Model node in the page-1 pipeline).
+ * (e.g. the 3D Model node in the page-1 pipeline).
  *
  * Behavior:
  *   - Loads the GLB and renders its original PBR materials/textures.

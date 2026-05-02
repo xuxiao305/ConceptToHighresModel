@@ -38,6 +38,10 @@ const makePart = (idx: number, mode: PipelineMode = 'extraction'): PartPipelineS
   extraction: {
     resultUrl: null,
   },
+  model3d: {
+    glbUrl: null,
+    mode: 'fourView',
+  },
 });
 
 /** PartPipelineState → 可持久化的精简表示 */
@@ -47,6 +51,8 @@ function toPersisted(p: PartPipelineState): PersistedPipeline {
     mode: p.mode,
     imageFile: p.imageInput?.imageFile ?? null,
     resultFile: p.extraction?.resultFile ?? null,
+    modelFile: p.model3d?.glbFile ?? null,
+    modelMode: p.model3d?.mode ?? 'fourView',
   };
 }
 
@@ -55,11 +61,13 @@ function fromPersisted(pp: PersistedPipeline, index: number): PartPipelineState 
   const nodeStates = makeInitialNodeStates(pp.mode);
   nodeStates[0] = pp.imageFile ? 'complete' : 'ready';
   if (pp.resultFile) nodeStates[1] = 'complete';
-  // Promote downstream nodes (across optional gaps) so e.g. Highres Model 3D
+  const nodes = getPartNodes(pp.mode);
+  const modelIdx = nodes.findIndex((n) => n.id === 'highres');
+  if (pp.modelFile && modelIdx >= 0) nodeStates[modelIdx] = 'complete';
+  // Promote downstream nodes (across optional gaps) so e.g. 3D Model
   // becomes 'ready' instead of stuck at 'idle' when Modify is optional.
-  const lastComplete = pp.resultFile ? 1 : pp.imageFile ? 0 : -1;
+  const lastComplete = pp.modelFile && modelIdx >= 0 ? modelIdx : pp.resultFile ? 1 : pp.imageFile ? 0 : -1;
   if (lastComplete >= 0) {
-    const nodes = getPartNodes(pp.mode);
     for (let i = lastComplete + 1; i < nodeStates.length; i++) {
       if (nodeStates[i] !== 'idle' && nodeStates[i] !== 'optional') continue;
       nodeStates[i] = nodes[i]?.optional ? 'optional' : 'ready';
@@ -78,6 +86,11 @@ function fromPersisted(pp: PersistedPipeline, index: number): PartPipelineState 
     extraction: {
       resultUrl: null,
       resultFile: pp.resultFile ?? null,
+    },
+    model3d: {
+      glbUrl: null,
+      glbFile: pp.modelFile ?? null,
+      mode: pp.modelMode ?? 'fourView',
     },
   };
 }

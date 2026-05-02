@@ -1,10 +1,11 @@
 import { useState, useCallback, useEffect, useRef, type ReactNode } from 'react';
-import type { NodeConfig, NodeState, PartPipelineState, PipelineMode } from '../../types';
+import type { Model3DMode, NodeConfig, NodeState, PartPipelineState, PipelineMode } from '../../types';
 import { NodeCard } from '../../components/NodeCard';
 import { NodeConnector } from '../../components/NodeConnector';
 import { Button } from '../../components/Button';
 import { Placeholder } from '../../components/Placeholder';
 import { ImagePreviewModal } from '../../components/ImagePreviewModal';
+import { GLBThumbnail } from '../../components/GLBThumbnail';
 import { useProject } from '../../contexts/ProjectContext';
 import {
   EXTRACT_JACKET_PROMPT,
@@ -17,6 +18,7 @@ import {
 } from '../../services/extraction';
 import { type AssetVersion } from '../../services/projectStore';
 import { splitMultiView, smartCropAndEnlargeAuto } from '../../services/multiviewSplit';
+import { runImageToModel, runMultiViewToModel, TripoServiceError, type MultiViewInputs } from '../../services/tripo';
 
 /**
  * Full node list (Mode 'multiview' = Jacket Extract pipeline). Mode
@@ -34,7 +36,7 @@ export const PART_NODES: NodeConfig[] = [
   { id: 'extraction', title: 'Jacket Extraction', display: 'image' },
   { id: 'multiview', title: 'Multi-View', display: 'multiview' },
   { id: 'modify', title: 'Modify', display: 'image', optional: true },
-  { id: 'highres', title: 'Highres Model 3D', display: '3d' },
+  { id: 'highres', title: '3D Model', display: '3d' },
   { id: 'retex', title: 'Re-Texturing', display: '3d', optional: true },
   { id: 'region', title: 'Region Define', display: '3d', optional: true },
 ];
@@ -77,6 +79,18 @@ const PIPELINE_MODE_LABEL: Record<PipelineMode, string> = {
   multiview: 'Jacket Extract',
 };
 
+const MODEL_3D_MODE_LABEL: Record<Model3DMode, string> = {
+  single: '单独生成',
+  frontBack: '前后图生成',
+  fourView: '四视图生成',
+};
+
+const MODEL_3D_MODE_DESC: Record<Model3DMode, string> = {
+  single: 'Tripo 单图 image_to_model：只使用 front 视图。',
+  frontBack: 'Tripo multiview_to_model：只提交 front + back。',
+  fourView: 'Tripo multiview_to_model：front / left / back / right，顺序与现有 3D Model 接口一致。',
+};
+
 interface Props {
   pipeline: PartPipelineState;
   index: number;
@@ -89,7 +103,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
   const { project, loadLatest, saveAsset, listHistory, loadByName, saveSegments } = useProject();
   const [renaming, setRenaming] = useState(false);
   const [draftName, setDraftName] = useState(pipeline.name);
-  const [splitView, setSplitView] = useState(false);
+  const modelAbortRef = useRef<AbortController | null>(null);
 
   // Mode-specific node list. Mode A · Extraction omits the standalone Multi-View
   // node since the Extract Jacket node already produces a 4-view sheet directly.
@@ -97,6 +111,8 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
 
   // Extraction 节点历史版本（仅本 Pipeline 自己的，按 pipeline.name 前缀过滤）
   const [extractionHistory, setExtractionHistory] = useState<AssetVersion[]>([]);
+  // 3D Model 节点历史版本（仅本 Pipeline 自己的，按 pipeline.name 前缀过滤）
+  const [modelHistory, setModelHistory] = useState<AssetVersion[]>([]);
   // 图片大图预览
   const [preview, setPreview] = useState<{ url: string; title: string } | null>(null);
 
@@ -164,6 +180,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
   // Extraction sub-state — Page2 fixes mode='banana' and the "Extract Jacket"
   // prompt, so no UI mutator is needed; runner reads/writes resultUrl/file.
   const extraction = pipeline.extraction ?? { resultUrl: null };
+  const model3d = pipeline.model3d ?? { glbUrl: null, mode: 'fourView' as Model3DMode };
 
   // Helpers to update imageInput sub-state immutably.
   const imageInput = pipeline.imageInput ?? { imageUrl: null };
@@ -196,7 +213,23 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     }
   }, [project, listHistory, safeName]);
 
+  const refreshModelHistory = useCallback(async () => {
+    if (!project) {
+      setModelHistory([]);
+      return;
+    }
+    try {
+      const all = await listHistory('page2.highres');
+      const mine = all.filter((v) => v.file.startsWith(`${safeName}_`));
+      setModelHistory(mine);
+    } catch (err) {
+      console.warn('[PartPipeline] list 3D model history failed:', err);
+      setModelHistory([]);
+    }
+  }, [project, listHistory, safeName]);
+
   useEffect(() => { void refreshExtractionHistory(); }, [refreshExtractionHistory]);
+  useEffect(() => { void refreshModelHistory(); }, [refreshModelHistory]);
 
   // Project loaded but the in-memory extraction state is empty → auto-load the
   // latest saved extraction as the current preview, so the node doesn't snap
@@ -238,6 +271,42 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       );
     }
   }, [project, loadByName, pipeline, extraction, onUpdate, onStatus]);
+
+  const handleSelectModelHistory = useCallback(async (fileName: string) => {
+    if (!project || !fileName) return;
+    try {
+      const r = await loadByName('page2.highres', fileName);
+      if (!r) {
+        onStatus(`[${pipeline.name}] 无法读取该 3D Model 历史版本`, 'error');
+        return;
+      }
+      if (model3d.glbUrl) URL.revokeObjectURL(model3d.glbUrl);
+      const modelIdx = partNodes.findIndex((n) => n.id === 'highres');
+      onUpdate(pipeline.id, {
+        ...pipeline,
+        nodeStates: modelIdx >= 0
+          ? promoteDownstream(
+              pipeline.nodeStates.map((v, idx) => (idx === modelIdx ? 'complete' : v)),
+              modelIdx,
+              partNodes,
+            )
+          : pipeline.nodeStates,
+        model3d: { ...model3d, glbUrl: r.url, glbFile: fileName, error: undefined },
+      });
+      onStatus(`[${pipeline.name}] 已切换到 3D Model：${fileName}`, 'success');
+    } catch (err) {
+      onStatus(
+        `[${pipeline.name}] 加载 3D Model 历史失败：${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    }
+  }, [project, loadByName, pipeline, model3d, partNodes, onUpdate, onStatus]);
+
+  useEffect(() => {
+    if (!project) return;
+    if (!model3d.glbFile || model3d.glbUrl) return;
+    void handleSelectModelHistory(model3d.glbFile);
+  }, [project, model3d.glbFile, model3d.glbUrl, handleSelectModelHistory]);
 
   const setStateAt = useCallback(
     (i: number, s: NodeState) => {
@@ -445,12 +514,145 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     }
   }, [pipeline, extraction, sourceFile, onStatus, onUpdate, project, saveAsset, saveSegments, refreshExtractionHistory]);
 
+  const run3DModel = useCallback(async (): Promise<string | null> => {
+    const modelIdx = partNodes.findIndex((n) => n.id === 'highres');
+    if (modelIdx < 0) return null;
+
+    let extractionBlob: Blob | null = null;
+    if (extraction.resultUrl) {
+      extractionBlob = await (await fetch(extraction.resultUrl)).blob();
+    } else if (project && extraction.resultFile) {
+      const r = await loadByName('page2.extraction', extraction.resultFile);
+      extractionBlob = r?.blob ?? null;
+    }
+    if (!extractionBlob) {
+      onStatus(`[${pipeline.name}] 缺少 Extraction 输出：请先完成 General/Jacket Extraction`, 'error');
+      return null;
+    }
+
+    const mode = model3d.mode ?? 'fourView';
+    const ctrl = new AbortController();
+    modelAbortRef.current = ctrl;
+
+    onUpdate(pipeline.id, {
+      ...pipeline,
+      nodeStates: pipeline.nodeStates.map((v, idx) => (idx === modelIdx ? 'running' : v)),
+      model3d: { ...model3d, error: undefined },
+    });
+    onStatus(`[${pipeline.name}] 3D Model · ${MODEL_3D_MODE_LABEL[mode]} 开始…`, 'info');
+
+    try {
+      const slices = await splitMultiView(extractionBlob);
+      const byView = new Map(slices.map((s) => [s.view, s.blob]));
+      const front = byView.get('front');
+      const left = byView.get('left') ?? null;
+      const back = byView.get('back') ?? null;
+      const right = byView.get('right') ?? null;
+
+      if (!front) throw new Error('未能从 Extraction 输出中切分出 front 视图');
+      if (mode === 'frontBack' && !back) throw new Error('前后图生成需要 front + back 视图');
+      if (mode === 'fourView' && (!left || !back || !right)) {
+        throw new Error('四视图生成需要 front / left / back / right 四张视图');
+      }
+
+      let blob: Blob;
+      let saveLabel: string;
+      if (mode === 'single') {
+        const r = await runImageToModel(front, {
+          onStatus: (msg) => onStatus(`[${pipeline.name}] ${msg}`, 'info'),
+          signal: ctrl.signal,
+          filename: 'front.png',
+        });
+        blob = r.blob;
+        saveLabel = `3D Model · Tripo single front · task ${r.result.task_id}`;
+      } else {
+        const inputs: MultiViewInputs = mode === 'frontBack'
+          ? { front, back }
+          : { front, left, back, right };
+        const r = await runMultiViewToModel(inputs, {
+          onStatus: (msg) => onStatus(`[${pipeline.name}] ${msg}`, 'info'),
+          signal: ctrl.signal,
+        });
+        blob = r.blob;
+        saveLabel = `3D Model · Tripo ${mode === 'frontBack' ? 'front/back' : 'four-view'} · task ${r.result.task_id}`;
+      }
+
+      let savedFile: string | null = null;
+      if (project) {
+        try {
+          const v = await saveAsset('page2.highres', blob, 'glb', saveLabel, pipeline.name);
+          if (v) {
+            savedFile = v.file;
+            onStatus(`[${pipeline.name}] 3D Model 已保存到工程：${v.file}`, 'success');
+          }
+        } catch (e) {
+          onStatus(
+            `[${pipeline.name}] 3D Model 保存失败：${e instanceof Error ? e.message : String(e)}`,
+            'error',
+          );
+        }
+      }
+
+      const glbUrl = URL.createObjectURL(blob);
+      if (model3d.glbUrl) URL.revokeObjectURL(model3d.glbUrl);
+      onUpdate(pipeline.id, {
+        ...pipeline,
+        nodeStates: promoteDownstream(
+          pipeline.nodeStates.map((v, idx) => (idx === modelIdx ? 'complete' : v)),
+          modelIdx,
+          partNodes,
+        ),
+        model3d: { ...model3d, glbUrl, glbFile: savedFile, mode, error: undefined },
+      });
+      void refreshModelHistory();
+      onStatus(`[${pipeline.name}] 3D Model 完成`, 'success');
+      return glbUrl;
+    } catch (err) {
+      if (err instanceof TripoServiceError && err.message === '已取消') {
+        onUpdate(pipeline.id, {
+          ...pipeline,
+          nodeStates: pipeline.nodeStates.map((v, idx) => (idx === modelIdx ? 'ready' : v)),
+          model3d: { ...model3d, error: undefined },
+        });
+        onStatus(`[${pipeline.name}] 已取消 3D Model 生成`, 'warning');
+        return null;
+      }
+      const msg =
+        err instanceof TripoServiceError
+          ? `${err.message}${err.error_code ? ` (code ${err.error_code})` : ''}${
+              err.task_id ? ` [task ${err.task_id}]` : ''
+            }`
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      console.error('[PartPipeline] 3D Model failed:', err);
+      onUpdate(pipeline.id, {
+        ...pipeline,
+        nodeStates: pipeline.nodeStates.map((v, idx) => (idx === modelIdx ? 'error' : v)),
+        model3d: { ...model3d, error: msg },
+      });
+      onStatus(`[${pipeline.name}] 3D Model 失败：${msg}`, 'error');
+      return null;
+    } finally {
+      modelAbortRef.current = null;
+    }
+  }, [partNodes, extraction, project, loadByName, pipeline, model3d, onStatus, onUpdate, saveAsset, refreshModelHistory]);
+
+  const cancel3DModel = useCallback(() => {
+    modelAbortRef.current?.abort();
+    modelAbortRef.current = null;
+  }, []);
+
   const runNode = useCallback(
     (i: number) => {
       // Extraction node: dispatches to SAM3 (General Extraction) or Banana
       // Pro (Extract Jacket) based on pipeline.mode — see runExtraction().
       if (i === 1) {
         void runExtraction();
+        return;
+      }
+      if (partNodes[i]?.id === 'highres') {
+        void run3DModel();
         return;
       }
       const updated: PartPipelineState = {
@@ -479,7 +681,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
         onStatus(`[${pipeline.name}] ${partNodes[i].title} 完成`, 'success');
       }, 2000);
     },
-    [pipeline, onUpdate, onStatus, runExtraction]
+    [pipeline, onUpdate, onStatus, runExtraction, run3DModel, partNodes]
   );
 
   const toggleExpand = (i: number) => {
@@ -600,12 +802,13 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
                   selected={extraction.resultFile ?? undefined}
                   onSelect={handleSelectExtractionHistory}
                 />
+              ) : node.id === 'highres' && project && modelHistory.length > 0 ? (
+                <HistoryDropdown
+                  history={modelHistory}
+                  selected={model3d.glbFile ?? undefined}
+                  onSelect={handleSelectModelHistory}
+                />
               ) : undefined;
-
-            const displayType =
-              node.id === 'highres' && splitView && state === 'complete'
-                ? 'split3d'
-                : node.display;
 
             const body: ReactNode = (
               <>
@@ -627,18 +830,45 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
                     label={`${pipeline.name} · ${node.title}`}
                     mode={pipeline.mode}
                   />
+                ) : node.id === 'highres' ? (
+                  <Model3DBody
+                    state={state}
+                    glbUrl={model3d.glbUrl}
+                    glbFile={model3d.glbFile ?? null}
+                    error={model3d.error}
+                    mode={model3d.mode ?? 'fourView'}
+                    onModeChange={(mode) => {
+                      onUpdate(pipeline.id, {
+                        ...pipeline,
+                        model3d: { ...model3d, mode },
+                      });
+                    }}
+                    disabled={state === 'running'}
+                  />
                 ) : (
-                  <Placeholder type={displayType} state={state} label={`${pipeline.name} · ${node.title}`} />
-                )}
-                {node.id === 'highres' && state === 'complete' && (
-                  <div style={{ marginTop: 6, fontSize: 10, color: 'var(--text-muted)' }}>
-                    {splitView ? '左右分屏对比中' : '单视图模式'}
-                  </div>
+                  <Placeholder type={node.display} state={state} label={`${pipeline.name} · ${node.title}`} />
                 )}
               </>
             );
 
-            const actions = renderPartActions(node, state, i, runNode, setStateAt, splitView, setSplitView);
+            const actions = renderPartActions(
+              node,
+              state,
+              i,
+              runNode,
+              setStateAt,
+              cancel3DModel,
+              model3d.glbUrl
+                ? () => {
+                    const a = document.createElement('a');
+                    a.href = model3d.glbUrl!;
+                    a.download = model3d.glbFile ?? `${pipeline.name}_3d_model.glb`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                  }
+                : undefined,
+            );
 
             // 双击节点正文：图像类节点弹大图预览。
             const previewImageUrl =
@@ -692,8 +922,8 @@ function renderPartActions(
   idx: number,
   runNode: (i: number) => void,
   setStateAt: (i: number, s: NodeState) => void,
-  splitView: boolean,
-  setSplitView: (v: boolean) => void
+  cancel3DModel?: () => void,
+  download3DModel?: () => void,
 ): ReactNode {
   if (node.optional && state === 'optional') {
     return (
@@ -724,11 +954,12 @@ function renderPartActions(
   if (node.id === 'highres' && isComplete) {
     extraButtons.push(
       <Button
-        key="cmp"
+        key="download"
         size="sm"
-        onClick={() => setSplitView(!splitView)}
+        disabled={!download3DModel}
+        onClick={download3DModel}
       >
-        {splitView ? '关闭对比' : '对比粗模'}
+        下载 GLB
       </Button>
     );
   }
@@ -744,7 +975,16 @@ function renderPartActions(
       {isError ? (
         <Button variant="primary" size="sm" onClick={() => runNode(idx)}>重试</Button>
       ) : isRunning ? (
-        <Button variant="danger" size="sm" onClick={() => setStateAt(idx, 'ready')}>取消</Button>
+        <Button
+          variant="danger"
+          size="sm"
+          onClick={() => {
+            if (node.id === 'highres') cancel3DModel?.();
+            setStateAt(idx, 'ready');
+          }}
+        >
+          取消
+        </Button>
       ) : (
         <Button
           variant="primary"
@@ -844,6 +1084,86 @@ function ExtractionBody({
           未检测到源图片：请先在 Page1 生成 Extraction 或 Multi-View
         </div>
       )}
+
+      {error && (
+        <div style={{ fontSize: 10, color: 'var(--accent-red)' }} title={error}>
+          ⚠ {error.length > 80 ? error.slice(0, 80) + '…' : error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 3D Model node body
+// ---------------------------------------------------------------------------
+
+interface Model3DBodyProps {
+  state: NodeState;
+  glbUrl: string | null;
+  glbFile: string | null;
+  error?: string;
+  mode: Model3DMode;
+  onModeChange: (mode: Model3DMode) => void;
+  disabled?: boolean;
+}
+
+function Model3DBody({
+  state,
+  glbUrl,
+  glbFile,
+  error,
+  mode,
+  onModeChange,
+  disabled,
+}: Model3DBodyProps) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      {state === 'complete' && glbUrl ? (
+        <GLBThumbnail url={glbUrl} height={140} />
+      ) : (
+        <Placeholder type="3d" state={state} label="3D Model" height={140} />
+      )}
+
+      <div
+        style={{
+          padding: 6,
+          background: 'var(--bg-surface-2, rgba(255,255,255,0.03))',
+          border: '1px solid var(--border-subtle)',
+          borderRadius: 3,
+          fontSize: 10,
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ color: 'var(--text-muted)', minWidth: 48 }}>模式</span>
+          <select
+            disabled={disabled}
+            value={mode}
+            onChange={(e) => onModeChange(e.target.value as Model3DMode)}
+            style={{
+              flex: 1,
+              fontSize: 11,
+              padding: '2px 4px',
+              background: 'var(--bg-input, var(--bg-app))',
+              color: 'var(--text-primary)',
+              border: '1px solid var(--border-default)',
+              borderRadius: 3,
+            }}
+          >
+            <option value="single">单独生成</option>
+            <option value="frontBack">前后图生成</option>
+            <option value="fourView">四视图生成</option>
+          </select>
+        </div>
+        <div style={{ marginTop: 4, color: 'var(--text-muted)', lineHeight: 1.35 }}>
+          {MODEL_3D_MODE_DESC[mode]}
+        </div>
+        {glbFile && (
+          <div style={{ marginTop: 4, color: 'var(--text-secondary)' }} title={glbFile}>
+            {glbFile.length > 34 ? `${glbFile.slice(0, 34)}…` : glbFile}
+          </div>
+        )}
+      </div>
 
       {error && (
         <div style={{ fontSize: 10, color: 'var(--accent-red)' }} title={error}>

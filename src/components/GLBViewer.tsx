@@ -71,7 +71,7 @@ export function GLBViewer({
         height={height}
         background={background}
         label={label}
-        message="双击 Pipeline 中的 Rough Model 节点以在此显示"
+        message="双击 Pipeline 中的 3D Model 节点以在此显示"
       />
     );
   }

@@ -562,6 +562,10 @@ export interface PersistedPipeline {
   imageFile?: string | null;
   /** 当前 Extraction 结果文件名（工程内相对路径，用于恢复显示） */
   resultFile?: string | null;
+  /** 当前 3D Model GLB 文件名（工程内相对路径，用于恢复显示） */
+  modelFile?: string | null;
+  /** 3D Model 生成模式 */
+  modelMode?: 'single' | 'frontBack' | 'fourView';
 }
 
 export interface Page2PipelinesIndex {
