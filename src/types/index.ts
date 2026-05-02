@@ -48,6 +48,15 @@ export interface ExtractionState {
   error?: string;
 }
 
+export interface ModifyState {
+  /** 当前展示的图片 blob: URL（Banana Pro 修改/高清化结果） */
+  resultUrl: string | null;
+  /** 当前展示图片对应的工程文件名（用于历史下拉、复制路径） */
+  resultFile?: string | null;
+  /** 错误信息（若有） */
+  error?: string;
+}
+
 export interface ImageInputState {
   /** 当前展示的图片 blob: URL */
   imageUrl: string | null;
@@ -78,6 +87,8 @@ export interface PartPipelineState {
   imageInput?: ImageInputState;
   /** Extraction 节点模式 + 结果（在 React state 中维护，未持久化到工程目录） */
   extraction?: ExtractionState;
+  /** Modify 节点结果（Banana Pro 绘制/高清化，可选） */
+  modify?: ModifyState;
   /** 3D Model 节点结果 */
   model3d?: Model3DState;
 }

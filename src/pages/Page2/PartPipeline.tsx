@@ -9,6 +9,7 @@ import { GLBThumbnail } from '../../components/GLBThumbnail';
 import { useProject } from '../../contexts/ProjectContext';
 import {
   EXTRACT_JACKET_PROMPT,
+  MODIFY_HIGHRES_PROMPT,
   extractWithPrompt,
   extractWithSAM3,
   removeBackgroundRMBG,
@@ -96,10 +97,11 @@ interface Props {
   index: number;
   onUpdate: (id: string, next: PartPipelineState) => void;
   onDelete: (id: string) => void;
+  onPreviewModel?: (url: string, label: string) => void;
   onStatus: (msg: string, status?: 'info' | 'success' | 'warning' | 'error') => void;
 }
 
-export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: Props) {
+export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewModel, onStatus }: Props) {
   const { project, loadLatest, saveAsset, listHistory, loadByName, saveSegments } = useProject();
   const [renaming, setRenaming] = useState(false);
   const [draftName, setDraftName] = useState(pipeline.name);
@@ -111,6 +113,8 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
 
   // Extraction 节点历史版本（仅本 Pipeline 自己的，按 pipeline.name 前缀过滤）
   const [extractionHistory, setExtractionHistory] = useState<AssetVersion[]>([]);
+  // Modify 节点历史版本（仅本 Pipeline 自己的，按 pipeline.name 前缀过滤）
+  const [modifyHistory, setModifyHistory] = useState<AssetVersion[]>([]);
   // 3D Model 节点历史版本（仅本 Pipeline 自己的，按 pipeline.name 前缀过滤）
   const [modelHistory, setModelHistory] = useState<AssetVersion[]>([]);
   // 图片大图预览
@@ -180,6 +184,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
   // Extraction sub-state — Page2 fixes mode='banana' and the "Extract Jacket"
   // prompt, so no UI mutator is needed; runner reads/writes resultUrl/file.
   const extraction = pipeline.extraction ?? { resultUrl: null };
+  const modify = pipeline.modify ?? { resultUrl: null };
   const model3d = pipeline.model3d ?? { glbUrl: null, mode: 'fourView' as Model3DMode };
 
   // Helpers to update imageInput sub-state immutably.
@@ -228,21 +233,24 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     }
   }, [project, listHistory, safeName]);
 
-  useEffect(() => { void refreshExtractionHistory(); }, [refreshExtractionHistory]);
-  useEffect(() => { void refreshModelHistory(); }, [refreshModelHistory]);
+  const refreshModifyHistory = useCallback(async () => {
+    if (!project) {
+      setModifyHistory([]);
+      return;
+    }
+    try {
+      const all = await listHistory('page2.modify');
+      const mine = all.filter((v) => v.file.startsWith(`${safeName}_`));
+      setModifyHistory(mine);
+    } catch (err) {
+      console.warn('[PartPipeline] list modify history failed:', err);
+      setModifyHistory([]);
+    }
+  }, [project, listHistory, safeName]);
 
-  // Project loaded but the in-memory extraction state is empty → auto-load the
-  // latest saved extraction as the current preview, so the node doesn't snap
-  // back to "show the multi-view source" after a reload.
-  useEffect(() => {
-    if (!project) return;
-    if (extraction.resultUrl || extraction.resultFile) return;
-    if (extractionHistory.length === 0) return;
-    const latest = extractionHistory[0];
-    void handleSelectExtractionHistory(latest.file);
-    // Only run when the history list materializes for the first time.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project, extractionHistory]);
+  useEffect(() => { void refreshExtractionHistory(); }, [refreshExtractionHistory]);
+  useEffect(() => { void refreshModifyHistory(); }, [refreshModifyHistory]);
+  useEffect(() => { void refreshModelHistory(); }, [refreshModelHistory]);
 
   // 切换历史版本：从工程目录加载 blob，替换当前 resultUrl/resultFile。
   const handleSelectExtractionHistory = useCallback(async (fileName: string) => {
@@ -270,7 +278,61 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
         'error',
       );
     }
-  }, [project, loadByName, pipeline, extraction, onUpdate, onStatus]);
+  }, [project, loadByName, pipeline, extraction, partNodes, onUpdate, onStatus]);
+
+  // Project restore path: `pipelines.json` may contain resultFile, but React
+  // state cannot persist the blob: URL. Reload that exact file so preview and
+  // downstream 3D Model input are in sync with the selected history item.
+  useEffect(() => {
+    if (!project) return;
+    if (!extraction.resultFile || extraction.resultUrl) return;
+    void handleSelectExtractionHistory(extraction.resultFile);
+  }, [project, extraction.resultFile, extraction.resultUrl, handleSelectExtractionHistory]);
+
+  // First-time / legacy project path: no persisted resultFile yet, but history
+  // exists. Auto-load the newest per-pipeline extraction as the current output.
+  useEffect(() => {
+    if (!project) return;
+    if (extraction.resultUrl || extraction.resultFile) return;
+    if (extractionHistory.length === 0) return;
+    void handleSelectExtractionHistory(extractionHistory[0].file);
+  }, [project, extraction.resultUrl, extraction.resultFile, extractionHistory, handleSelectExtractionHistory]);
+
+  const handleSelectModifyHistory = useCallback(async (fileName: string) => {
+    if (!project || !fileName) return;
+    try {
+      const r = await loadByName('page2.modify', fileName);
+      if (!r) {
+        onStatus(`[${pipeline.name}] 无法读取该 Modify 历史版本`, 'error');
+        return;
+      }
+      if (modify.resultUrl) URL.revokeObjectURL(modify.resultUrl);
+      const modifyIdx = partNodes.findIndex((n) => n.id === 'modify');
+      onUpdate(pipeline.id, {
+        ...pipeline,
+        nodeStates: modifyIdx >= 0
+          ? promoteDownstream(
+              pipeline.nodeStates.map((v, idx) => (idx === modifyIdx ? 'complete' : v)),
+              modifyIdx,
+              partNodes,
+            )
+          : pipeline.nodeStates,
+        modify: { ...modify, resultUrl: r.url, resultFile: fileName, error: undefined },
+      });
+      onStatus(`[${pipeline.name}] 已切换到 Modify：${fileName}`, 'success');
+    } catch (err) {
+      onStatus(
+        `[${pipeline.name}] 加载 Modify 历史失败：${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      );
+    }
+  }, [project, loadByName, pipeline, modify, partNodes, onUpdate, onStatus]);
+
+  useEffect(() => {
+    if (!project) return;
+    if (!modify.resultFile || modify.resultUrl) return;
+    void handleSelectModifyHistory(modify.resultFile);
+  }, [project, modify.resultFile, modify.resultUrl, handleSelectModifyHistory]);
 
   const handleSelectModelHistory = useCallback(async (fileName: string) => {
     if (!project || !fileName) return;
@@ -514,19 +576,122 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     }
   }, [pipeline, extraction, sourceFile, onStatus, onUpdate, project, saveAsset, saveSegments, refreshExtractionHistory]);
 
+  const runModify = useCallback(async (): Promise<string | null> => {
+    const modifyIdx = partNodes.findIndex((n) => n.id === 'modify');
+    if (modifyIdx < 0) return null;
+
+    let inputBlob: Blob | null = null;
+    if (extraction.resultUrl) {
+      inputBlob = await (await fetch(extraction.resultUrl)).blob();
+    } else if (project && extraction.resultFile) {
+      const r = await loadByName('page2.extraction', extraction.resultFile);
+      inputBlob = r?.blob ?? null;
+    }
+    if (!inputBlob) {
+      onStatus(`[${pipeline.name}] 缺少 Extraction 输出：请先完成 General/Jacket Extraction`, 'error');
+      return null;
+    }
+
+    onUpdate(pipeline.id, {
+      ...pipeline,
+      nodeStates: pipeline.nodeStates.map((v, idx) => (idx === modifyIdx ? 'running' : v)),
+      modify: { ...modify, error: undefined },
+    });
+    onStatus(`[${pipeline.name}] Modify · Banana Pro 高清化中…`, 'info');
+
+    try {
+      const url = await extractWithPrompt({
+        source: inputBlob,
+        prompt: MODIFY_HIGHRES_PROMPT,
+        statusAction: '绘制/高清化',
+        onStatus: (m) => onStatus(`[${pipeline.name}] ${m}`, 'info'),
+      });
+      const blob = await (await fetch(url)).blob();
+      if (modify.resultUrl) URL.revokeObjectURL(modify.resultUrl);
+
+      let savedFile: string | null = null;
+      if (project) {
+        try {
+          const v = await saveAsset('page2.modify', blob, 'png', `${pipeline.name} · Modify · Banana Pro`, pipeline.name);
+          if (v) {
+            savedFile = v.file;
+            onStatus(`[${pipeline.name}] Modify 已保存到工程：${v.file}`, 'success');
+
+            try {
+              const slices = await splitMultiView(blob);
+              const baseName = v.file.replace(/\.[^.]+$/, '');
+              const setHandle = await saveSegments(
+                'page2.modify',
+                baseName,
+                v.file,
+                slices.map((s) => ({
+                  name: `${s.view}_{v}.png`,
+                  blob: s.blob,
+                  meta: { view: s.view, bbox: s.bbox, size: s.size },
+                })),
+              );
+              if (setHandle) {
+                onStatus(`[${pipeline.name}] Modify 已切分 4 视图 → ${setHandle.dirName}/`, 'success');
+              }
+            } catch (e) {
+              onStatus(
+                `[${pipeline.name}] Modify 4 视图切分失败：${e instanceof Error ? e.message : String(e)}`,
+                'warning',
+              );
+            }
+          }
+        } catch (e) {
+          onStatus(
+            `[${pipeline.name}] Modify 保存失败：${e instanceof Error ? e.message : String(e)}`,
+            'error',
+          );
+        }
+      }
+
+      onUpdate(pipeline.id, {
+        ...pipeline,
+        nodeStates: promoteDownstream(
+          pipeline.nodeStates.map((v, idx) => (idx === modifyIdx ? 'complete' : v)),
+          modifyIdx,
+          partNodes,
+        ),
+        modify: { ...modify, resultUrl: url, resultFile: savedFile, error: undefined },
+      });
+      void refreshModifyHistory();
+      onStatus(`[${pipeline.name}] Modify 完成`, 'success');
+      return url;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[PartPipeline] modify failed:', err);
+      onUpdate(pipeline.id, {
+        ...pipeline,
+        nodeStates: pipeline.nodeStates.map((v, idx) => (idx === modifyIdx ? 'error' : v)),
+        modify: { ...modify, error: msg },
+      });
+      onStatus(`[${pipeline.name}] Modify 失败：${msg}`, 'error');
+      return null;
+    }
+  }, [partNodes, extraction, project, loadByName, pipeline, modify, onStatus, onUpdate, saveAsset, saveSegments, refreshModifyHistory]);
+
   const run3DModel = useCallback(async (): Promise<string | null> => {
     const modelIdx = partNodes.findIndex((n) => n.id === 'highres');
     if (modelIdx < 0) return null;
 
-    let extractionBlob: Blob | null = null;
-    if (extraction.resultUrl) {
-      extractionBlob = await (await fetch(extraction.resultUrl)).blob();
+    const useModify = !!(modify.resultUrl || modify.resultFile);
+    let modelInputBlob: Blob | null = null;
+    if (useModify && modify.resultUrl) {
+      modelInputBlob = await (await fetch(modify.resultUrl)).blob();
+    } else if (useModify && project && modify.resultFile) {
+      const r = await loadByName('page2.modify', modify.resultFile);
+      modelInputBlob = r?.blob ?? null;
+    } else if (extraction.resultUrl) {
+      modelInputBlob = await (await fetch(extraction.resultUrl)).blob();
     } else if (project && extraction.resultFile) {
       const r = await loadByName('page2.extraction', extraction.resultFile);
-      extractionBlob = r?.blob ?? null;
+      modelInputBlob = r?.blob ?? null;
     }
-    if (!extractionBlob) {
-      onStatus(`[${pipeline.name}] 缺少 Extraction 输出：请先完成 General/Jacket Extraction`, 'error');
+    if (!modelInputBlob) {
+      onStatus(`[${pipeline.name}] 缺少图片输出：请先完成 Extraction，或选择有效的 Modify 输出`, 'error');
       return null;
     }
 
@@ -542,7 +707,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     onStatus(`[${pipeline.name}] 3D Model · ${MODEL_3D_MODE_LABEL[mode]} 开始…`, 'info');
 
     try {
-      const slices = await splitMultiView(extractionBlob);
+      const slices = await splitMultiView(modelInputBlob);
       const byView = new Map(slices.map((s) => [s.view, s.blob]));
       const front = byView.get('front');
       const left = byView.get('left') ?? null;
@@ -636,7 +801,20 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
     } finally {
       modelAbortRef.current = null;
     }
-  }, [partNodes, extraction, project, loadByName, pipeline, model3d, onStatus, onUpdate, saveAsset, refreshModelHistory]);
+  }, [partNodes, modify, extraction, project, loadByName, pipeline, model3d, onStatus, onUpdate, saveAsset, refreshModelHistory]);
+
+  const clearModify = useCallback(() => {
+    if (modify.resultUrl) URL.revokeObjectURL(modify.resultUrl);
+    const modifyIdx = partNodes.findIndex((n) => n.id === 'modify');
+    onUpdate(pipeline.id, {
+      ...pipeline,
+      nodeStates: modifyIdx >= 0
+        ? pipeline.nodeStates.map((v, idx) => (idx === modifyIdx ? 'ready' : v))
+        : pipeline.nodeStates,
+      modify: { resultUrl: null, resultFile: null, error: undefined },
+    });
+    onStatus(`[${pipeline.name}] 已撤销 Modify 输出，3D Model 将使用 Extraction 输出`, 'info');
+  }, [modify.resultUrl, partNodes, pipeline, onUpdate, onStatus]);
 
   const cancel3DModel = useCallback(() => {
     modelAbortRef.current?.abort();
@@ -649,6 +827,10 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
       // Pro (Extract Jacket) based on pipeline.mode — see runExtraction().
       if (i === 1) {
         void runExtraction();
+        return;
+      }
+      if (partNodes[i]?.id === 'modify') {
+        void runModify();
         return;
       }
       if (partNodes[i]?.id === 'highres') {
@@ -681,7 +863,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
         onStatus(`[${pipeline.name}] ${partNodes[i].title} 完成`, 'success');
       }, 2000);
     },
-    [pipeline, onUpdate, onStatus, runExtraction, run3DModel, partNodes]
+    [pipeline, onUpdate, onStatus, runExtraction, runModify, run3DModel, partNodes]
   );
 
   const toggleExpand = (i: number) => {
@@ -802,6 +984,12 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
                   selected={extraction.resultFile ?? undefined}
                   onSelect={handleSelectExtractionHistory}
                 />
+              ) : node.id === 'modify' && project && modifyHistory.length > 0 ? (
+                <HistoryDropdown
+                  history={modifyHistory}
+                  selected={modify.resultFile ?? undefined}
+                  onSelect={handleSelectModifyHistory}
+                />
               ) : node.id === 'highres' && project && modelHistory.length > 0 ? (
                 <HistoryDropdown
                   history={modelHistory}
@@ -829,6 +1017,15 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
                     error={extraction.error}
                     label={`${pipeline.name} · ${node.title}`}
                     mode={pipeline.mode}
+                  />
+                ) : node.id === 'modify' ? (
+                  <ModifyBody
+                    state={state}
+                    resultUrl={modify.resultUrl}
+                    resultFile={modify.resultFile ?? null}
+                    inputUrl={extraction.resultUrl ?? sourceUrl}
+                    error={modify.error}
+                    label={`${pipeline.name} · ${node.title}`}
                   />
                 ) : node.id === 'highres' ? (
                   <Model3DBody
@@ -858,6 +1055,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
               runNode,
               setStateAt,
               cancel3DModel,
+              clearModify,
               model3d.glbUrl
                 ? () => {
                     const a = document.createElement('a');
@@ -876,9 +1074,16 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onStatus }: 
                 ? imageInput.imageUrl ?? sourceUrl
                 : node.id === 'extraction'
                   ? extraction.resultUrl ?? sourceUrl
+                  : node.id === 'modify'
+                    ? modify.resultUrl ?? extraction.resultUrl ?? sourceUrl
                   : undefined;
             const onBodyDoubleClick = previewImageUrl
               ? () => setPreview({ url: previewImageUrl, title: `${i + 1}. ${node.title} · ${pipeline.name}` })
+              : node.id === 'highres' && model3d.glbUrl
+                ? () => onPreviewModel?.(
+                    model3d.glbUrl!,
+                    `${i + 1}. ${node.title} · ${pipeline.name}${model3d.glbFile ? ' · ' + model3d.glbFile : ''}`,
+                  )
               : undefined;
 
             return (
@@ -923,6 +1128,7 @@ function renderPartActions(
   runNode: (i: number) => void,
   setStateAt: (i: number, s: NodeState) => void,
   cancel3DModel?: () => void,
+  clearModify?: () => void,
   download3DModel?: () => void,
 ): ReactNode {
   if (node.optional && state === 'optional') {
@@ -965,7 +1171,7 @@ function renderPartActions(
   }
   if (node.id === 'modify' && state !== 'optional') {
     extraButtons.push(
-      <Button key="undo" size="sm" disabled={isRunning}>撤销</Button>
+      <Button key="undo" size="sm" disabled={isRunning} onClick={clearModify}>撤销</Button>
     );
   }
 
@@ -1082,6 +1288,57 @@ function ExtractionBody({
       {!sourceUrl && (
         <div style={{ fontSize: 10, color: 'var(--accent-yellow, #d49b3b)' }}>
           未检测到源图片：请先在 Page1 生成 Extraction 或 Multi-View
+        </div>
+      )}
+
+      {error && (
+        <div style={{ fontSize: 10, color: 'var(--accent-red)' }} title={error}>
+          ⚠ {error.length > 80 ? error.slice(0, 80) + '…' : error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Modify node body — Banana Pro high-res redraw while preserving 4-view order
+// ---------------------------------------------------------------------------
+
+interface ModifyBodyProps {
+  state: NodeState;
+  resultUrl: string | null;
+  resultFile: string | null;
+  inputUrl: string | null;
+  error?: string;
+  label: string;
+}
+
+function ModifyBody({
+  state,
+  resultUrl,
+  resultFile: _resultFile,
+  inputUrl,
+  error,
+  label,
+}: ModifyBodyProps) {
+  const previewUrl = resultUrl ?? inputUrl;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <Placeholder
+        type="image"
+        state={previewUrl && state !== 'running' && state !== 'error' ? 'complete' : state}
+        label={label}
+        imageUrl={previewUrl ?? undefined}
+        height={140}
+      />
+
+      <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.35 }}>
+        Banana Pro：按 2×2 顺序（front / left / right / back）对同一主体高清化，保持整体画风。
+      </div>
+      {!inputUrl && (
+        <div style={{ fontSize: 10, color: 'var(--accent-yellow, #d49b3b)' }}>
+          未检测到输入：请先完成 Extraction
         </div>
       )}
 

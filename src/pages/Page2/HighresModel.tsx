@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import type { NodeState, PartPipelineState, PipelineMode } from '../../types';
 import { Button } from '../../components/Button';
+import { GLBViewer } from '../../components/GLBViewer';
 import { getPartNodes, PartPipeline } from './PartPipeline';
 import { useProject } from '../../contexts/ProjectContext';
 import type { PersistedPipeline } from '../../services/projectStore';
@@ -38,6 +39,9 @@ const makePart = (idx: number, mode: PipelineMode = 'extraction'): PartPipelineS
   extraction: {
     resultUrl: null,
   },
+  modify: {
+    resultUrl: null,
+  },
   model3d: {
     glbUrl: null,
     mode: 'fourView',
@@ -51,6 +55,7 @@ function toPersisted(p: PartPipelineState): PersistedPipeline {
     mode: p.mode,
     imageFile: p.imageInput?.imageFile ?? null,
     resultFile: p.extraction?.resultFile ?? null,
+    modifyFile: p.modify?.resultFile ?? null,
     modelFile: p.model3d?.glbFile ?? null,
     modelMode: p.model3d?.mode ?? 'fourView',
   };
@@ -62,11 +67,21 @@ function fromPersisted(pp: PersistedPipeline, index: number): PartPipelineState 
   nodeStates[0] = pp.imageFile ? 'complete' : 'ready';
   if (pp.resultFile) nodeStates[1] = 'complete';
   const nodes = getPartNodes(pp.mode);
+  const modifyIdx = nodes.findIndex((n) => n.id === 'modify');
+  if (pp.modifyFile && modifyIdx >= 0) nodeStates[modifyIdx] = 'complete';
   const modelIdx = nodes.findIndex((n) => n.id === 'highres');
   if (pp.modelFile && modelIdx >= 0) nodeStates[modelIdx] = 'complete';
   // Promote downstream nodes (across optional gaps) so e.g. 3D Model
   // becomes 'ready' instead of stuck at 'idle' when Modify is optional.
-  const lastComplete = pp.modelFile && modelIdx >= 0 ? modelIdx : pp.resultFile ? 1 : pp.imageFile ? 0 : -1;
+  const lastComplete = pp.modelFile && modelIdx >= 0
+    ? modelIdx
+    : pp.modifyFile && modifyIdx >= 0
+      ? modifyIdx
+      : pp.resultFile
+        ? 1
+        : pp.imageFile
+          ? 0
+          : -1;
   if (lastComplete >= 0) {
     for (let i = lastComplete + 1; i < nodeStates.length; i++) {
       if (nodeStates[i] !== 'idle' && nodeStates[i] !== 'optional') continue;
@@ -87,6 +102,10 @@ function fromPersisted(pp: PersistedPipeline, index: number): PartPipelineState 
       resultUrl: null,
       resultFile: pp.resultFile ?? null,
     },
+    modify: {
+      resultUrl: null,
+      resultFile: pp.modifyFile ?? null,
+    },
     model3d: {
       glbUrl: null,
       glbFile: pp.modelFile ?? null,
@@ -101,6 +120,8 @@ export function HighresModel({ onStatusChange }: Props) {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const addDropdownRef = useRef<HTMLDivElement>(null);
   const [addDropdownOpen, setAddDropdownOpen] = useState(false);
+  const [viewerUrl, setViewerUrl] = useState<string | null>(null);
+  const [viewerLabel, setViewerLabel] = useState<string | null>(null);
 
   // Track whether we've restored pipelines for the current open project.
   const loadedForProject = useRef<string | null>(null);
@@ -252,38 +273,57 @@ export function HighresModel({ onStatusChange }: Props) {
         </div>
       </div>
 
-      {/* Vertical stack of pipelines */}
+      {/* Main split: pipelines on the left, 3D preview on the right */}
       <div
         style={{
           flex: 1,
-          overflow: 'auto',
-          padding: '12px 16px',
+          minHeight: 0,
+          display: 'flex',
           background: 'var(--bg-app)',
         }}
       >
-        {parts.length === 0 && (
-          <div
-            style={{
-              padding: 40,
-              textAlign: 'center',
-              color: 'var(--text-muted)',
-              border: '1px dashed var(--border-default)',
-              borderRadius: 4,
-            }}
-          >
-            暂无 Pipeline，点击右上角 “＋ 添加 Pipeline” 创建第一个部件
-          </div>
-        )}
-        {parts.map((p, i) => (
-          <PartPipeline
-            key={p.id}
-            pipeline={p}
-            index={i}
-            onUpdate={updatePart}
-            onDelete={requestDelete}
-            onStatus={onStatusChange}
-          />
-        ))}
+        <div
+          style={{
+            flex: '0 0 58%',
+            minWidth: 420,
+            maxWidth: '62%',
+            overflow: 'auto',
+            padding: '12px 12px 12px 16px',
+            borderRight: '1px solid var(--border-default)',
+          }}
+        >
+          {parts.length === 0 && (
+            <div
+              style={{
+                padding: 40,
+                textAlign: 'center',
+                color: 'var(--text-muted)',
+                border: '1px dashed var(--border-default)',
+                borderRadius: 4,
+              }}
+            >
+              暂无 Pipeline，点击右上角 “＋ 添加 Pipeline” 创建第一个部件
+            </div>
+          )}
+          {parts.map((p, i) => (
+            <PartPipeline
+              key={p.id}
+              pipeline={p}
+              index={i}
+              onUpdate={updatePart}
+              onDelete={requestDelete}
+              onPreviewModel={(url, label) => {
+                setViewerUrl(url);
+                setViewerLabel(label);
+              }}
+              onStatus={onStatusChange}
+            />
+          ))}
+        </div>
+
+        <div style={{ flex: 1, minWidth: 0, minHeight: 0, position: 'relative' }}>
+          <GLBViewer url={viewerUrl} label={viewerLabel ?? 'Page2 · 3D Preview'} />
+        </div>
       </div>
 
       {/* Confirmation modal */}

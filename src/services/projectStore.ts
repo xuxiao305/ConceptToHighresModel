@@ -54,6 +54,7 @@ export const NODE_DIRS: Record<string, NodeDir> = {
   // Page 2
   'page2.imageInput': { pageDir: 'page2_highres', nodeDir: '00_image_input' },
   'page2.extraction': { pageDir: 'page2_highres', nodeDir: '01_extraction' },
+  'page2.modify':     { pageDir: 'page2_highres', nodeDir: '02_modify' },
   'page2.highres':   { pageDir: 'page2_highres', nodeDir: '02_highres' },
   // Page 3 占位（后续节点接入时按需追加）
 };
@@ -562,6 +563,8 @@ export interface PersistedPipeline {
   imageFile?: string | null;
   /** 当前 Extraction 结果文件名（工程内相对路径，用于恢复显示） */
   resultFile?: string | null;
+  /** 当前 Modify 结果文件名（工程内相对路径，用于恢复显示） */
+  modifyFile?: string | null;
   /** 当前 3D Model GLB 文件名（工程内相对路径，用于恢复显示） */
   modelFile?: string | null;
   /** 3D Model 生成模式 */

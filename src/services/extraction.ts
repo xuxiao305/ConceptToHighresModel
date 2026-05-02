@@ -42,6 +42,17 @@ export const REMOVE_JACKET_PROMPT =
 export const EXTRACT_JACKET_PROMPT =
   'Extract the orange jacket, remove the other part of the character. Fill the missing part covered by the character body';
 
+/**
+ * Page2 Modify 节点使用的固定 Banana Pro 绘制/高清化提示词。
+ */
+export const MODIFY_HIGHRES_PROMPT =
+  'note this is the SAME subject with different angle with such order:\n' +
+  'top left: front view \n' +
+  'top right: left view\n' +
+  'bottom left: right view\n' +
+  'bottom right: back view \n\n' +
+  'You need to make a higher resolution of the input image, but keep the art style same in general';
+
 // ===========================================================================
 // Banana Pro extraction (Pipeline 1 step ①)
 // ===========================================================================
@@ -57,6 +68,8 @@ export interface ExtractWithPromptOptions {
   seed?: number;
   /** Abort signal for cancellation. */
   signal?: AbortSignal;
+  /** Status verb shown in UI, defaults to “提取”. */
+  statusAction?: string;
 }
 
 /**
@@ -67,14 +80,15 @@ export async function extractWithPrompt(
 ): Promise<string> {
   const seed =
     typeof opts.seed === 'number' ? opts.seed : Math.floor(Math.random() * 2 ** 31);
-  opts.onStatus?.(`调用 Banana Pro 提取（seed=${seed}）…`);
+  const action = opts.statusAction ?? '提取';
+  opts.onStatus?.(`调用 Banana Pro ${action}（seed=${seed}）…`);
   const url = await generateImage({
     prompt: opts.prompt,
     images: [opts.source],
     seed,
     signal: opts.signal,
   });
-  opts.onStatus?.('Banana Pro 提取完成');
+  opts.onStatus?.(`Banana Pro ${action}完成`);
   return url;
 }
 
