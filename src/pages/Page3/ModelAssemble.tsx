@@ -56,6 +56,7 @@ interface MeshData {
 
 type CenterViewMode = 'landmark' | 'result';
 type ResultViewMode = 'overlay' | 'aligned' | 'target' | 'original';
+type TargetRegionSelectionMode = 'auto' | 'manual';
 
 interface ResultPreview {
   mode: AlignmentMode;
@@ -243,12 +244,22 @@ function recommendRegionLabel(sourceName: string, labels: string[]): string | nu
   const findLabel = (needles: string[]) =>
     labels.find((label) => needles.some((needle) => label.toLowerCase().replace(/[\s_-]+/g, '').includes(needle))) ?? null;
 
-  if (normalized.includes('rightarm') || normalized.includes('armhires')) return findLabel(['rightarm']) ?? findLabel(['arm']);
-  if (normalized.includes('leftarm')) return findLabel(['leftarm']) ?? findLabel(['arm']);
+  const hasArm = normalized.includes('arm') || normalized.includes('rarm') || normalized.includes('larm');
+  const hasRight = normalized.includes('right') || normalized.includes('rarm') || normalized.includes('armhires');
+  const hasLeft = normalized.includes('left') || normalized.includes('larm');
+  if (hasArm && hasLeft) return findLabel(['leftarm']) ?? findLabel(['arm']);
+  if (hasArm && hasRight) return findLabel(['rightarm']) ?? findLabel(['arm']);
+  if (hasArm) return findLabel(['rightarm']) ?? findLabel(['leftarm']) ?? findLabel(['arm']);
   if (normalized.includes('body') || normalized.includes('torso') || normalized.includes('jacket') || normalized.includes('coat')) {
     return findLabel(['body', 'torso', 'jacket', 'coat']);
   }
   return labels[0] ?? null;
+}
+
+function chooseRegionLabel(sourceName: string, labels: string[], previous = ''): string {
+  if (labels.length === 0) return '';
+  if (previous && labels.includes(previous)) return previous;
+  return recommendRegionLabel(sourceName, labels) ?? labels[0];
 }
 
 const DEMO_SOURCE: MeshData = {
@@ -413,6 +424,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [segPack, setSegPack] = useState<SegmentationPack | null>(null);
   const [segPackName, setSegPackName] = useState<string | null>(null);
   const [selectedTargetRegionLabel, setSelectedTargetRegionLabel] = useState<string>('');
+  const [targetRegionSelectionMode, setTargetRegionSelectionMode] = useState<TargetRegionSelectionMode>('auto');
   const [orthoRenderUrl, setOrthoRenderUrl] = useState<string | null>(null);
   // Camera that was actually used for the most recent render. Required
   // for mask reprojection so the projection used to interpret a mask
@@ -445,17 +457,17 @@ export function ModelAssemble({ onStatusChange }: Props) {
     () => recommendRegionLabel(srcMesh.name, regionLabels),
     [srcMesh.name, regionLabels],
   );
-
-  useEffect(() => {
-    if (regionLabels.length === 0) {
-      setSelectedTargetRegionLabel('');
-      return;
+  const activeTargetRegionLabel = useMemo(() => {
+    if (regionLabels.length === 0) return '';
+    if (
+      targetRegionSelectionMode === 'manual' &&
+      selectedTargetRegionLabel &&
+      regionLabels.includes(selectedTargetRegionLabel)
+    ) {
+      return selectedTargetRegionLabel;
     }
-    setSelectedTargetRegionLabel((prev) => {
-      if (prev && regionLabels.includes(prev)) return prev;
-      return recommendedRegionLabel ?? regionLabels[0];
-    });
-  }, [recommendedRegionLabel, regionLabels]);
+    return recommendedRegionLabel ?? regionLabels[0];
+  }, [recommendedRegionLabel, regionLabels, selectedTargetRegionLabel, targetRegionSelectionMode]);
 
   const srcAdjacency: MeshAdjacency = useMemo(
     () => buildMeshAdjacency(srcMesh.vertices, srcMesh.faces),
@@ -1067,6 +1079,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
       setTarRegion(region);
       setTarRegionLabel(label);
       setSelectedTargetRegionLabel(label);
+      setTargetRegionSelectionMode('manual');
       appendAlignmentTrace('adopt-target-region', {
         label,
         region: summarizeRegion(region),
@@ -1079,12 +1092,51 @@ export function ModelAssemble({ onStatusChange }: Props) {
     [maskReproj, buildTarRegionFromSet, onStatusChange],
   );
 
+  // Keep the semantic Target seed derived from the active SAM3 region,
+  // instead of relying on whichever async loader/effect happened to run
+  // last. This makes region changes, source-driven auto recommendations,
+  // and already-computed reprojections converge through one canonical path.
+  useEffect(() => {
+    if (!maskReproj || !activeTargetRegionLabel) return;
+    if (tarRegion && tarRegionLabel === activeTargetRegionLabel) return;
+
+    const set = maskReproj.regions.get(activeTargetRegionLabel);
+    if (!set || set.size === 0) {
+      setTarRegion(null);
+      setTarRegionLabel(null);
+      appendAlignmentTrace('sync-target-region-empty', {
+        label: activeTargetRegionLabel,
+        availableLabels: Array.from(maskReproj.regions.keys()),
+      });
+      return;
+    }
+
+    const region = buildTarRegionFromSet(set);
+    if (!region) return;
+    setTarRegion(region);
+    setTarRegionLabel(activeTargetRegionLabel);
+    appendAlignmentTrace('sync-target-region', {
+      label: activeTargetRegionLabel,
+      selectionMode: targetRegionSelectionMode,
+      region: summarizeRegion(region),
+    });
+  }, [
+    maskReproj,
+    activeTargetRegionLabel,
+    tarRegion,
+    tarRegionLabel,
+    targetRegionSelectionMode,
+    buildTarRegionFromSet,
+    appendAlignmentTrace,
+  ]);
+
   // Once the SAM3 three-piece pack is loaded, immediately perform the
   // target localization that used to be delayed until the manual buttons or
   // the one-click auto-align button: render Target front view, reproject mask
   // to target vertices, then adopt the selected region as the Target seed.
   useEffect(() => {
-    if (!segPack || !maskImageUrl || !refImageSize || !selectedTargetRegionLabel) return;
+    const targetRegionLabel = activeTargetRegionLabel;
+    if (!segPack || !maskImageUrl || !refImageSize || !targetRegionLabel) return;
     if (maskReproj) return;
     if (tarMesh.vertices.length === 0 || tarMesh.faces.length === 0) return;
 
@@ -1141,19 +1193,20 @@ export function ModelAssemble({ onStatusChange }: Props) {
         if (cancelled) return;
         setMaskReproj(reproj);
         appendAlignmentTrace('auto-localize-reproject-mask', {
-          selectedTargetRegionLabel,
+          targetRegionLabel,
+          selectionMode: targetRegionSelectionMode,
           camera: summarizeCamera(rendered.camera),
           mask: maskImageName,
           segmentation: segPackName,
           result: summarizeMaskReprojection(reproj),
         });
 
-        const set = reproj.regions.get(selectedTargetRegionLabel);
+        const set = reproj.regions.get(targetRegionLabel);
         if (set && set.size > 0) {
           const region = buildTarRegionFromSet(set);
           if (region) {
             setTarRegion(region);
-            setTarRegionLabel(selectedTargetRegionLabel);
+            setTarRegionLabel(targetRegionLabel);
           }
         } else {
           setTarRegion(null);
@@ -1187,7 +1240,8 @@ export function ModelAssemble({ onStatusChange }: Props) {
     segPack,
     maskImageUrl,
     refImageSize,
-    selectedTargetRegionLabel,
+    activeTargetRegionLabel,
+    targetRegionSelectionMode,
     maskReproj,
     tarMesh,
     autoFit,
@@ -1229,8 +1283,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
     try {
       const text = await file.text();
       const pack = parseSegmentationJson(text);
+      const labels = pack.regions.map((r) => r.label);
+      const selectedLabel = chooseRegionLabel(srcMesh.name, labels);
       setSegPack(pack);
       setSegPackName(file.name);
+      setSelectedTargetRegionLabel(selectedLabel);
+      setTargetRegionSelectionMode('auto');
       setOrthoRenderUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
         return null;
@@ -1243,11 +1301,16 @@ export function ModelAssemble({ onStatusChange }: Props) {
         file: file.name,
         imageName: pack.imageName,
         maskName: pack.maskName,
+        sourceName: srcMesh.name,
+        selectedLabel,
+        selectionMode: 'auto',
+        recommendedLabel: recommendRegionLabel(srcMesh.name, labels),
         regions: pack.regions.map((r) => ({ label: r.label, mask: r.mask_value, bbox: r.bbox })),
       });
       const union = regionsUnionBBox(pack.regions);
       onStatusChange(
         `已加载 ${file.name} · ${pack.regions.length} 个区域：${pack.regions.map((r) => r.label).join(', ')}` +
+          (selectedLabel ? ` · 当前目标区域 ${selectedLabel}` : '') +
           (union ? ` · 并集 bbox ${union.w}×${union.h}@(${union.x},${union.y})` : ''),
         'success',
       );
@@ -1257,7 +1320,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         'error',
       );
     }
-  }, [onStatusChange]);
+  }, [onStatusChange, srcMesh.name]);
 
   const handleLoadSegPackFiles = useCallback(async (files: FileList | File[]) => {
     const all = Array.from(files);
@@ -1505,6 +1568,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         pipelineMode: item.pipelineMode,
         file: item.file,
       });
+      setTargetRegionSelectionMode('auto');
       setSelectedSrcIndex(null);
       setSrcRegion(null);
       clearAllLandmarks();
@@ -1686,6 +1750,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
       if (side === 'source') {
         setSrcMesh(mesh);
         setSourceGalleryBinding(null);
+        setTargetRegionSelectionMode('auto');
         setSelectedSrcIndex(null);
         setSrcRegion(null);
       } else {
@@ -1929,7 +1994,8 @@ export function ModelAssemble({ onStatusChange }: Props) {
       onStatusChange('Source/Target 尚未加载', 'warning');
       return;
     }
-    if (!selectedTargetRegionLabel) {
+    const targetRegionLabel = activeTargetRegionLabel;
+    if (!targetRegionLabel) {
       onStatusChange(
         '请先加载 SAM3 分割包并选择目标区域，避免无约束匹配误对到身体。',
         'error',
@@ -1947,6 +2013,8 @@ export function ModelAssemble({ onStatusChange }: Props) {
     const runSeed = makeRandomAlignSeed();
     appendAlignmentTrace('auto-align-click', {
       seed: runSeed,
+      targetRegionLabel,
+      selectionMode: targetRegionSelectionMode,
       selectedTargetRegionLabel,
       tarRegionLabel,
       hasTarRegion: Boolean(tarRegion),
@@ -1967,9 +2035,11 @@ export function ModelAssemble({ onStatusChange }: Props) {
         const t0 = performance.now();
 
         let workingTarRegion =
-          tarRegion && tarRegionLabel === selectedTargetRegionLabel ? tarRegion : null;
+          tarRegion && tarRegionLabel === targetRegionLabel ? tarRegion : null;
         let workingMaskReproj = maskReproj;
         appendAlignmentTrace('auto-region-initial', {
+          targetRegionLabel,
+          selectionMode: targetRegionSelectionMode,
           selectedTargetRegionLabel,
           tarRegionLabel,
           usingCachedRegion: Boolean(workingTarRegion),
@@ -1978,17 +2048,17 @@ export function ModelAssemble({ onStatusChange }: Props) {
           camera: summarizeCamera(orthoCamera),
         });
 
-        if (!workingTarRegion && selectedTargetRegionLabel) {
+        if (!workingTarRegion && targetRegionLabel) {
           if (workingMaskReproj) {
-            const set = workingMaskReproj.regions.get(selectedTargetRegionLabel);
+            const set = workingMaskReproj.regions.get(targetRegionLabel);
             if (set && set.size > 0) {
               workingTarRegion = buildTarRegionFromSet(set);
               if (workingTarRegion) {
                 setTarRegion(workingTarRegion);
-                setTarRegionLabel(selectedTargetRegionLabel);
+                setTarRegionLabel(targetRegionLabel);
               }
               appendAlignmentTrace('auto-region-from-existing-reprojection', {
-                label: selectedTargetRegionLabel,
+                label: targetRegionLabel,
                 region: summarizeRegion(workingTarRegion),
               });
             }
@@ -2040,21 +2110,21 @@ export function ModelAssemble({ onStatusChange }: Props) {
               setMaskReproj(reproj);
               workingMaskReproj = reproj;
               appendAlignmentTrace('auto-reproject-mask', {
-                label: selectedTargetRegionLabel,
+                label: targetRegionLabel,
                 camera: summarizeCamera(camera),
                 mask: maskImageName,
                 segmentation: segPackName,
                 result: summarizeMaskReprojection(reproj),
               });
-              const set = reproj.regions.get(selectedTargetRegionLabel);
+              const set = reproj.regions.get(targetRegionLabel);
               if (set && set.size > 0) {
                 workingTarRegion = buildTarRegionFromSet(set);
                 if (workingTarRegion) {
                   setTarRegion(workingTarRegion);
-                  setTarRegionLabel(selectedTargetRegionLabel);
+                  setTarRegionLabel(targetRegionLabel);
                 }
                 appendAlignmentTrace('auto-region-from-new-reprojection', {
-                  label: selectedTargetRegionLabel,
+                  label: targetRegionLabel,
                   region: summarizeRegion(workingTarRegion),
                 });
               }
@@ -2064,7 +2134,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
 
         if (!workingTarRegion) {
           onStatusChange(
-            `目标区域 "${selectedTargetRegionLabel}" 没有可用顶点，已停止自动对齐以避免误匹配到身体。请检查 mask / 反投影结果。`,
+            `目标区域 "${targetRegionLabel}" 没有可用顶点，已停止自动对齐以避免误匹配到身体。请检查 mask / 反投影结果。`,
             'error',
           );
           setPartialLoading(false);
@@ -2085,7 +2155,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
             axialWeight: partialAxialWeight,
             seed: runSeed,
           },
-          targetRegionLabel: selectedTargetRegionLabel,
+          targetRegionLabel,
           targetRegion: summarizeRegion(workingTarRegion),
         });
         const pm = matchPartialToWhole(
@@ -2270,7 +2340,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           elapsedMs: round3(dt),
         });
         setAutoAlignSummary({
-          regionLabel: workingTarRegion ? selectedTargetRegionLabel || null : null,
+          regionLabel: workingTarRegion ? targetRegionLabel : null,
           pairs: pm.pairs.length,
           rmse: finalRmse,
           scale: sx,
@@ -2309,6 +2379,8 @@ export function ModelAssemble({ onStatusChange }: Props) {
     partialAxialWeight,
     tarRegion,
     tarRegionLabel,
+    activeTargetRegionLabel,
+    targetRegionSelectionMode,
     selectedTargetRegionLabel,
     maskReproj,
     segPack,
@@ -2366,6 +2438,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         faces: srcLoaded.faces,
       });
       setSourceGalleryBinding(null);
+      setTargetRegionSelectionMode('auto');
       setTarMesh({
         name: 'alignmenttest_bot.glb',
         vertices: tarLoaded.vertices,
@@ -2380,6 +2453,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
       setSrcRegion(null);
       setTarRegion(null);
       setTarRegionLabel(null);
+      setOrthoRenderUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+      setOrthoCamera(null);
+      setMaskReproj(null);
       setCandidates([]);
       setAcceptedCandidateIds(new Set());
       setCenterViewMode('landmark');
@@ -2392,6 +2471,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
       // Fallback: tiny inline demo so the page is still usable
       setSrcMesh(DEMO_SOURCE);
       setSourceGalleryBinding(null);
+      setTargetRegionSelectionMode('auto');
       setTarMesh(demoTarget);
       clearAllLandmarks();
       setAlignResult(null);
@@ -2402,6 +2482,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
       setSrcRegion(null);
       setTarRegion(null);
       setTarRegionLabel(null);
+      setOrthoRenderUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+      setOrthoCamera(null);
+      setMaskReproj(null);
       setCandidates([]);
       setAcceptedCandidateIds(new Set());
       onStatusChange(
@@ -2659,6 +2745,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
                 <div>Mask：{maskImageName ?? segPack.maskName}</div>
                 <div>检测到区域：{regionLabels.join(' / ')}</div>
                 <div>
+                  当前目标区域：{activeTargetRegionLabel || '未确定'} · {targetRegionSelectionMode === 'manual' ? '手动选择' : '自动推荐'}
+                </div>
+                <div>
                   Target 正视图：{orthoRenderUrl ? '已自动渲染' : autoLocalizing ? '自动渲染中…' : '待渲染'}
                 </div>
                 <div>
@@ -2695,10 +2784,11 @@ export function ModelAssemble({ onStatusChange }: Props) {
 
           <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>目标区域</div>
           <select
-            value={selectedTargetRegionLabel}
+            value={activeTargetRegionLabel}
             onChange={(e) => {
               const label = e.target.value;
               setSelectedTargetRegionLabel(label);
+              setTargetRegionSelectionMode('manual');
               setTarRegion(null);
               setTarRegionLabel(null);
               if (maskReproj && label) handleAdoptRegionAsTarSeed(label);
@@ -2722,7 +2812,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           </select>
           {recommendedRegionLabel && (
             <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8 }}>
-              系统推荐：{recommendedRegionLabel}，置信度：高（可修改）
+              系统推荐：{recommendedRegionLabel}，当前模式：{targetRegionSelectionMode === 'manual' ? '手动' : '自动'}（可修改）
             </div>
           )}
 
