@@ -47,8 +47,63 @@ import {
   type AlignmentResult,
   applyTransform,
 } from '../../three/alignment';
-import { detectPoses, cocoPoseToJoint2D } from '../../services/dwpose';
-import { getPipelineJoints, type AssetVersion, type PersistedPipeline, type SegmentSetEntry } from '../../services/projectStore';
+import { getPipelineJoints, type AssetVersion, type PersistedPipeline } from '../../services/projectStore';
+import type { Joint2D, Page1JointsMeta, Page1SplitsMeta } from '../../types/joints';
+
+/**
+ * Stage 2 (refactor master plan) — Pose Proxy joints 双源兼容查询。
+ *
+ * Page1 优先：直接使用 `project.meta.page1.joints/splits`，joints 已是 split-local
+ * 像素坐标，src view 尺寸 = page1.splits.front.size，无需任何坐标换算。
+ *
+ * 旧工程回退：找 `pipelines.json` 里对应 pipeline 的 `jointsMeta`（Page2 产物）。
+ *
+ * 设计意图：让 Page3 不再调用 detectPoses 兜底；只要 Page1 跑过 multiview，
+ * 就能拿到 src+tar 共用的 2D 关节（同 image space）。
+ */
+interface PoseProxyJoints {
+  source: 'page1' | 'page2-legacy';
+  /** Front-view joints in split-local pixel coordinates. */
+  frontJoints: Joint2D[];
+  /** Image space these joint coordinates live in. */
+  frontSize: { width: number; height: number };
+  /** Optional traceability metadata. */
+  meta: {
+    sourceFile?: string;
+    pipelineKey?: string;
+  };
+}
+
+async function loadPoseProxyJoints(
+  page1: { splits?: Page1SplitsMeta; joints?: Page1JointsMeta } | undefined,
+  legacyLookup: () => Promise<{
+    front: Joint2D[];
+    sliceSize: { w: number; h: number };
+    pipelineKey: string;
+    resultFile?: string;
+  } | null>,
+): Promise<PoseProxyJoints | null> {
+  // Prefer Page1 joints (Stage 1 producer)
+  if (page1?.joints?.views.front?.joints?.length && page1?.splits?.views.front) {
+    const fv = page1.splits.views.front;
+    return {
+      source: 'page1',
+      frontJoints: page1.joints.views.front.joints,
+      frontSize: { width: fv.size.w, height: fv.size.h },
+      meta: { sourceFile: page1.joints.source },
+    };
+  }
+  const legacy = await legacyLookup();
+  if (legacy && legacy.front.length) {
+    return {
+      source: 'page2-legacy',
+      frontJoints: legacy.front,
+      frontSize: { width: legacy.sliceSize.w, height: legacy.sliceSize.h },
+      meta: { pipelineKey: legacy.pipelineKey, sourceFile: legacy.resultFile },
+    };
+  }
+  return null;
+}
 
 interface Props {
   onStatusChange: (msg: string, status?: 'info' | 'success' | 'warning' | 'error') => void;
@@ -141,14 +196,6 @@ interface GallerySnapshot {
   dataUrl?: string;
 }
 
-interface LoadedFrontSegment {
-  dataUrl: string;
-  file: string;
-  dirName: string;
-  source: string;
-  size?: { w: number; h: number };
-}
-
 const TRACE_LIMIT = 200;
 const POSE_PROXY_DIRECT_JOINTS = [
   'left_shoulder',
@@ -237,29 +284,6 @@ function summarizeMaskReprojection(result: MaskReprojectionResult | null): Recor
     })),
     unassignedPixels: result.unassignedPixels,
   };
-}
-
-function segmentView(entry: SegmentSetEntry): string | null {
-  const view = entry.meta?.view;
-  return typeof view === 'string' ? view : null;
-}
-
-function segmentSize(entry: SegmentSetEntry): { w: number; h: number } | undefined {
-  const size = entry.meta?.size;
-  if (!size || typeof size !== 'object') return undefined;
-  const s = size as { w?: unknown; h?: unknown; width?: unknown; height?: unknown };
-  const w = typeof s.w === 'number' ? s.w : typeof s.width === 'number' ? s.width : undefined;
-  const h = typeof s.h === 'number' ? s.h : typeof s.height === 'number' ? s.height : undefined;
-  return w && h ? { w, h } : undefined;
-}
-
-function blobToDataUrl(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => resolve(reader.result as string);
-    reader.onerror = () => reject(new Error('Failed to convert image blob to data URL'));
-    reader.readAsDataURL(blob);
-  });
 }
 
 function scaleJointsToImageSize<T extends { x: number; y: number }>(
@@ -569,7 +593,7 @@ function makeDemoTarget(source: MeshData): MeshData {
 }
 
 export function ModelAssemble({ onStatusChange }: Props) {
-  const { project, listHistory, loadByName, loadLatest, loadLatestSegments, loadPipelines } = useProject();
+  const { project, listHistory, loadByName, loadLatest, loadPipelines } = useProject();
   const demoTarget = useMemo(() => makeDemoTarget(DEMO_SOURCE), []);
 
   const [srcMesh, setSrcMesh] = useState<MeshData>(DEMO_SOURCE);
@@ -593,7 +617,16 @@ export function ModelAssemble({ onStatusChange }: Props) {
   useEffect(() => {
     let cancelled = false;
     async function check() {
-      if (!project || !sourceGalleryBinding?.pipelineKey) {
+      if (!project) {
+        setPoseProxyAvailable(false);
+        return;
+      }
+      // Stage 2: page1.joints 优先；旧工程回退到 pipeline jointsMeta
+      if (project.meta.page1?.joints?.views.front?.joints?.length) {
+        if (!cancelled) setPoseProxyAvailable(true);
+        return;
+      }
+      if (!sourceGalleryBinding?.pipelineKey) {
         setPoseProxyAvailable(false);
         return;
       }
@@ -608,7 +641,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
     }
     check();
     return () => { cancelled = true; };
-  }, [project, sourceGalleryBinding?.pipelineKey]);
+  }, [project, project?.meta.page1?.joints, sourceGalleryBinding?.pipelineKey]);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [autoAlignSummary, setAutoAlignSummary] = useState<AutoAlignSummary | null>(null);
   const [partialMatchSummary, setPartialMatchSummary] = useState<PartialMatchSummary | null>(null);
@@ -627,30 +660,6 @@ export function ModelAssemble({ onStatusChange }: Props) {
       return next;
     });
   }, []);
-
-  const loadPage1FrontSegment = useCallback(async (): Promise<LoadedFrontSegment | null> => {
-    const latest = await loadLatest('page1.multiview');
-    if (!latest) return null;
-
-    const baseName = latest.version.file.replace(/\.[^.]+$/, '');
-    const segmentSet = await loadLatestSegments('page1.multiview', baseName);
-    if (!segmentSet) return null;
-
-    const frontEntry = segmentSet.index.entries.find((entry) => segmentView(entry) === 'front')
-      ?? segmentSet.index.entries.find((entry) => /^front[_-]/i.test(entry.file));
-    if (!frontEntry) return null;
-
-    const blob = segmentSet.files.get(frontEntry.file);
-    if (!blob) return null;
-
-    return {
-      dataUrl: await blobToDataUrl(blob),
-      file: frontEntry.file,
-      dirName: segmentSet.dirName,
-      source: segmentSet.index.source,
-      size: segmentSize(frontEntry),
-    };
-  }, [loadLatest, loadLatestSegments]);
 
   const clearAlignmentTrace = useCallback(() => {
     setAlignmentTrace([]);
@@ -2759,26 +2768,54 @@ export function ModelAssemble({ onStatusChange }: Props) {
             pipelineKey: sourceGalleryBinding.pipelineKey,
           });
 
-          const srcJointsMeta = await getPipelineJoints(project, sourceGalleryBinding.pipelineKey);
-          if (!srcJointsMeta?.views?.front?.length) {
-            onStatusChange('源模型缺少关节点数据，请确认 Page2 已生成 joints', 'error');
+          // Stage 2: 双源兼容查询关节。Page1 优先；旧工程回退到 pipeline.jointsMeta。
+          const proxyJoints = await loadPoseProxyJoints(
+            project.meta.page1,
+            async () => {
+              const meta = await getPipelineJoints(project, sourceGalleryBinding.pipelineKey);
+              if (!meta?.views?.front?.length) return null;
+              const fv = meta.splitMeta.views.find((v) => v.view === 'front');
+              if (!fv) return null;
+              return {
+                front: meta.views.front,
+                sliceSize: fv.sliceSize,
+                pipelineKey: sourceGalleryBinding.pipelineKey,
+                resultFile: meta.resultFile,
+              };
+            },
+          );
+          if (!proxyJoints) {
+            onStatusChange('未找到关节数据：请先在 Page1 生成 Multi-View（自动检测关节），或在旧工程的 Page2 生成 joints', 'error');
             setPartialLoading(false);
             setAligning(false);
             return;
           }
-          const srcJoints = srcJointsMeta.views.front;
+          const srcJoints = proxyJoints.frontJoints;
+          if (proxyJoints.source === 'page1' && project.meta.page1?.joints) {
+            const pj = project.meta.page1.joints;
+            console.warn(
+              '[Page3 Pose Proxy] dual-source resolved → page1.joints (file=%s, frontJoints=%d)',
+              pj.source, srcJoints.length,
+            );
+          } else if (proxyJoints.source === 'page2-legacy') {
+            console.warn(
+              '[Page3 Pose Proxy] dual-source resolved → page2.jointsMeta (legacy, pipelineKey=%s)',
+              sourceGalleryBinding.pipelineKey,
+            );
+          }
 
           appendAlignmentTrace('auto-pose-source-input', {
-            kind: 'cached-page2-pipeline-joints',
+            kind: proxyJoints.source === 'page1'
+              ? 'page1.joints (Stage 1 producer)'
+              : 'cached-page2-pipeline-joints (legacy)',
             pipelineKey: sourceGalleryBinding.pipelineKey,
             pipelineName: sourceGalleryBinding.pipelineName,
-            resultFile: srcJointsMeta.resultFile,
-            modelFile: srcJointsMeta.modelFile,
+            sourceFile: proxyJoints.meta.sourceFile,
             jointCount: srcJoints.length,
+            frontSize: proxyJoints.frontSize,
           });
 
           // The target grey render is kept only as the 2D→3D projection reference.
-          // DWPose itself should run on the real Page1 MultiView front image.
           if (!orthoRenderUrl || !orthoCamera) {
             onStatusChange('缺少目标模型正交渲染图，请先加载参考图并完成定位', 'error');
             setPartialLoading(false);
@@ -2786,60 +2823,29 @@ export function ModelAssemble({ onStatusChange }: Props) {
             return;
           }
 
-          const targetFront = await loadPage1FrontSegment();
-          if (!targetFront) {
-            appendAlignmentTrace('auto-pose-target-input-missing', {
-              expected: 'page1.multiview front segment',
-            });
-            onStatusChange('Pose Proxy 缺少 Page1 MultiView 正视图：请先在 Page1 生成 MultiView，并确保已切分 front 视图', 'error');
-            setPartialLoading(false);
-            setAligning(false);
-            return;
-          }
-
-          appendAlignmentTrace('auto-pose-dwpose-start', {
-            input: 'page1.multiview.front',
-            file: targetFront.file,
-            dirName: targetFront.dirName,
-            source: targetFront.source,
-            segmentSize: targetFront.size,
-            projectionCamera: summarizeCamera(orthoCamera),
-          });
-          const tPose = await detectPoses(targetFront.dataUrl, {
-            includeHand: false,
-            includeFace: false,
-          });
-          if (!tPose.raw?.poses?.length) {
-            appendAlignmentTrace('auto-pose-dwpose-fail', {
-              input: 'page1.multiview.front',
-              file: targetFront.file,
-              posesLength: tPose.raw?.poses?.length ?? 0,
-              imageSize: tPose.raw?.imageSize,
-            });
-            onStatusChange('Page1 MultiView 正视图 DWPose 未检测到人体关键点，无法使用 Pose Proxy', 'error');
-            setPartialLoading(false);
-            setAligning(false);
-            return;
-          }
-          const detectedTarJoints = cocoPoseToJoint2D(tPose.raw.poses[0], tPose.raw.imageSize);
-          const tarJoints = scaleJointsToImageSize(
-            detectedTarJoints,
-            tPose.raw.imageSize,
+          // ── Target joints ────────────────────────────────────────────
+          // Stage 4: src 与 tar 共用同一组 page1 joints；target 只需把同一份
+          // joints 从 page1 split-local 缩放到 orthoCamera 像素空间。
+          // 旧工程的 page2.jointsMeta 也走同一路径（proxyJoints 已统一两源）。
+          const tarJoints: Joint2D[] = scaleJointsToImageSize(
+            proxyJoints.frontJoints,
+            proxyJoints.frontSize,
             { width: orthoCamera.width, height: orthoCamera.height },
           );
-          appendAlignmentTrace('auto-pose-dwpose-result', {
-            input: 'page1.multiview.front',
-            rawImageSize: tPose.raw.imageSize,
-            projectionSize: { width: orthoCamera.width, height: orthoCamera.height },
-            scaledToProjection: tPose.raw.imageSize.width !== orthoCamera.width || tPose.raw.imageSize.height !== orthoCamera.height,
+          appendAlignmentTrace('auto-pose-target-input', {
+            kind: proxyJoints.source === 'page1'
+              ? 'page1.joints (shared with src; rescaled to ortho)'
+              : 'page2-legacy.jointsMeta (rescaled to ortho)',
+            fromSize: proxyJoints.frontSize,
+            toSize: { width: orthoCamera.width, height: orthoCamera.height },
             jointCount: tarJoints.length,
-            joints: tarJoints.map((j) => `${j.name}(${j.x},${j.y})`),
+            projectionCamera: summarizeCamera(orthoCamera),
           });
 
-          // Build source skeleton proxy — derive camera from split view size
-          const frontViewMeta = srcJointsMeta.splitMeta.views.find((v) => v.view === 'front');
-          const srcViewW = frontViewMeta?.sliceSize.w ?? 512;
-          const srcViewH = frontViewMeta?.sliceSize.h ?? 512;
+          // Build source skeleton proxy — derive camera from src view size.
+          // Stage 2: src view size 来自 page1.splits.front.size（或旧工程的 splitMeta sliceSize）。
+          const srcViewW = proxyJoints.frontSize.width;
+          const srcViewH = proxyJoints.frontSize.height;
           const srcRender = renderOrthoFrontViewWithCamera(
             srcMesh.vertices,
             srcMesh.faces,
@@ -3229,7 +3235,6 @@ export function ModelAssemble({ onStatusChange }: Props) {
     sourceGalleryBinding,
     project,
     orthoRenderUrl,
-    loadPage1FrontSegment,
     onStatusChange,
   ]);
 
