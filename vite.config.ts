@@ -61,6 +61,18 @@ export default defineConfig(({ mode }) => {
   const SEGFORMER_CACHE_DIR =
     env.VITE_SEGFORMER_CACHE_DIR ?? 'C:\\Users\\xuxiao02\\.cache\\huggingface\\hub';
 
+  // DWPose body pose estimation (D:\AI\Prototypes\DWPose).
+  // Uses the DWPose project's own venv (Python 3.9 + onnxruntime-directml)
+  // for GPU-accelerated inference via YOLOX + RTMPose ONNX models.
+  const DWPOSE_PYTHON =
+    env.VITE_DWPOSE_PYTHON ?? 'D:\\AI\\Prototypes\\DWPose\\venv\\Scripts\\python.exe';
+  const DWPOSE_WORKER =
+    env.VITE_DWPOSE_WORKER ?? 'D:\\AI\\Prototypes\\DWPose\\pose_worker.py';
+  const DWPOSE_DETECTOR =
+    env.VITE_DWPOSE_DETECTOR ?? 'D:\\AI\\Prototypes\\DWPose\\models\\yolox_l.onnx';
+  const DWPOSE_POSE_MODEL =
+    env.VITE_DWPOSE_POSE_MODEL ?? 'D:\\AI\\Prototypes\\DWPose\\models\\dw-ll_ucoco_384.onnx';
+
   return {
     plugins: [
       react(),
@@ -71,6 +83,12 @@ export default defineConfig(({ mode }) => {
         worker: SEGFORMER_WORKER,
         model: SEGFORMER_MODEL,
         cacheDir: SEGFORMER_CACHE_DIR,
+      }),
+      dwposePlugin({
+        python: DWPOSE_PYTHON,
+        worker: DWPOSE_WORKER,
+        detectorModel: DWPOSE_DETECTOR,
+        poseModel: DWPOSE_POSE_MODEL,
       }),
     ],
     // Allow the test_align_e2e.html page to be served as a second entry.
@@ -149,6 +167,168 @@ export default defineConfig(({ mode }) => {
     },
   };
 });
+
+// ============================================================================
+// DWPose bridge plugin
+// ============================================================================
+//
+// Exposes a single dev-server endpoint:
+//
+//   POST /api/dwpose
+//     Content-Type: application/json
+//     Body: {
+//       imageBase64: "data:image/png;base64,...",
+//       detThr?: number,        // default 0.4
+//       nmsThr?: number,        // default 0.45
+//       includeHand?: boolean,  // default true
+//       includeFace?: boolean,  // default true
+//     }
+//
+//     Spawns pose_worker.py in the DWPose project's own venv (DirectML GPU).
+//     The worker returns COCO-18 body keypoints (+ optional hand/face).
+//
+//     Response shape:
+//       { ok: true, json: { imageSize, poses } }
+//       { ok: false, error: <string> }
+//
+interface DwposePluginOptions {
+  python: string;
+  worker: string;
+  detectorModel: string;
+  poseModel: string;
+}
+
+function dwposePlugin(opts: DwposePluginOptions): Plugin {
+  return {
+    name: 'dwpose-bridge',
+    apply: 'serve',
+    configureServer(server) {
+      server.middlewares.use('/api/dwpose', async (req, res, next) => {
+        if (req.method !== 'POST') return next();
+
+        const sendJson = (status: number, body: unknown) => {
+          res.statusCode = status;
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          res.end(JSON.stringify(body));
+        };
+
+        let body = '';
+        try {
+          for await (const chunk of req) body += chunk;
+        } catch (err) {
+          return sendJson(400, { ok: false, error: `读取请求体失败：${(err as Error).message}` });
+        }
+
+        let parsed: {
+          imageBase64?: string;
+          detThr?: number;
+          nmsThr?: number;
+          includeHand?: boolean;
+          includeFace?: boolean;
+        };
+        try {
+          parsed = JSON.parse(body);
+          if (!parsed.imageBase64) throw new Error('缺少 imageBase64 字段');
+        } catch (err) {
+          return sendJson(400, { ok: false, error: `请求体不合法：${(err as Error).message}` });
+        }
+
+        const m = /^data:image\/[^;]+;base64,(.+)$/.exec(parsed.imageBase64!);
+        const pureB64 = m ? m[1] : parsed.imageBase64!;
+
+        const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dwpose-bridge-'));
+        const inputPath = path.join(tmpDir, 'in.png');
+        const jsonPath = path.join(tmpDir, 'pose.json');
+        const overlayPath = path.join(tmpDir, 'pose_overlay.png');
+
+        try {
+          await fs.writeFile(inputPath, Buffer.from(pureB64, 'base64'));
+
+          const args = [
+            opts.worker,
+            '--input', inputPath,
+            '--output-json', jsonPath,
+            '--output-image', overlayPath,
+            '--detector', opts.detectorModel,
+            '--pose-model', opts.poseModel,
+            '--det-thr', String(parsed.detThr ?? 0.4),
+            '--nms-thr', String(parsed.nmsThr ?? 0.45),
+          ];
+          if (parsed.includeHand === false) args.push('--no-hand');
+          if (parsed.includeFace === false) args.push('--no-face');
+
+          // eslint-disable-next-line no-console
+          console.log('[dwpose-bridge] spawn:', opts.python, args.join(' '));
+
+          const child = spawn(opts.python, args, {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+          });
+
+          let stderr = '';
+          let stdout = '';
+          child.stderr.on('data', (d) => {
+            const text = d.toString();
+            stderr += text;
+            process.stderr.write(`[dwpose-bridge] ${text}`);
+          });
+          child.stdout.on('data', (d) => {
+            const text = d.toString();
+            stdout += text;
+            process.stdout.write(`[dwpose-bridge] ${text}`);
+          });
+
+          const exitCode: number = await new Promise((resolve) => {
+            child.on('exit', (code) => resolve(code ?? -1));
+            child.on('error', () => resolve(-1));
+          });
+
+          if (exitCode !== 0) {
+            return sendJson(500, {
+              ok: false,
+              error: `DWPose 进程退出码 ${exitCode}\n${stderr.slice(-2000)}`,
+            });
+          }
+
+          let jsonExists = true;
+          try { await fs.access(jsonPath); } catch { jsonExists = false; }
+          if (!jsonExists) {
+            return sendJson(500, {
+              ok: false,
+              error: `DWPose 未产生 JSON 输出\n${stderr.slice(-1000)}`,
+            });
+          }
+
+          const jsonBuf = await fs.readFile(jsonPath, 'utf-8');
+          const jsonData = JSON.parse(jsonBuf);
+
+          // Optionally include the overlay image
+          let overlayBase64: string | undefined;
+          try {
+            const overlayBuf = await fs.readFile(overlayPath);
+            overlayBase64 = `data:image/png;base64,${overlayBuf.toString('base64')}`;
+          } catch {
+            // overlay is optional
+          }
+          void stdout;
+
+          return sendJson(200, {
+            ok: true,
+            json: jsonData,
+            overlayBase64,
+          });
+        } catch (err) {
+          return sendJson(500, {
+            ok: false,
+            error: `DWPose 桥接异常：${(err as Error).message}`,
+          });
+        } finally {
+          fs.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
+        }
+      });
+    },
+  };
+}
 
 // ============================================================================
 // SAM3 bridge plugin

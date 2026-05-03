@@ -5,6 +5,8 @@ import { GLBViewer } from '../../components/GLBViewer';
 import { getPartNodes, PartPipeline } from './PartPipeline';
 import { useProject } from '../../contexts/ProjectContext';
 import type { PersistedPipeline } from '../../services/projectStore';
+import { detectAndConvertToGlobalJoints } from '../../services/dwpose';
+import { generatePipelineJoints } from '../../services/jointsGeneration';
 
 const PIPELINE_MODE_LABEL: Record<PipelineMode, string> = {
   extraction: 'General Extract',
@@ -59,6 +61,9 @@ function toPersisted(p: PartPipelineState): PersistedPipeline {
     modifyFile: p.modify?.resultFile ?? null,
     modelFile: p.model3d?.glbFile ?? null,
     modelMode: p.model3d?.mode ?? 'fourView',
+    smartCropMeta: p.extraction?.smartCropMeta,
+    splitMeta: p.extraction?.splitMeta,
+    jointsMeta: p.jointsMeta,
   };
 }
 
@@ -102,6 +107,8 @@ function fromPersisted(pp: PersistedPipeline, index: number): PartPipelineState 
     extraction: {
       resultUrl: null,
       resultFile: pp.resultFile ?? null,
+      smartCropMeta: pp.smartCropMeta,
+      splitMeta: pp.splitMeta,
     },
     modify: {
       resultUrl: null,
@@ -112,11 +119,12 @@ function fromPersisted(pp: PersistedPipeline, index: number): PartPipelineState 
       glbFile: pp.modelFile ?? null,
       mode: pp.modelMode ?? 'fourView',
     },
+    jointsMeta: pp.jointsMeta,
   };
 }
 
 export function HighresModel({ onStatusChange }: Props) {
-  const { project, savePipelines, loadPipelines } = useProject();
+  const { project, savePipelines, loadPipelines, loadLatest } = useProject();
   const [parts, setParts] = useState<PartPipelineState[]>(() => [makePart(0, 'extraction'), makePart(1, 'extraction')]);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const addDropdownRef = useRef<HTMLDivElement>(null);
@@ -202,6 +210,115 @@ export function HighresModel({ onStatusChange }: Props) {
     setPendingDelete(null);
   };
 
+  // ── Generate Joint Info ──────────────────────────────────────────────
+  const [jointsGenerating, setJointsGenerating] = useState(false);
+  const [jointsStatus, setJointsStatus] = useState<string | null>(null);
+
+  const handleGenerateJoints = useCallback(async () => {
+    if (!project) {
+      onStatusChange('请先打开工程', 'error');
+      return;
+    }
+
+    setJointsGenerating(true);
+    setJointsStatus('Running DWPose on Page1 MultiView…');
+    onStatusChange('Joints: 开始生成…', 'info');
+
+    try {
+      // 1. Load Page1 MultiView image
+      const r = await loadLatest('page1.multiview');
+      if (!r) {
+        onStatusChange('Page1 MultiView 图片不存在，请先在 Page1 生成 Multi-View', 'error');
+        setJointsGenerating(false);
+        setJointsStatus(null);
+        return;
+      }
+
+      // 2. Convert blob to base64 data URI
+      const base64 = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result as string);
+        reader.onerror = () => reject(new Error('Failed to convert blob to base64'));
+        reader.readAsDataURL(r.blob);
+      });
+
+      // 3. Run DWPose on the MultiView 2x2 image
+      const { joints: globalJoints } = await detectAndConvertToGlobalJoints(
+        base64,
+        r.version.file,
+      );
+
+      // 4. For each pipeline with SmartCrop + Split metadata, generate pipeline joints
+      let successCount = 0;
+      let skipCount = 0;
+      const statusLines: string[] = [];
+
+      const updatedParts = await Promise.all(
+        parts.map(async (p) => {
+          const ext = p.extraction;
+          if (!ext?.smartCropMeta || !ext?.splitMeta) {
+            skipCount++;
+            statusLines.push(`${p.name}: 跳过（缺 SmartCrop/Split 元数据，请重新运行 Extraction）`);
+            return p;
+          }
+
+          // P0-A: Verify DWPose input image size matches SmartCrop source size.
+          // A mismatch means the MultiView image was regenerated at a different
+          // resolution than the SmartCrop input, which would map joints to wrong
+          // coordinates.
+          const srcW = ext.smartCropMeta.sourceSize.width;
+          const srcH = ext.smartCropMeta.sourceSize.height;
+          const globalW = globalJoints.imageSize.width;
+          const globalH = globalJoints.imageSize.height;
+          if (srcW !== globalW || srcH !== globalH) {
+            skipCount++;
+            statusLines.push(
+              `${p.name}: 跳过（尺寸不一致：DWPose ${globalW}×${globalH} ≠ SmartCrop ${srcW}×${srcH}，请重新运行 Page1 MultiView 和 Page2 Extraction）`,
+            );
+            return p;
+          }
+
+          const dims = ext.smartCropMeta.outputSize;
+
+          const persisted = toPersisted(p);
+          const pipelineJoints = generatePipelineJoints(
+            globalJoints,
+            persisted,
+            ext.smartCropMeta,
+            ext.splitMeta,
+            dims,
+          );
+
+          const frontCount = pipelineJoints.views.front.length;
+          const leftCount = pipelineJoints.views.left.length;
+          const backCount = pipelineJoints.views.back.length;
+          const rightCount = pipelineJoints.views.right.length;
+          statusLines.push(
+            `${p.name}: front ${frontCount} / left ${leftCount} / back ${backCount} / right ${rightCount}`,
+          );
+          successCount++;
+          return { ...p, jointsMeta: pipelineJoints };
+        }),
+      );
+
+      setParts(updatedParts); // Triggers auto-save via useEffect
+
+      const summary =
+        `Joints 完成：${successCount} 条 Pipeline 成功` +
+        (skipCount > 0 ? `, ${skipCount} 条跳过` : '');
+      setJointsStatus(summary);
+      onStatusChange(summary + '\n' + statusLines.join('\n'), successCount > 0 ? 'success' : 'warning');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setJointsStatus(`失败: ${msg}`);
+      onStatusChange(`生成 Joints 失败: ${msg}`, 'error');
+    } finally {
+      setJointsGenerating(false);
+    }
+  }, [project, parts, loadLatest, onStatusChange]);
+
+  // ── Render ───────────────────────────────────────────────────────────
+
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       {/* Toolbar */}
@@ -225,6 +342,20 @@ export function HighresModel({ onStatusChange }: Props) {
         <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
           共 {parts.length} 条 Pipeline
         </span>
+        <Button
+          variant="secondary"
+          size="sm"
+          disabled={jointsGenerating || !project}
+          onClick={handleGenerateJoints}
+          title={jointsStatus ?? '从 Page1 MultiView 生成 DWPose 骨骼，按 SmartCrop/Split 映射到各 Pipeline'}
+        >
+          {jointsGenerating ? '⏳ Generating…' : '🦴 Generate Joint Info'}
+        </Button>
+        {jointsStatus && !jointsGenerating && (
+          <span style={{ fontSize: 10, color: 'var(--text-muted)', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {jointsStatus}
+          </span>
+        )}
         <div ref={addDropdownRef} style={{ position: 'relative' }}>
           <Button variant="primary" size="sm" onClick={() => setAddDropdownOpen((v) => !v)}>
             ＋ 添加 Pipeline ▾

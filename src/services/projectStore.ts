@@ -36,6 +36,8 @@ export interface NodeIndex {
   history: AssetVersion[];   // 按时间倒序，[0] = 最新
 }
 
+import type { PipelineJointsMeta, SmartCropTransformMeta, SplitTransformMeta } from '../types/joints';
+
 // 节点目录命名（含序号便于在文件管理器中按顺序查看）
 export interface NodeDir {
   pageDir: string;
@@ -571,6 +573,12 @@ export interface PersistedPipeline {
   modelFile?: string | null;
   /** 3D Model 生成模式 */
   modelMode?: 'single' | 'frontBack' | 'fourView';
+  /** SmartCrop transform metadata — captured during extraction for joints generation */
+  smartCropMeta?: SmartCropTransformMeta;
+  /** Split transform metadata — captured during extraction for joints generation */
+  splitMeta?: SplitTransformMeta;
+  /** Pipeline joints metadata (Page2 output for Page3 alignment) */
+  jointsMeta?: PipelineJointsMeta;
 }
 
 export interface Page2PipelinesIndex {
@@ -610,4 +618,32 @@ export async function loadPipelines(
   } catch {
     return null;
   }
+}
+
+/**
+ * Find the pipeline joints for a given pipeline ID.
+ * Returns undefined if the pipeline or its joints are not found.
+ */
+export async function getPipelineJoints(
+  handle: ProjectHandle,
+  pipelineId: string,
+): Promise<PipelineJointsMeta | undefined> {
+  const index = await loadPipelines(handle);
+  if (!index) return undefined;
+  const pipeline = index.pipelines.find((p) => p.id === pipelineId);
+  return pipeline?.jointsMeta;
+}
+
+/**
+ * Find the pipeline joints for the pipeline associated with a given
+ * model file (GLB). Returns undefined if not found.
+ */
+export async function getPipelineJointsByModelFile(
+  handle: ProjectHandle,
+  modelFile: string,
+): Promise<PipelineJointsMeta | undefined> {
+  const index = await loadPipelines(handle);
+  if (!index) return undefined;
+  const pipeline = index.pipelines.find((p) => p.modelFile === modelFile);
+  return pipeline?.jointsMeta;
 }

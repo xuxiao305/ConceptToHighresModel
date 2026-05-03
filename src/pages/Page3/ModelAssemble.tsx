@@ -30,6 +30,8 @@ import {
   reprojectMaskToVertices,
   extractImageSubjectBBox,
   icpRefine,
+  buildSkeletonProxy,
+  computePoseAlignment,
   type Vec3,
   type Face3,
   type ViewMode,
@@ -48,7 +50,8 @@ import {
   type AlignmentResult,
   applyTransform,
 } from '../../three/alignment';
-import type { AssetVersion, PersistedPipeline } from '../../services/projectStore';
+import { detectPoses, cocoPoseToJoint2D } from '../../services/dwpose';
+import { getPipelineJoints, type AssetVersion, type PersistedPipeline } from '../../services/projectStore';
 
 interface Props {
   onStatusChange: (msg: string, status?: 'info' | 'success' | 'warning' | 'error') => void;
@@ -63,7 +66,7 @@ interface MeshData {
 type CenterViewMode = 'landmark' | 'result';
 type ResultViewMode = 'overlay' | 'aligned' | 'target' | 'original';
 type TargetRegionSelectionMode = 'auto' | 'manual';
-type PartialMatchMode = 'surface' | 'limb-structure' | 'jacket-structure';
+type PartialMatchMode = 'surface' | 'limb-structure' | 'jacket-structure' | 'pose-proxy';
 
 interface ResultPreview {
   mode: AlignmentMode;
@@ -522,6 +525,27 @@ export function ModelAssemble({ onStatusChange }: Props) {
   const [selectedGalleryId, setSelectedGalleryId] = useState<string | null>(null);
   const [gallerySnapshots, setGallerySnapshots] = useState<Record<string, GallerySnapshot>>({});
   const [sourceGalleryBinding, setSourceGalleryBinding] = useState<SourceGalleryBinding | null>(null);
+  const [poseProxyAvailable, setPoseProxyAvailable] = useState(false);
+  // Check Pose Proxy joints availability whenever source binding changes
+  useEffect(() => {
+    let cancelled = false;
+    async function check() {
+      if (!project || !sourceGalleryBinding?.pipelineKey) {
+        setPoseProxyAvailable(false);
+        return;
+      }
+      try {
+        const joints = await getPipelineJoints(project, sourceGalleryBinding.pipelineKey);
+        if (!cancelled) {
+          setPoseProxyAvailable(!!(joints?.views?.front?.length));
+        }
+      } catch {
+        if (!cancelled) setPoseProxyAvailable(false);
+      }
+    }
+    check();
+    return () => { cancelled = true; };
+  }, [project, sourceGalleryBinding?.pipelineKey]);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [autoAlignSummary, setAutoAlignSummary] = useState<AutoAlignSummary | null>(null);
   const [partialMatchSummary, setPartialMatchSummary] = useState<PartialMatchSummary | null>(null);
@@ -737,7 +761,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
     setPartialDebug(null);
     setAcceptedCandidateIds(new Set());
     onStatusChange(
-      mode === 'limb-structure'
+      mode === 'pose-proxy'
+        ? 'Step 1 已切换到实验模式：Pose Proxy（DWPose 骨架胶囊 + SVD）— 仅支持一键自动对齐'
+        : mode === 'limb-structure'
         ? 'Step 1 已切换到实验模式：肢体大结构（root / bend / end 三锚点）'
         : mode === 'jacket-structure'
           ? 'Step 1 已切换到实验模式：外套结构（collar / shoulder / cuff / hem 锚点图）'
@@ -904,7 +930,19 @@ export function ModelAssemble({ onStatusChange }: Props) {
       targetRegion: summarizeRegion(tarRegion),
     });
     const tarBodyVertices = findMaskRegion(maskReproj?.regions, ['body', 'torso']);
-    const r = partialMatchMode === 'limb-structure'
+    const r = partialMatchMode === 'pose-proxy'
+      ? (() => {
+          // Pose Proxy is auto-align only — manual Step 1 is not supported.
+          // The button is disabled when mode is 'pose-proxy', but guard here
+          // as defense-in-depth: show error and bail, never fall back to RANSAC.
+          onStatusChange(
+            'Pose Proxy 模式不支持手动 Step 1，请使用上方「一键 · Pose Proxy 对齐」按钮',
+            'error',
+          );
+          setPartialLoading(false);
+          return null;
+        })()
+      : partialMatchMode === 'limb-structure'
       ? matchLimbStructureToWhole(
           { vertices: srcMesh.vertices },
           { vertices: tarMesh.vertices },
@@ -963,6 +1001,8 @@ export function ModelAssemble({ onStatusChange }: Props) {
             seed: runSeed,
           },
         );
+    // Defense-in-depth: pose-proxy mode bailed out, nothing to process
+    if (!r) return;
     const partialTimings = 'timings' in r ? r.timings : undefined;
     const partialDiagnostics = 'diagnostics' in r ? r.diagnostics : undefined;
     const partialWarnings = buildPartialWarnings(partialMatchMode, partialDiagnostics, tarRegion, tarMesh.vertices.length);
@@ -1008,7 +1048,10 @@ export function ModelAssemble({ onStatusChange }: Props) {
         diagnostics: partialDiagnostics,
       });
       onStatusChange(
-        partialMatchMode === 'limb-structure'
+        partialMatchMode === 'pose-proxy'
+          ? `Step 1 失败（Pose Proxy 回退到 RANSAC）：inliers=${r.bestInlierCount}（threshold=${(partialThresholdPct).toFixed(1)}% src bbox）` +
+            ` — 请使用一键自动对齐获得完整 Pose Proxy 流程`
+          : partialMatchMode === 'limb-structure'
           ? `Step 1 失败：结构锚点不足或退化（pairs=${r.pairs.length}）。请检查目标肢体区域 / Body 区域。`
           : partialMatchMode === 'jacket-structure'
             ? `Step 1 失败：外套结构锚点匹配不足（matched=${(r as any).diagnostics?.matchedCount ?? r.pairs.length}）。请检查 source/target 外套区域 BBox 分割是否合理。`
@@ -1053,7 +1096,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
     });
     appendAlignmentTrace('manual-partial-timing', summarizePartialTimings(partialTimings) ?? {});
     onStatusChange(
-      partialMatchMode === 'limb-structure'
+      partialMatchMode === 'pose-proxy'
+        ? `Step 1 完成（Pose Proxy 回退到 RANSAC）：inliers=${r.bestInlierCount}，输出 ${r.pairs.length} 对候选，RMSE=${r.rmse.toFixed(4)} — ${dt.toFixed(1)}ms · 请使用一键自动对齐获得完整 Pose Proxy`
+        : partialMatchMode === 'limb-structure'
         ? `Step 1 完成：结构锚点 ${r.pairs.length} 对（root/bend/end），RMSE=${r.rmse.toFixed(4)} — ${dt.toFixed(1)}ms${partialWarnings.length ? ' · 有诊断警告' : ''}`
         : partialMatchMode === 'jacket-structure'
           ? `Step 1 完成：外套结构锚点 ${r.pairs.length} 对（collar/hem/shoulder/cuff/armpit），RMSE=${r.rmse.toFixed(4)} — ${dt.toFixed(1)}ms${partialWarnings.length ? ' · 有诊断警告' : ''}`
@@ -2607,8 +2652,169 @@ export function ModelAssemble({ onStatusChange }: Props) {
           targetRegion: summarizeRegion(workingTarRegion),
         });
         const workingTarBodyVertices = findMaskRegion(workingMaskReproj?.regions, ['body', 'torso']);
-        const pm = runMode === 'limb-structure'
-          ? matchLimbStructureToWhole(
+        let pm: {
+          pairs: LandmarkCandidate[];
+          matrix4x4: number[][] | null;
+          rmse: number;
+          thresholdUsed: number;
+          iterationsRun: number;
+          rawSrcSamples: number;
+          rawTarSamples: number;
+          bestInlierCount: number;
+          timings?: PartialMatchTimingReport;
+          diagnostics?: Record<string, unknown>;
+        };
+        if (runMode === 'pose-proxy') {
+          // ── Pose Proxy Alignment ──────────────────────────────────────
+          // Uses DWPose body joints projected onto 3D mesh to build
+          // skeleton proxies (PCA capsules), then SVD on proxy anchors.
+          if (!project) {
+            onStatusChange('Pose Proxy 需要先打开项目', 'error');
+            setPartialLoading(false);
+            setAligning(false);
+            return;
+          }
+          if (!sourceGalleryBinding?.pipelineKey) {
+            onStatusChange('Pose Proxy 需要先选择源模型（从 Gallery 绑定 pipeline）', 'error');
+            setPartialLoading(false);
+            setAligning(false);
+            return;
+          }
+
+          appendAlignmentTrace('auto-pose-load-source-joints', {
+            pipelineKey: sourceGalleryBinding.pipelineKey,
+          });
+
+          const srcJointsMeta = await getPipelineJoints(project, sourceGalleryBinding.pipelineKey);
+          if (!srcJointsMeta?.views?.front?.length) {
+            onStatusChange('源模型缺少关节点数据，请确认 Page2 已生成 joints', 'error');
+            setPartialLoading(false);
+            setAligning(false);
+            return;
+          }
+          const srcJoints = srcJointsMeta.views.front;
+
+          // Run DWPose on target ortho render
+          if (!orthoRenderUrl || !orthoCamera) {
+            onStatusChange('缺少目标模型正交渲染图，请先加载参考图并完成定位', 'error');
+            setPartialLoading(false);
+            setAligning(false);
+            return;
+          }
+
+          appendAlignmentTrace('auto-pose-dwpose-start', {
+            camera: summarizeCamera(orthoCamera),
+          });
+          const tPose = await detectPoses(orthoRenderUrl, { includeHand: false, includeFace: false });
+          if (!tPose.raw?.poses?.length) {
+            onStatusChange('目标模型 DWPose 未检测到人体关键点，无法使用 Pose Proxy', 'error');
+            setPartialLoading(false);
+            setAligning(false);
+            return;
+          }
+          const tarJoints = cocoPoseToJoint2D(tPose.raw.poses[0], tPose.raw.imageSize);
+          appendAlignmentTrace('auto-pose-dwpose-result', {
+            jointCount: tarJoints.length,
+            joints: tarJoints.map((j) => `${j.name}(${j.x},${j.y})`),
+          });
+
+          // Build source skeleton proxy — derive camera from split view size
+          const frontViewMeta = srcJointsMeta.splitMeta.views.find((v) => v.view === 'front');
+          const srcViewW = frontViewMeta?.sliceSize.w ?? 512;
+          const srcViewH = frontViewMeta?.sliceSize.h ?? 512;
+          const srcRender = renderOrthoFrontViewWithCamera(
+            srcMesh.vertices,
+            srcMesh.faces,
+            {
+              width: srcViewW,
+              height: srcViewH,
+              background: null,
+              meshColor: '#dddddd',
+            },
+          );
+          const srcCamera = srcRender.camera;
+          const srcProxy = buildSkeletonProxy(
+            srcMesh.vertices,
+            srcJoints,
+            srcCamera,
+            { capsuleRadiusFraction: 0.08 },
+          );
+
+          // Build target skeleton proxy
+          const tarProxy = buildSkeletonProxy(
+            tarMesh.vertices,
+            tarJoints,
+            orthoCamera,
+            { capsuleRadiusFraction: 0.08 },
+            workingTarRegion?.vertices,
+          );
+
+          appendAlignmentTrace('auto-pose-proxies', {
+            srcAnchors: srcProxy.anchors.length,
+            srcCapsules: srcProxy.anchors.map((a) => `${a.kind}(v=${a.vertexCount})`),
+            tarAnchors: tarProxy.anchors.length,
+            tarCapsules: tarProxy.anchors.map((a) => `${a.kind}(v=${a.vertexCount})`),
+            srcWarnings: srcProxy.warnings,
+            tarWarnings: tarProxy.warnings,
+          });
+
+          // Compute pose alignment (SVD on proxy anchors)
+          const poseAlign = computePoseAlignment(srcProxy, tarProxy, {
+            svdMode: 'similarity',
+          });
+
+          appendAlignmentTrace('auto-pose-svd', {
+            anchorPairCount: poseAlign.anchorPairCount,
+            svdRmse: round3(poseAlign.svdRmse),
+            scale: round3(poseAlign.scale),
+            reliable: poseAlign.reliable,
+            warnings: poseAlign.warnings,
+            anchorErrors: poseAlign.anchorErrors.map((e) => ({
+              kind: e.kind,
+              error: round3(e.error),
+              confidence: round3(e.confidence),
+            })),
+          });
+
+          // Convert anchor errors to LandmarkCandidate pairs for ICP
+          const anchorPairs: LandmarkCandidate[] = [];
+          for (const e of poseAlign.anchorErrors) {
+            const srcA = srcProxy.anchors.find((a) => a.kind === e.kind);
+            const tarA = tarProxy.anchors.find((a) => a.kind === e.kind);
+            if (!srcA || !tarA) continue;
+            anchorPairs.push({
+              srcVertex: -1,
+              srcPosition: srcA.position,
+              tarVertex: -1,
+              tarPosition: tarA.position,
+              confidence: e.confidence,
+              descriptorDist: 0,
+              suggestAccept: e.confidence > 0.5,
+            });
+          }
+
+          pm = {
+            pairs: anchorPairs,
+            matrix4x4: poseAlign.matrix4x4,
+            rmse: poseAlign.svdRmse,
+            thresholdUsed: 0,
+            iterationsRun: 1,
+            rawSrcSamples: srcProxy.anchors.length,
+            rawTarSamples: tarProxy.anchors.length,
+            bestInlierCount: anchorPairs.length,
+            diagnostics: {
+              mode: 'pose-proxy' as const,
+              srcAnchors: srcProxy.anchors.length,
+              tarAnchors: tarProxy.anchors.length,
+              anchorPairCount: poseAlign.anchorPairCount,
+              svdRmse: poseAlign.svdRmse,
+              scale: poseAlign.scale,
+              reliable: poseAlign.reliable,
+              warnings: poseAlign.warnings,
+            },
+          };
+        } else if (runMode === 'limb-structure') {
+          pm = matchLimbStructureToWhole(
               { vertices: srcMesh.vertices },
               { vertices: tarMesh.vertices },
               {
@@ -2616,9 +2822,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
                 tarBodyVertices: workingTarBodyVertices,
                 mode: ALIGNMENT_MODE,
               },
-            )
-          : runMode === 'jacket-structure'
-            ? (() => {
+            );
+        } else if (runMode === 'jacket-structure') {
+          pm = (() => {
                 // Phase 0: split garment into torso / left_sleeve / right_sleeve
                 // using bounding-box heuristic. Phase 2 will replace with AI.
                 const srcGarment = new Set(allIndices(srcMesh.vertices.length));
@@ -2653,8 +2859,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
                     warning: result.warning ?? null,
                   },
                 };
-              })()
-          : matchPartialToWhole(
+              })();
+        } else {
+          pm = matchPartialToWhole(
               { vertices: srcMesh.vertices, adjacency: srcAdjacency },
               { vertices: tarMesh.vertices, adjacency: tarAdjacency },
               {
@@ -2676,6 +2883,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
                 seed: runSeed,
               },
             );
+        }
         const partialTimings = 'timings' in pm ? pm.timings : undefined;
         const partialDiagnostics = 'diagnostics' in pm ? pm.diagnostics : undefined;
         const partialWarnings = buildPartialWarnings(runMode, partialDiagnostics, workingTarRegion, tarMesh.vertices.length);
@@ -2690,7 +2898,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
             diagnostics: partialDiagnostics,
           });
           onStatusChange(
-            runMode === 'limb-structure'
+            runMode === 'pose-proxy'
+              ? `自动对齐：Pose Proxy 锚点不足（pairs=${pm.pairs.length}，需≥3）`
+              : runMode === 'limb-structure'
               ? `自动对齐：结构锚点匹配失败（pairs=${pm.pairs.length}）`
               : runMode === 'jacket-structure'
                 ? `自动对齐：外套结构锚点匹配失败（matched=${(pm as any).diagnostics?.matchedCount ?? pm.pairs.length}）`
@@ -2866,9 +3076,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
         const icpSummary = useIcp
           ? `ICP 已采用：surface RMSE=${icp.rmse.toFixed(4)}，kept=${bestIcpIter?.pairsKept ?? 0}，${icp.iterations.length} 轮 (${icp.stopReason}, best#${icp.bestIteration + 1})`
           : `ICP 未采用：kept=${bestIcpIter?.pairsKept ?? 0} < ${minIcpPairsKept} 或 RMSE 无效`;
-        const modeLabel = runMode === 'limb-structure' ? '四肢大结构' : runMode === 'jacket-structure' ? '外套结构' : 'RANSAC';
+        const modeLabel = runMode === 'pose-proxy' ? 'Pose Proxy' : runMode === 'limb-structure' ? '四肢大结构' : runMode === 'jacket-structure' ? '外套结构' : 'RANSAC';
         onStatusChange(
-          `自动对齐完成 · ${modeLabel} · partial=${pm.pairs.length} 对 · ${icpSummary} · 最终 RMSE=${finalRmse.toFixed(4)} · ${dt.toFixed(0)}ms`,
+          `自动对齐完成 · ${modeLabel} · pm=${pm.pairs.length} 对 · ${icpSummary} · 最终 RMSE=${finalRmse.toFixed(4)} · ${dt.toFixed(0)}ms`,
           'success',
         );
       } catch (err) {
@@ -2920,6 +3130,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
     icpRejectMultiplier,
     icpConvergenceImprovement,
     buildTarRegionFromSet,
+    sourceGalleryBinding,
+    project,
+    orthoRenderUrl,
     onStatusChange,
   ]);
 
@@ -3394,7 +3607,22 @@ export function ModelAssemble({ onStatusChange }: Props) {
             </div>
           )}
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6, marginBottom: 8 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 8 }}>
+            <Button
+              size="md"
+              variant="primary"
+              onClick={() => handleAutoAlign('pose-proxy')}
+              loading={partialLoading || aligning}
+              disabled={partialLoading || aligning || srcMesh.vertices.length === 0 || tarMesh.vertices.length === 0 || !sourceGalleryBinding || !poseProxyAvailable}
+              style={{ justifyContent: 'center' }}
+              title={
+                !poseProxyAvailable
+                  ? 'Pose Proxy 不可用：请先在 Page2 生成 Joint Info（需要 Page1 MultiView + Page2 Extraction 完成）'
+                  : '实验模式：使用 DWPose 骨架胶囊 + PCA 锚点 + SVD 对齐。需要先绑定 Gallery 源模型。'
+              }
+            >
+              {(partialLoading || aligning) ? '自动对齐中…' : '一键 · Pose Proxy 对齐'}
+            </Button>
             <Button
               size="md"
               variant="primary"
@@ -3864,13 +4092,29 @@ export function ModelAssemble({ onStatusChange }: Props) {
               fontWeight: 600,
             }}
           >
-            当前模式：{partialMatchMode === 'limb-structure'
+            当前模式：{partialMatchMode === 'pose-proxy'
+              ? '实验 · Pose Proxy'
+              : partialMatchMode === 'limb-structure'
               ? '实验 · 肢体大结构'
               : partialMatchMode === 'jacket-structure'
                 ? '实验 · 外套结构对齐'
                 : '旧模式 · 表面 RANSAC'}
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6, marginBottom: 8 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 8 }}>
+            <Button
+              size="sm"
+              variant={partialMatchMode === 'pose-proxy' ? 'primary' : 'secondary'}
+              onClick={() => handleSetPartialMatchMode('pose-proxy')}
+              disabled={!poseProxyAvailable}
+              style={{ justifyContent: 'center' }}
+              title={
+                !poseProxyAvailable
+                  ? 'Pose Proxy 不可用：请先在 Page2 生成 Joint Info'
+                  : 'DWPose 骨架胶囊 + PCA 锚点 + SVD 对齐（仅支持一键自动对齐）'
+              }
+            >
+              {partialMatchMode === 'pose-proxy' ? '✓ ' : ''}Pose Proxy
+            </Button>
             <Button
               size="sm"
               variant={partialMatchMode === 'limb-structure' ? 'primary' : 'secondary'}
@@ -3900,7 +4144,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
             </Button>
           </div>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8 }}>
-            当前：{partialMatchMode === 'limb-structure'
+            当前：{partialMatchMode === 'pose-proxy'
+              ? 'DWPose 提取骨架关键点 → PCA 胶囊 → SVD 锚点对齐。仅支持一键自动对齐，Step 1 手动模式会回退到 RANSAC。'
+              : partialMatchMode === 'limb-structure'
               ? '只输出肩/肘/手（或髋/膝/脚）3 个大结构锚点，优先对齐 PCA 方向与弯折朝向。'
               : partialMatchMode === 'jacket-structure'
                 ? '分割外套为 torso / 左右袖，检测 collar/hem/shoulder/cuff/armpit 结构锚点，SVD 相似变换匹配。'
@@ -4080,9 +4326,11 @@ export function ModelAssemble({ onStatusChange }: Props) {
             variant="primary"
             onClick={handleFindPartial}
             loading={partialLoading}
-            disabled={partialLoading}
+            disabled={partialLoading || partialMatchMode === 'pose-proxy'}
             style={{ width: '100%', justifyContent: 'center' }}
-            title={partialMatchMode === 'limb-structure'
+            title={partialMatchMode === 'pose-proxy'
+              ? 'Pose Proxy 模式仅支持一键自动对齐，请使用上方「一键 · Pose Proxy 对齐」按钮'
+              : partialMatchMode === 'limb-structure'
               ? '执行结构匹配：检测 root / bend / end 三个大结构锚点，并生成供 Step 2 使用的对应点'
               : partialMatchMode === 'jacket-structure'
                 ? '执行外套结构匹配：BBox 分割 torso/左右袖，检测 collar/hem/shoulder/cuff/armpit 锚点，SVD 相似变换匹配'
@@ -4602,6 +4850,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
             </Button>
             <Button size="sm" onClick={resetPreview} disabled={!alignResult && !resultPreview} style={{ justifyContent: 'center' }}>
               撤销
+            </Button>
+            <Button size="sm" onClick={() => handleAutoAlign('pose-proxy')} loading={partialLoading || aligning} disabled={partialLoading || aligning || !sourceGalleryBinding || !poseProxyAvailable} style={{ justifyContent: 'center' }}>
+              重跑 Pose Proxy
             </Button>
             <Button size="sm" onClick={() => handleAutoAlign('limb-structure')} loading={partialLoading || aligning} disabled={partialLoading || aligning} style={{ justifyContent: 'center' }}>
               重跑大结构

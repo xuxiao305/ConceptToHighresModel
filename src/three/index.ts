@@ -92,3 +92,27 @@ export { detectJacketStructure, splitGarmentByBBox } from './jacketStructure';
 export type { JacketStructureInput, JacketStructureResult } from './jacketStructure';
 export { matchStructureGraphs } from './graphMatch';
 export type { GraphMatchResult } from './graphMatch';
+
+export type {
+  CapsuleRegion3D,
+  ProxyAnchor,
+  SkeletonProxyResult,
+  SkeletonProxyOptions,
+  PoseAlignmentOptions,
+  PoseAlignmentResult,
+} from './types';
+
+export {
+  matchObjectsToViews,
+  globalToProcessed,
+  processedToView,
+  globalToView,
+  globalJointsToProcessed,
+  processedJointsToViews,
+  globalJointsToViews,
+  jointToViewUV,
+} from './jointsTransform';
+
+export { buildSkeletonProxy } from './skeletonProxy';
+
+export { computePoseAlignment } from './poseAlignment';

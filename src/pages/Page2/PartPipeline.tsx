@@ -18,7 +18,8 @@ import {
   SAM3NotWiredError,
 } from '../../services/extraction';
 import { type AssetVersion } from '../../services/projectStore';
-import { splitMultiView, smartCropAndEnlargeAuto } from '../../services/multiviewSplit';
+import { splitMultiView, splitMultiViewWithMeta, smartCropAndEnlargeAutoWithMeta } from '../../services/multiviewSplit';
+import type { SmartCropTransformMeta, SplitTransformMeta } from '../../types/joints';
 import { runImageToModel, runMultiViewToModel, TripoServiceError, type MultiViewInputs } from '../../services/tripo';
 
 /**
@@ -469,9 +470,10 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
       onStatus(`[${pipeline.name}] Smart Crop & Enlarge (Auto)…`, 'info');
       let processedBlob: Blob;
       let processedUrl: string;
+      let smartCropMeta: SmartCropTransformMeta | undefined;
       try {
-        processedBlob = useSAM3
-          ? await smartCropAndEnlargeAuto(maskedBlob, {
+        const scResult = useSAM3
+          ? await smartCropAndEnlargeAutoWithMeta(maskedBlob, {
               // SAM3_ExtractParts.json node 13 params (with overrides per project spec:
               // workflow had max_objects=16 / uniform_scale=false / preserve_position=false
               // by mistake — corrected here to keep 4-view layout aligned)
@@ -485,7 +487,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
               preservePosition: true,
               background: '#ffffff',
             })
-          : await smartCropAndEnlargeAuto(maskedBlob, {
+          : await smartCropAndEnlargeAutoWithMeta(maskedBlob, {
               // BananaExtractJacket.json node 12 params
               padding: 1,
               whiteThreshold: 240,
@@ -497,6 +499,8 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
               preservePosition: true,
               background: '#ffffff',
             });
+        processedBlob = scResult.blob;
+        smartCropMeta = scResult.meta;
         processedUrl = URL.createObjectURL(processedBlob);
       } catch (e) {
         onStatus(
@@ -505,10 +509,12 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
         );
         processedBlob = maskedBlob;
         processedUrl = URL.createObjectURL(processedBlob);
+        // No smartCropMeta available — joints generation will skip this pipeline
       }
 
       // Save to project (full 4-view PNG)
       let savedFile: string | null = null;
+      let splitMeta: SplitTransformMeta | undefined;
       if (project) {
         try {
           const v = await saveAsset('page2.extraction', processedBlob, 'png', noteForMode, pipeline.name);
@@ -520,13 +526,14 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
             // mirroring page1.multiview's behaviour. Stored under
             // <basename>_v0001/{view}_v0001.png plus segments.json.
             try {
-              const slices = await splitMultiView(processedBlob);
+              const splitResult = await splitMultiViewWithMeta(processedBlob);
+              splitMeta = splitResult.meta;
               const baseName = v.file.replace(/\.[^.]+$/, '');
               const setHandle = await saveSegments(
                 'page2.extraction',
                 baseName,
                 v.file,
-                slices.map((s) => ({
+                splitResult.slices.map((s) => ({
                   name: `${s.view}_{v}.png`,
                   blob: s.blob,
                   meta: { view: s.view, bbox: s.bbox, size: s.size },
@@ -560,7 +567,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
           1,
           partNodes,
         ),
-        extraction: { ...extraction, resultUrl: processedUrl, resultFile: savedFile, error: undefined },
+        extraction: { ...extraction, resultUrl: processedUrl, resultFile: savedFile, smartCropMeta, splitMeta, error: undefined },
       });
       onStatus(`[${pipeline.name}] ${modeLabel} 完成`, 'success');
       // Reload the per-pipeline history dropdown.

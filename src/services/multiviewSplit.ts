@@ -16,6 +16,8 @@
  *   - right = 角色身体的右侧（在画面里通常面朝左）
  */
 
+import type { SmartCropTransformMeta, SplitTransformMeta, SplitViewBBox } from '../types/joints';
+
 export type ViewName = 'front' | 'left' | 'back' | 'right';
 
 /** Tripo 多视图 API 的固定顺序：front → left → back → right */
@@ -108,6 +110,95 @@ export async function splitMultiView(
   }
 
   return slices;
+}
+
+/** Result of splitMultiViewWithMeta: slices plus transform metadata. */
+export interface SplitMultiViewWithMetaResult {
+  slices: ViewSlice[];
+  meta: SplitTransformMeta;
+}
+
+/**
+ * Like splitMultiView, but also returns {@link SplitTransformMeta}
+ * so that global 2x2 joints can later be mapped through
+ * SmartCrop → processed 2x2 → per-view split coords.
+ */
+export async function splitMultiViewWithMeta(
+  source: Blob | string,
+  opts: SplitOptions = {},
+): Promise<SplitMultiViewWithMetaResult> {
+  const pad = opts.pad ?? 8;
+  const whiteThr = opts.whiteThreshold ?? 240;
+
+  const img = await loadImage(source);
+  const W = img.naturalWidth;
+  const H = img.naturalHeight;
+  const halfW = Math.floor(W / 2);
+  const halfH = Math.floor(H / 2);
+
+  const fullCanvas = makeCanvas(W, H);
+  const fullCtx = fullCanvas.getContext('2d', { willReadFrequently: true });
+  if (!fullCtx) throw new Error('无法获取 2D Canvas 上下文');
+  fullCtx.drawImage(img, 0, 0);
+  const imageData = fullCtx.getImageData(0, 0, W, H).data;
+
+  const quadrants: { view: ViewName; x0: number; y0: number; x1: number; y1: number }[] = [
+    { view: 'front', x0: 0,     y0: 0,     x1: halfW, y1: halfH },
+    { view: 'left',  x0: halfW, y0: 0,     x1: W,     y1: halfH },
+    { view: 'right', x0: 0,     y0: halfH, x1: halfW, y1: H     },
+    { view: 'back',  x0: halfW, y0: halfH, x1: W,     y1: H     },
+  ];
+
+  const slices: ViewSlice[] = [];
+  const viewBBoxes: SplitViewBBox[] = [];
+
+  for (const view of VIEW_ORDER) {
+    const q = quadrants.find((it) => it.view === view)!;
+    const bbEx = largestComponentBBox(imageData, W, q.x0, q.y0, q.x1, q.y1, whiteThr, false);
+    let bb: { x0: number; y0: number; x1: number; y1: number } | null = bbEx
+      ? { x0: bbEx.x0, y0: bbEx.y0, x1: bbEx.x1 - 1, y1: bbEx.y1 - 1 }
+      : null;
+    if (!bb) {
+      bb = { x0: q.x0, y0: q.y0, x1: q.x1 - 1, y1: q.y1 - 1 };
+    }
+    const padded = {
+      x0: Math.max(q.x0, bb.x0 - pad),
+      y0: Math.max(q.y0, bb.y0 - pad),
+      x1: Math.min(q.x1 - 1, bb.x1 + pad),
+      y1: Math.min(q.y1 - 1, bb.y1 + pad),
+    };
+    const w = padded.x1 - padded.x0 + 1;
+    const h = padded.y1 - padded.y0 + 1;
+
+    const c = makeCanvas(w, h);
+    const ctx = c.getContext('2d');
+    if (!ctx) throw new Error('无法获取 2D Canvas 上下文');
+    ctx.drawImage(img, padded.x0, padded.y0, w, h, 0, 0, w, h);
+    const blob = await canvasToBlob(c, 'image/png');
+
+    slices.push({
+      view,
+      blob,
+      bbox: padded,
+      size: { w, h },
+    });
+
+    viewBBoxes.push({
+      view,
+      quadrant: { x0: q.x0, y0: q.y0, x1: q.x1 - 1, y1: q.y1 - 1 },
+      compactBbox: bb,
+      paddedBbox: padded,
+      sliceSize: { w, h },
+    });
+  }
+
+  const meta: SplitTransformMeta = {
+    sourceSize: { width: W, height: H },
+    params: { pad, whiteThreshold: whiteThr },
+    views: viewBBoxes,
+  };
+
+  return { slices, meta };
 }
 
 // ---------------------------------------------------------------------------
@@ -587,4 +678,208 @@ function canvasToBlob(c: HTMLCanvasElement, type: string): Promise<Blob> {
       type,
     );
   });
+}
+
+// ── SmartCrop with transform metadata ───────────────────────────────────
+// This function mirrors smartCropAndEnlargeAuto but additionally captures
+// the exact transform parameters (bbox, paste offset, scale) for each object
+// so that 2D joints can be mapped from the global image space into the
+// processed 2x2 image space.
+
+export interface SmartCropWithMetaResult {
+  blob: Blob;
+  meta: SmartCropTransformMeta;
+}
+
+export async function smartCropAndEnlargeAutoWithMeta(
+  source: Blob | string,
+  opts: SmartCropAutoOptions = {},
+): Promise<SmartCropWithMetaResult> {
+  const padding = Math.max(0, Math.floor(opts.padding ?? 8));
+  const whiteThr = opts.whiteThreshold ?? 240;
+  const useAlpha = opts.useAlpha ?? false;
+  const minArea = Math.max(1, Math.floor(opts.minArea ?? 64));
+  const maxObjects = Math.max(1, Math.floor(opts.maxObjects ?? 16));
+  const layout = opts.layout ?? 'auto';
+  const uniformScale = opts.uniformScale ?? false;
+  const preservePosition = opts.preservePosition ?? false;
+  const bgColor = opts.background ?? '#ffffff';
+  const transparent =
+    bgColor.toLowerCase() === 'transparent' || bgColor.toLowerCase() === 'none';
+
+  const img = await loadImage(source);
+  const W = img.naturalWidth;
+  const H = img.naturalHeight;
+
+  const srcCanvas = makeCanvas(W, H);
+  const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true });
+  if (!srcCtx) throw new Error('无法获取 2D Canvas 上下文');
+  srcCtx.drawImage(img, 0, 0);
+  const srcData = srcCtx.getImageData(0, 0, W, H).data;
+
+  let bboxes = allComponentsBBoxes(srcData, W, H, whiteThr, useAlpha, minArea);
+  bboxes.sort((a, b) => (b.x1 - b.x0) * (b.y1 - b.y0) - (a.x1 - a.x0) * (a.y1 - a.y0));
+  bboxes = bboxes.slice(0, maxObjects);
+  bboxes = sortBBoxesRowMajor(bboxes);
+
+  const outCanvas = makeCanvas(W, H);
+  const outCtx = outCanvas.getContext('2d');
+  if (!outCtx) throw new Error('无法获取 2D Canvas 上下文');
+  if (!transparent) {
+    outCtx.fillStyle = bgColor;
+    outCtx.fillRect(0, 0, W, H);
+  } else {
+    outCtx.clearRect(0, 0, W, H);
+  }
+  outCtx.imageSmoothingEnabled = true;
+  outCtx.imageSmoothingQuality = 'high';
+
+  // ── Capture metadata objects ──
+  const metaObjects: SmartCropTransformMeta['objects'] = [];
+
+  if (bboxes.length === 0) {
+    const blob = await canvasToBlob(outCanvas, 'image/png');
+    return {
+      blob,
+      meta: {
+        sourceSize: { width: W, height: H },
+        outputSize: { width: W, height: H },
+        params: {
+          padding, whiteThreshold: whiteThr, minArea, maxObjects,
+          layout, uniformScale, preservePosition,
+        },
+        objects: [],
+      },
+    };
+  }
+
+  const padded = bboxes.map((b, i) => {
+    const p = {
+      x0: Math.max(0, b.x0 - padding),
+      y0: Math.max(0, b.y0 - padding),
+      x1: Math.min(W, b.x1 + padding),
+      y1: Math.min(H, b.y1 + padding),
+    };
+    // Record source bbox (end-exclusive)
+    metaObjects[i] = {
+      srcBbox: { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 },
+      paddedBbox: { x0: p.x0, y0: p.y0, x1: p.x1, y1: p.y1 },
+      pasteX: 0,
+      pasteY: 0,
+      scale: 1,
+      targetW: 0,
+      targetH: 0,
+    };
+    return p;
+  });
+
+  if (preservePosition) {
+    let scaleOverride: number | null = null;
+    if (uniformScale) {
+      const cands: number[] = [];
+      for (const p of padded) {
+        const fgW = p.x1 - p.x0;
+        const fgH = p.y1 - p.y0;
+        if (fgW <= 0 || fgH <= 0) continue;
+        const cx = (p.x0 + p.x1) / 2;
+        const cy = (p.y0 + p.y1) / 2;
+        const [tw, th] = centeredLimitSize(cx, cy, W, H, 1.0);
+        cands.push(Math.min(tw / fgW, th / fgH));
+      }
+      if (cands.length > 0) scaleOverride = Math.min(...cands);
+    }
+
+    for (let i = 0; i < padded.length; i++) {
+      const p = padded[i];
+      const fgW = p.x1 - p.x0;
+      const fgH = p.y1 - p.y0;
+      if (fgW <= 0 || fgH <= 0) continue;
+      const cx = (p.x0 + p.x1) / 2;
+      const cy = (p.y0 + p.y1) / 2;
+      const [tw, th] = centeredLimitSize(cx, cy, W, H, 1.0);
+      const [newW, newH] = fitWithScale(fgW, fgH, tw, th, scaleOverride);
+      const [px, py] = pasteXyForCenter(cx, cy, newW, newH, W, H);
+      outCtx.drawImage(img, p.x0, p.y0, fgW, fgH, px, py, newW, newH);
+      // Record actual transform
+      metaObjects[i].pasteX = px;
+      metaObjects[i].pasteY = py;
+      metaObjects[i].scale = newW / fgW;
+      metaObjects[i].targetW = newW;
+      metaObjects[i].targetH = newH;
+    }
+  } else {
+    // Grid layout
+    const n = padded.length;
+    let cols: number, rows: number;
+    if (layout === 'horizontal') {
+      rows = 1; cols = n;
+    } else if (layout === 'vertical') {
+      rows = n; cols = 1;
+    } else {
+      cols = Math.ceil(Math.sqrt(n));
+      rows = Math.ceil(n / cols);
+    }
+    const cellWBase = Math.floor(W / cols);
+    const cellHBase = Math.floor(H / rows);
+
+    let scaleOverride: number | null = null;
+    if (uniformScale) {
+      const cands: number[] = [];
+      for (let i = 0; i < n; i++) {
+        const r = Math.floor(i / cols);
+        const c = i % cols;
+        const cx0 = c * cellWBase;
+        const cy0 = r * cellHBase;
+        const cx1 = c === cols - 1 ? W : (c + 1) * cellWBase;
+        const cy1 = r === rows - 1 ? H : (r + 1) * cellHBase;
+        const cw = cx1 - cx0;
+        const ch = cy1 - cy0;
+        const fgW = padded[i].x1 - padded[i].x0;
+        const fgH = padded[i].y1 - padded[i].y0;
+        if (cw <= 0 || ch <= 0 || fgW <= 0 || fgH <= 0) continue;
+        cands.push(Math.min(cw / fgW, ch / fgH));
+      }
+      if (cands.length > 0) scaleOverride = Math.min(...cands);
+    }
+
+    for (let i = 0; i < n; i++) {
+      const r = Math.floor(i / cols);
+      const c = i % cols;
+      const cx0 = c * cellWBase;
+      const cy0 = r * cellHBase;
+      const cx1 = c === cols - 1 ? W : (c + 1) * cellWBase;
+      const cy1 = r === rows - 1 ? H : (r + 1) * cellHBase;
+      const cw = cx1 - cx0;
+      const ch = cy1 - cy0;
+      if (cw <= 0 || ch <= 0) continue;
+
+      const p = padded[i];
+      const fgW = p.x1 - p.x0;
+      const fgH = p.y1 - p.y0;
+      if (fgW <= 0 || fgH <= 0) continue;
+
+      const [newW, newH] = fitWithScale(fgW, fgH, cw, ch, scaleOverride);
+      const px = cx0 + Math.floor((cw - newW) / 2);
+      const py = cy0 + Math.floor((ch - newH) / 2);
+      outCtx.drawImage(img, p.x0, p.y0, fgW, fgH, px, py, newW, newH);
+      metaObjects[i].pasteX = px;
+      metaObjects[i].pasteY = py;
+      metaObjects[i].scale = newW / fgW;
+      metaObjects[i].targetW = newW;
+      metaObjects[i].targetH = newH;
+    }
+  }
+
+  const blob = await canvasToBlob(outCanvas, 'image/png');
+  const meta: SmartCropTransformMeta = {
+    sourceSize: { width: W, height: H },
+    outputSize: { width: W, height: H },
+    params: {
+      padding, whiteThreshold: whiteThr, minArea, maxObjects,
+      layout, uniformScale, preservePosition,
+    },
+    objects: metaObjects,
+  };
+
+  return { blob, meta };
 }

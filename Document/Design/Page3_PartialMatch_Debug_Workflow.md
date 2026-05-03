@@ -163,7 +163,7 @@ Step 1 · Partial-match / RANSAC
 ```text
 Step 1 · RANSAC 生成候选对
 ```
-
+****
 这样用户能明确 Step 1 的关键输出是 RANSAC 筛选后的候选对。
 
 ---

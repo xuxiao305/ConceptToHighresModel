@@ -39,6 +39,9 @@ export type PipelineMode = 'extraction' | 'multiview';
 /** Page2 3D Model generation mode. */
 export type Model3DMode = 'single' | 'frontBack' | 'fourView';
 
+import type { SmartCropTransformMeta, SplitTransformMeta, PipelineJointsMeta } from './joints';
+export type { SmartCropTransformMeta, SplitTransformMeta, PipelineJointsMeta };
+
 export interface ExtractionState {
   /** 当前展示的图片 blob: URL（生成结果或选中的历史版本） */
   resultUrl: string | null;
@@ -46,6 +49,10 @@ export interface ExtractionState {
   resultFile?: string | null;
   /** 错误信息（若有） */
   error?: string;
+  /** SmartCrop transform metadata — captured during extraction for joints generation */
+  smartCropMeta?: SmartCropTransformMeta;
+  /** Split transform metadata — captured during extraction for joints generation */
+  splitMeta?: SplitTransformMeta;
 }
 
 export interface ModifyState {
@@ -91,6 +98,8 @@ export interface PartPipelineState {
   modify?: ModifyState;
   /** 3D Model 节点结果 */
   model3d?: Model3DState;
+  /** Pipeline joints (generated via "Generate Joint Info" button for Page3 alignment) */
+  jointsMeta?: PipelineJointsMeta;
 }
 
 export type PageId = 'page1' | 'page2' | 'page3';
