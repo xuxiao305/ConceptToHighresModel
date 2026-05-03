@@ -103,7 +103,7 @@ function bboxDiagonal(positions: Vec3[]): number {
  * Returns a Map from joint name → 3D seed position, or undefined
  * if the joint is not found or has no nearby vertices.
  */
-function jointsToSeeds3D(
+export function jointsToSeeds3D(
   joints: Joint2D[],
   positions: Vec3[],
   camera: OrthoFrontCamera,
@@ -289,9 +289,8 @@ function pcaProxyAnchor(
  * @param joints      - View-local Joint2D[] for one view
  * @param camera      - OrthoFrontCamera used to render/align the view
  * @param options     - Optional tuning parameters
- * @param restrictVertices - Optional vertex set to restrict capsule collection
- *                           (e.g., Target jacket region). If omitted, all vertices
- *                           are eligible.
+ * @param restrictVertices - Optional vertex set to restrict capsule collection.
+ *                           If omitted, all vertices are eligible.
  * @returns SkeletonProxyResult with capsules, anchors, and named proxy anchors
  */
 export function buildSkeletonProxy(
@@ -424,6 +423,7 @@ export function buildSkeletonProxy(
 
   return {
     anchors,
+    jointSeeds: seeds,
     capsules,
     shoulderLine,
     torsoAxis,

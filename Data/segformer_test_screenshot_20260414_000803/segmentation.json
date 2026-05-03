@@ -1,0 +1,47 @@
+{
+  "image": "Screenshot 2026-04-14 000803.png",
+  "mask_png": "segformer_label.png",
+  "model": "mattmdjaga/segformer_b2_clothes",
+  "objects": [
+    {
+      "label": "Upper-clothes",
+      "class_id": 4,
+      "mask_value": 4,
+      "bbox": {
+        "xyxy": [
+          186,
+          197,
+          1050,
+          736
+        ],
+        "xywh": [
+          186,
+          197,
+          865,
+          540
+        ]
+      },
+      "pixel_count": 205870
+    },
+    {
+      "label": "Pants",
+      "class_id": 6,
+      "mask_value": 6,
+      "bbox": {
+        "xyxy": [
+          502,
+          581,
+          740,
+          1001
+        ],
+        "xywh": [
+          502,
+          581,
+          239,
+          421
+        ]
+      },
+      "pixel_count": 47694
+    }
+  ]
+}
