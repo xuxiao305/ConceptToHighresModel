@@ -47,11 +47,31 @@ export default defineConfig(({ mode }) => {
     env.VITE_RMBG_MODEL_DIR ??
     'D:\\AI\\ComfyUI-Easy-Install\\ComfyUI\\models\\RMBG\\RMBG-2.0';
 
+  // SegFormer clothes parser (mattmdjaga/segformer_b2_clothes). This reuses
+  // the same embedded Python used by RMBG because it already carries torch +
+  // transformers. The worker returns a SAM3-compatible segmentation JSON plus
+  // label-mask PNG for Page3 garment-region experiments.
+  const SEGFORMER_PYTHON =
+    env.VITE_SEGFORMER_PYTHON ?? RMBG_PYTHON;
+  const SEGFORMER_WORKER =
+    env.VITE_SEGFORMER_WORKER ??
+    path.join(process.cwd(), 'scripts', 'segformer', 'segformer_garment_worker.py');
+  const SEGFORMER_MODEL =
+    env.VITE_SEGFORMER_MODEL ?? 'mattmdjaga/segformer_b2_clothes';
+  const SEGFORMER_CACHE_DIR =
+    env.VITE_SEGFORMER_CACHE_DIR ?? 'C:\\Users\\xuxiao02\\.cache\\huggingface\\hub';
+
   return {
     plugins: [
       react(),
       sam3ExtractPlugin({ python: SAM3_PYTHON, projectDir: SAM3_PROJECT_DIR }),
       rmbgPlugin({ python: RMBG_PYTHON, worker: RMBG_WORKER, modelDir: RMBG_MODEL_DIR }),
+      segformerGarmentPlugin({
+        python: SEGFORMER_PYTHON,
+        worker: SEGFORMER_WORKER,
+        model: SEGFORMER_MODEL,
+        cacheDir: SEGFORMER_CACHE_DIR,
+      }),
     ],
     // Allow the test_align_e2e.html page to be served as a second entry.
     appType: 'mpa',
@@ -195,6 +215,150 @@ interface RmbgPluginOptions {
   python: string;
   worker: string;
   modelDir: string;
+}
+
+// ============================================================================
+// SegFormer garment parser bridge plugin
+// ============================================================================
+//
+// Exposes a single dev-server endpoint:
+//
+//   POST /api/segformer-garment
+//     Body: { imageBase64: "data:image/png;base64,...", classes?: string[] }
+//
+//     Response shape:
+//       { ok: true, json, labelMaskBase64, colorMaskBase64, classesPresent }
+//       { ok: false, error: <string> }
+//
+interface SegformerGarmentPluginOptions {
+  python: string;
+  worker: string;
+  model: string;
+  cacheDir: string;
+}
+
+function segformerGarmentPlugin(opts: SegformerGarmentPluginOptions): Plugin {
+  return {
+    name: 'segformer-garment-bridge',
+    apply: 'serve',
+    configureServer(server) {
+      server.middlewares.use('/api/segformer-garment', async (req, res, next) => {
+        if (req.method !== 'POST') return next();
+
+        const sendJson = (status: number, body: unknown) => {
+          res.statusCode = status;
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          res.end(JSON.stringify(body));
+        };
+
+        let body = '';
+        try {
+          for await (const chunk of req) body += chunk;
+        } catch (err) {
+          return sendJson(400, { ok: false, error: `读取请求体失败：${(err as Error).message}` });
+        }
+
+        let parsed: { imageBase64?: string; classes?: string[] };
+        try {
+          parsed = JSON.parse(body);
+          if (!parsed.imageBase64) throw new Error('缺少 imageBase64 字段');
+        } catch (err) {
+          return sendJson(400, { ok: false, error: `请求体不合法：${(err as Error).message}` });
+        }
+
+        const m = /^data:image\/[^;]+;base64,(.+)$/.exec(parsed.imageBase64!);
+        const pureB64 = m ? m[1] : parsed.imageBase64!;
+
+        const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'segformer-garment-'));
+        const inputPath = path.join(tmpDir, 'in.png');
+        const labelPath = path.join(tmpDir, 'segformer_label.png');
+        const colorPath = path.join(tmpDir, 'segformer_color.png');
+        const jsonPath = path.join(tmpDir, 'segmentation.json');
+
+        try {
+          await fs.writeFile(inputPath, Buffer.from(pureB64, 'base64'));
+
+          const args = [
+            opts.worker,
+            '--input', inputPath,
+            '--label-output', labelPath,
+            '--json-output', jsonPath,
+            '--color-output', colorPath,
+            '--model', opts.model,
+            '--cache-dir', opts.cacheDir,
+          ];
+          if (Array.isArray(parsed.classes) && parsed.classes.length > 0) {
+            args.push('--classes', parsed.classes.join(','));
+          }
+
+          // eslint-disable-next-line no-console
+          console.log('[segformer-garment-bridge] spawn:', opts.python, args.join(' '));
+
+          const child = spawn(opts.python, args, {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+          });
+
+          let stderr = '';
+          let stdout = '';
+          child.stderr.on('data', (d) => {
+            const text = d.toString();
+            stderr += text;
+            process.stderr.write(`[segformer-garment-bridge] ${text}`);
+          });
+          child.stdout.on('data', (d) => {
+            const text = d.toString();
+            stdout += text;
+            process.stdout.write(`[segformer-garment-bridge] ${text}`);
+          });
+
+          const exitCode: number = await new Promise((resolve) => {
+            child.on('exit', (code) => resolve(code ?? -1));
+            child.on('error', () => resolve(-1));
+          });
+
+          if (exitCode !== 0) {
+            return sendJson(500, {
+              ok: false,
+              error: `SegFormer 进程退出码 ${exitCode}\n${stderr.slice(-2000)}`,
+            });
+          }
+
+          const [jsonText, labelBuf, colorBuf] = await Promise.all([
+            fs.readFile(jsonPath, 'utf8'),
+            fs.readFile(labelPath),
+            fs.readFile(colorPath),
+          ]);
+
+          let classesPresent: unknown[] = [];
+          const lastLine = stdout.trim().split(/\r?\n/).filter(Boolean).pop();
+          if (lastLine) {
+            try {
+              const status = JSON.parse(lastLine) as { classesPresent?: unknown[] };
+              classesPresent = status.classesPresent ?? [];
+            } catch {
+              classesPresent = [];
+            }
+          }
+
+          return sendJson(200, {
+            ok: true,
+            json: JSON.parse(jsonText),
+            labelMaskBase64: `data:image/png;base64,${labelBuf.toString('base64')}`,
+            colorMaskBase64: `data:image/png;base64,${colorBuf.toString('base64')}`,
+            classesPresent,
+          });
+        } catch (err) {
+          return sendJson(500, {
+            ok: false,
+            error: `SegFormer 桥接异常：${(err as Error).message}`,
+          });
+        } finally {
+          fs.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
+        }
+      });
+    },
+  };
 }
 
 function rmbgPlugin(opts: RmbgPluginOptions): Plugin {

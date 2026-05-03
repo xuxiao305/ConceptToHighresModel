@@ -124,3 +124,80 @@ export interface LandmarkCandidate {
   /** Whether the system recommends auto-accept (confidence ≥ 0.5) */
   suggestAccept: boolean;
 }
+
+// ── Garment / Jacket Structure Types ──────────────────────────────────────
+
+/** Semantic region labels for a jacket/garment */
+export type GarmentRegionLabel =
+  | 'torso'
+  | 'left_sleeve'
+  | 'right_sleeve'
+  | 'collar'
+  | 'left_cuff'
+  | 'right_cuff'
+  | 'hem';
+
+/** A mesh region with a semantic label */
+export interface GarmentSemanticRegion {
+  label: GarmentRegionLabel;
+  vertices: Set<number>;
+  centroid: Vec3;
+  bbox: { min: Vec3; max: Vec3 };
+}
+
+/** A semantically meaningful anchor point on a garment */
+export interface StructureAnchor {
+  kind:
+    | 'collar_center'
+    | 'left_shoulder'
+    | 'right_shoulder'
+    | 'left_cuff'
+    | 'right_cuff'
+    | 'hem_center'
+    | 'left_armpit'
+    | 'right_armpit';
+  vertex: number;
+  position: Vec3;
+  confidence: number;
+}
+
+/** An edge in the structure graph connecting two anchors */
+export interface StructureEdge {
+  from: string;
+  to: string;
+}
+
+/** A structure graph representing the garment's geometric topology */
+export interface StructureGraph {
+  anchors: StructureAnchor[];
+  edges: StructureEdge[];
+  anchorRegionMap: Map<string, GarmentRegionLabel>;
+}
+
+/** Options for jacket structure detection */
+export interface JacketStructureOptions {
+  /**
+   * Which axis of the torso PCA is considered "up" (vertical).
+   * 0 = X, 1 = Y, 2 = Z. Default: auto-detect by picking the axis
+   * most aligned with world Y.
+   */
+  verticalAxis?: number;
+  /**
+   * Endpoint search fraction of sleeve axis length. Default: 0.06.
+   */
+  cuffFraction?: number;
+  /**
+   * Shoulder search fraction around the torso-sleeve junction. Default: 0.15.
+   */
+  shoulderFraction?: number;
+}
+
+/** Options for structure graph matching */
+export interface GraphMatchOptions {
+  /** Alignment mode. Default: 'similarity'. */
+  mode?: 'rigid' | 'similarity' | 'affine';
+  /** Minimum number of matched anchor pairs to proceed. Default: 4. */
+  minPairs?: number;
+  /** Max RMSE (in model-space units) to consider a match valid. */
+  maxRmse?: number;
+}

@@ -8,6 +8,15 @@
  */
 
 export type { Vec3, Face3, ViewMode, MeshRole, MeshInfo, MeshAdjacency, MeshRegion, RegionGrowOptions, VertexDescriptor, LandmarkCandidate } from './types';
+export type {
+  GarmentRegionLabel,
+  GarmentSemanticRegion,
+  StructureAnchor,
+  StructureEdge,
+  StructureGraph,
+  JacketStructureOptions,
+  GraphMatchOptions,
+} from './types';
 export type { LandmarkPoint } from './landmarkStore';
 export type { CameraState } from './cameraSyncStore';
 export type { LoadedMesh, LoadedGlb } from './glbLoader';
@@ -79,3 +88,7 @@ export { extractImageSubjectBBox } from './imageSubjectBBox';
 export type { SubjectBBox, ExtractOptions as SubjectExtractOptions } from './imageSubjectBBox';
 export { icpRefine } from './icpRefine';
 export type { IcpOptions, IcpResult, IcpIteration } from './icpRefine';
+export { detectJacketStructure, splitGarmentByBBox } from './jacketStructure';
+export type { JacketStructureInput, JacketStructureResult } from './jacketStructure';
+export { matchStructureGraphs } from './graphMatch';
+export type { GraphMatchResult } from './graphMatch';
