@@ -38,6 +38,97 @@ export interface SplitOptions {
   pad?: number;
   /** 视为"白底"的阈值：每个通道 ≥ whiteThreshold 即认为是背景。默认 240 */
   whiteThreshold?: number;
+  /** 小于该面积的连通块视为噪点丢弃。对齐 ComfyUI SmartCropAndEnlargeAuto 默认 64 */
+  minArea?: number;
+}
+
+/**
+ * 计算每个 view 的紧凑 bbox：
+ *
+ * 与 ComfyUI 的 SmartCropAndEnlargeAuto 行为一致——先在**整图**上做连通分量
+ * 分析，再按每个分量的重心落在哪个象限，把它合并到该象限的 bbox 里。这样
+ * 当某个 view 的部件（如夹克左袖）跨过象限中线时，仍能被完整保留下来。
+ *
+ * padding 只夹到**图像边界**，不再夹到象限边界。这是与之前实现最关键的
+ * 区别：之前 `Math.min(q.x1 - 1, bb.x1 + pad)` 会把 bbox 强行截在 W/2 上，
+ * 跨过中线的像素就被切掉了。
+ */
+function computeViewBBoxes(
+  imageData: Uint8ClampedArray,
+  W: number,
+  H: number,
+  pad: number,
+  whiteThr: number,
+  minArea: number,
+): Map<
+  ViewName,
+  {
+    quadrant: { x0: number; y0: number; x1: number; y1: number };
+    compactBbox: { x0: number; y0: number; x1: number; y1: number };
+    paddedBbox: { x0: number; y0: number; x1: number; y1: number };
+  }
+> {
+  const halfW = Math.floor(W / 2);
+  const halfH = Math.floor(H / 2);
+  const quadrants: Record<ViewName, { x0: number; y0: number; x1: number; y1: number }> = {
+    front: { x0: 0,     y0: 0,     x1: halfW, y1: halfH },
+    left:  { x0: halfW, y0: 0,     x1: W,     y1: halfH },
+    right: { x0: 0,     y0: halfH, x1: halfW, y1: H     },
+    back:  { x0: halfW, y0: halfH, x1: W,     y1: H     },
+  };
+
+  // 全图找连通分量（与 SmartCropAndEnlargeAuto 一致）。
+  // bbox 端不含；坐标都是绝对图像坐标。
+  const components = allComponentsBBoxes(imageData, W, H, whiteThr, false, minArea);
+
+  // 按重心把每个分量分配到一个象限，并合并到该象限的 bbox 里。
+  const merged = new Map<ViewName, { x0: number; y0: number; x1: number; y1: number }>();
+  for (const c of components) {
+    const cx = (c.x0 + c.x1) / 2;
+    const cy = (c.y0 + c.y1) / 2;
+    const view: ViewName =
+      cy < halfH
+        ? cx < halfW ? 'front' : 'left'
+        : cx < halfW ? 'right' : 'back';
+    const cur = merged.get(view);
+    // compactBbox 用 inclusive 端点存储，统一与历史实现一致。
+    const incl = { x0: c.x0, y0: c.y0, x1: c.x1 - 1, y1: c.y1 - 1 };
+    if (!cur) {
+      merged.set(view, incl);
+    } else {
+      cur.x0 = Math.min(cur.x0, incl.x0);
+      cur.y0 = Math.min(cur.y0, incl.y0);
+      cur.x1 = Math.max(cur.x1, incl.x1);
+      cur.y1 = Math.max(cur.y1, incl.y1);
+    }
+  }
+
+  const result = new Map<
+    ViewName,
+    {
+      quadrant: { x0: number; y0: number; x1: number; y1: number };
+      compactBbox: { x0: number; y0: number; x1: number; y1: number };
+      paddedBbox: { x0: number; y0: number; x1: number; y1: number };
+    }
+  >();
+  for (const view of VIEW_ORDER) {
+    const q = quadrants[view];
+    const compact =
+      merged.get(view) ?? { x0: q.x0, y0: q.y0, x1: q.x1 - 1, y1: q.y1 - 1 };
+    // padding 只夹到图像边界（0..W-1 / 0..H-1），不再夹到象限边界。
+    const padded = {
+      x0: Math.max(0, compact.x0 - pad),
+      y0: Math.max(0, compact.y0 - pad),
+      x1: Math.min(W - 1, compact.x1 + pad),
+      y1: Math.min(H - 1, compact.y1 + pad),
+    };
+    result.set(view, {
+      quadrant: { x0: q.x0, y0: q.y0, x1: q.x1 - 1, y1: q.y1 - 1 },
+      compactBbox: compact,
+      paddedBbox: padded,
+    });
+  }
+  return result;
 }
 
 /**
@@ -50,48 +141,23 @@ export async function splitMultiView(
 ): Promise<ViewSlice[]> {
   const pad = opts.pad ?? 8;
   const whiteThr = opts.whiteThreshold ?? 240;
+  const minArea = Math.max(1, Math.floor(opts.minArea ?? 64));
 
   const img = await loadImage(source);
   const W = img.naturalWidth;
   const H = img.naturalHeight;
-  const halfW = Math.floor(W / 2);
-  const halfH = Math.floor(H / 2);
 
-  // 一次性把全图绘到 canvas，读出 ImageData
   const fullCanvas = makeCanvas(W, H);
   const fullCtx = fullCanvas.getContext('2d', { willReadFrequently: true });
   if (!fullCtx) throw new Error('无法获取 2D Canvas 上下文');
   fullCtx.drawImage(img, 0, 0);
   const imageData = fullCtx.getImageData(0, 0, W, H).data;
 
-  // 象限定义：(view, x0, y0, x1, y1)（end 不包含）
-  const quadrants: { view: ViewName; x0: number; y0: number; x1: number; y1: number }[] = [
-    { view: 'front', x0: 0,     y0: 0,     x1: halfW, y1: halfH },
-    { view: 'left',  x0: halfW, y0: 0,     x1: W,     y1: halfH },
-    { view: 'right', x0: 0,     y0: halfH, x1: halfW, y1: H     },
-    { view: 'back',  x0: halfW, y0: halfH, x1: W,     y1: H     },
-  ];
+  const viewBBoxes = computeViewBBoxes(imageData, W, H, pad, whiteThr, minArea);
 
   const slices: ViewSlice[] = [];
-
   for (const view of VIEW_ORDER) {
-    const q = quadrants.find((it) => it.view === view)!;
-    // 使用最大连通分量，避免邻接象限渗过来的零碎像素影响 bbox。
-    // largestComponentBBox 返回 end-exclusive；下方逻辑沿用 inclusive，故 -1 还原。
-    const bbEx = largestComponentBBox(imageData, W, q.x0, q.y0, q.x1, q.y1, whiteThr, false);
-    let bb: { x0: number; y0: number; x1: number; y1: number } | null = bbEx
-      ? { x0: bbEx.x0, y0: bbEx.y0, x1: bbEx.x1 - 1, y1: bbEx.y1 - 1 }
-      : null;
-    if (!bb) {
-      // 整个象限都是白色（不太可能，但兜底）：用整个象限
-      bb = { x0: q.x0, y0: q.y0, x1: q.x1 - 1, y1: q.y1 - 1 };
-    }
-    const padded = {
-      x0: Math.max(q.x0, bb.x0 - pad),
-      y0: Math.max(q.y0, bb.y0 - pad),
-      x1: Math.min(q.x1 - 1, bb.x1 + pad),
-      y1: Math.min(q.y1 - 1, bb.y1 + pad),
-    };
+    const padded = viewBBoxes.get(view)!.paddedBbox;
     const w = padded.x1 - padded.x0 + 1;
     const h = padded.y1 - padded.y0 + 1;
 
@@ -129,12 +195,11 @@ export async function splitMultiViewWithMeta(
 ): Promise<SplitMultiViewWithMetaResult> {
   const pad = opts.pad ?? 8;
   const whiteThr = opts.whiteThreshold ?? 240;
+  const minArea = Math.max(1, Math.floor(opts.minArea ?? 64));
 
   const img = await loadImage(source);
   const W = img.naturalWidth;
   const H = img.naturalHeight;
-  const halfW = Math.floor(W / 2);
-  const halfH = Math.floor(H / 2);
 
   const fullCanvas = makeCanvas(W, H);
   const fullCtx = fullCanvas.getContext('2d', { willReadFrequently: true });
@@ -142,31 +207,14 @@ export async function splitMultiViewWithMeta(
   fullCtx.drawImage(img, 0, 0);
   const imageData = fullCtx.getImageData(0, 0, W, H).data;
 
-  const quadrants: { view: ViewName; x0: number; y0: number; x1: number; y1: number }[] = [
-    { view: 'front', x0: 0,     y0: 0,     x1: halfW, y1: halfH },
-    { view: 'left',  x0: halfW, y0: 0,     x1: W,     y1: halfH },
-    { view: 'right', x0: 0,     y0: halfH, x1: halfW, y1: H     },
-    { view: 'back',  x0: halfW, y0: halfH, x1: W,     y1: H     },
-  ];
+  const viewBBoxes = computeViewBBoxes(imageData, W, H, pad, whiteThr, minArea);
 
   const slices: ViewSlice[] = [];
-  const viewBBoxes: SplitViewBBox[] = [];
+  const viewBBoxesMeta: SplitViewBBox[] = [];
 
   for (const view of VIEW_ORDER) {
-    const q = quadrants.find((it) => it.view === view)!;
-    const bbEx = largestComponentBBox(imageData, W, q.x0, q.y0, q.x1, q.y1, whiteThr, false);
-    let bb: { x0: number; y0: number; x1: number; y1: number } | null = bbEx
-      ? { x0: bbEx.x0, y0: bbEx.y0, x1: bbEx.x1 - 1, y1: bbEx.y1 - 1 }
-      : null;
-    if (!bb) {
-      bb = { x0: q.x0, y0: q.y0, x1: q.x1 - 1, y1: q.y1 - 1 };
-    }
-    const padded = {
-      x0: Math.max(q.x0, bb.x0 - pad),
-      y0: Math.max(q.y0, bb.y0 - pad),
-      x1: Math.min(q.x1 - 1, bb.x1 + pad),
-      y1: Math.min(q.y1 - 1, bb.y1 + pad),
-    };
+    const entry = viewBBoxes.get(view)!;
+    const padded = entry.paddedBbox;
     const w = padded.x1 - padded.x0 + 1;
     const h = padded.y1 - padded.y0 + 1;
 
@@ -183,10 +231,10 @@ export async function splitMultiViewWithMeta(
       size: { w, h },
     });
 
-    viewBBoxes.push({
+    viewBBoxesMeta.push({
       view,
-      quadrant: { x0: q.x0, y0: q.y0, x1: q.x1 - 1, y1: q.y1 - 1 },
-      compactBbox: bb,
+      quadrant: entry.quadrant,
+      compactBbox: entry.compactBbox,
       paddedBbox: padded,
       sliceSize: { w, h },
     });
@@ -195,7 +243,7 @@ export async function splitMultiViewWithMeta(
   const meta: SplitTransformMeta = {
     sourceSize: { width: W, height: H },
     params: { pad, whiteThreshold: whiteThr },
-    views: viewBBoxes,
+    views: viewBBoxesMeta,
   };
 
   return { slices, meta };
@@ -539,108 +587,6 @@ function fitWithScale(
   }
   const s = Math.min(scale, dw / sw, dh / sh);
   return [Math.max(1, Math.floor(sw * s + 1e-6)), Math.max(1, Math.floor(sh * s + 1e-6))];
-}
-
-/**
- * 在指定矩形区域内做 4-邻接连通分量扫描，返回**面积最大**那块连通分量的
- * 紧凑 bbox（绝对坐标，end 不包含）。如果区域内没有前景像素返回 null。
- *
- * 用途：Banana Pro 生成的 2x2 多视图常常会让某个 view 的主体"渗"到隔壁
- * 象限边缘几像素，单纯的 tight bbox 会被这些零碎渗漏拉宽。取最大连通分量
- * 即可只保留该象限内的"主物体"。
- *
- * 实现：先用 typed-array stack flood-fill；区域可能很大（半张 2K 图，~1M
- * 像素），所以避免递归。
- */
-function largestComponentBBox(
-  data: Uint8ClampedArray,
-  imgW: number,
-  x0: number,
-  y0: number,
-  x1: number,
-  y1: number,
-  whiteThr: number,
-  useAlpha: boolean,
-): { x0: number; y0: number; x1: number; y1: number } | null {
-  const regW = x1 - x0;
-  const regH = y1 - y0;
-  if (regW <= 0 || regH <= 0) return null;
-
-  // 1. 把"前景"标到一张本地 mask 上（0=bg, 1=fg, 2=visited）
-  //    用 Uint8Array(regW*regH) 节省内存。
-  const mask = new Uint8Array(regW * regH);
-  let totalFg = 0;
-  for (let y = 0; y < regH; y++) {
-    const srcRow = (y + y0) * imgW * 4;
-    const dstRow = y * regW;
-    for (let x = 0; x < regW; x++) {
-      const i = srcRow + (x + x0) * 4;
-      const a = data[i + 3];
-      let isFg: boolean;
-      if (useAlpha) {
-        isFg = a > 8;
-      } else if (a < 8) {
-        isFg = false;
-      } else {
-        isFg = data[i] < whiteThr || data[i + 1] < whiteThr || data[i + 2] < whiteThr;
-      }
-      if (isFg) {
-        mask[dstRow + x] = 1;
-        totalFg++;
-      }
-    }
-  }
-  if (totalFg === 0) return null;
-
-  // 2. flood fill 找最大分量。stack 用 Int32Array 模拟，存 pixel index。
-  //    上限：所有前景像素都在一个分量里。
-  const stack = new Int32Array(totalFg);
-  let bestArea = 0;
-  let bestMinX = 0, bestMinY = 0, bestMaxX = 0, bestMaxY = 0;
-
-  for (let py = 0; py < regH; py++) {
-    for (let px = 0; px < regW; px++) {
-      const start = py * regW + px;
-      if (mask[start] !== 1) continue;
-
-      // BFS/DFS 一个分量
-      let top = 0;
-      stack[top++] = start;
-      mask[start] = 2;
-      let minX = px, maxX = px, minY = py, maxY = py;
-      let area = 0;
-      while (top > 0) {
-        const idx = stack[--top];
-        const x = idx % regW;
-        const y = (idx - x) / regW;
-        area++;
-        if (x < minX) minX = x;
-        else if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        else if (y > maxY) maxY = y;
-        // 4-邻接
-        if (x + 1 < regW && mask[idx + 1] === 1) { mask[idx + 1] = 2; stack[top++] = idx + 1; }
-        if (x - 1 >= 0   && mask[idx - 1] === 1) { mask[idx - 1] = 2; stack[top++] = idx - 1; }
-        if (y + 1 < regH && mask[idx + regW] === 1) { mask[idx + regW] = 2; stack[top++] = idx + regW; }
-        if (y - 1 >= 0   && mask[idx - regW] === 1) { mask[idx - regW] = 2; stack[top++] = idx - regW; }
-      }
-
-      if (area > bestArea) {
-        bestArea = area;
-        bestMinX = minX; bestMaxX = maxX;
-        bestMinY = minY; bestMaxY = maxY;
-      }
-    }
-  }
-
-  if (bestArea === 0) return null;
-  // 转回绝对坐标，end-exclusive
-  return {
-    x0: x0 + bestMinX,
-    y0: y0 + bestMinY,
-    x1: x0 + bestMaxX + 1,
-    y1: y0 + bestMaxY + 1,
-  };
 }
 
 // ---------------------------------------------------------------------------

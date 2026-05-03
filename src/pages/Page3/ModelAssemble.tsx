@@ -1831,18 +1831,38 @@ export function ModelAssemble({ onStatusChange }: Props) {
       let imageSize: { w: number; h: number } | null = null;
       if (imageFile) {
         imageSize = await handleLoadRefImage(imageFile);
+      } else if (maskFile) {
+        // When the reference image referenced in segmentation.json is missing,
+        // derive refImageSize from the mask (they share the same resolution).
+        // This enables alignment features that require localizationSpace.
+        const maskUrl = URL.createObjectURL(maskFile);
+        try {
+          imageSize = await loadImageDimensions(maskUrl);
+          setRefImageSize(imageSize);
+          appendAlignmentTrace('load-seg-pack-mask-fallback', {
+            missingImage: pack.imageName,
+            maskFile: maskFile.name,
+            derivedSize: imageSize,
+          });
+        } finally {
+          URL.revokeObjectURL(maskUrl);
+        }
       }
       if (maskFile) {
-        await handleLoadMaskImage(maskFile, imageSize ?? refImageSize);
+        await handleLoadMaskImage(maskFile, imageSize);
       }
 
       const union = regionsUnionBBox(pack.regions);
       onStatusChange(
         `已加载 SAM3 分割包：${pack.regions.map((r) => r.label).join(' / ')}` +
-          (imageFile ? ` · 参考图 ${pack.imageName}` : ` · 未找到参考图 ${pack.imageName}`) +
+          (imageFile
+            ? ` · 参考图 ${pack.imageName}`
+            : imageSize
+              ? ` · 参考图 ${pack.imageName} 缺失，已从 mask 推导尺寸 ${imageSize.w}×${imageSize.h}`
+              : ` · 未找到参考图 ${pack.imageName}`) +
           (maskFile ? ` · Mask ${pack.maskName}` : ` · 未找到 Mask ${pack.maskName}`) +
           (union ? ` · bbox ${union.w}×${union.h}@(${union.x},${union.y})` : ''),
-        imageFile && maskFile ? 'success' : 'warning',
+        maskFile ? 'success' : 'warning',
       );
     } catch (err) {
       onStatusChange(

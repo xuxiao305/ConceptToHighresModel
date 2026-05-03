@@ -466,6 +466,26 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
       // Revoke previous result URL if any
       if (extraction.resultUrl) URL.revokeObjectURL(extraction.resultUrl);
 
+      // ── Save maskedBlob pre-crop for Smart Crop All ──
+      let maskedFile: string | null = null;
+      if (project) {
+        try {
+          const maskedVer = await saveAsset(
+            'page2.extraction_masked',
+            maskedBlob,
+            'png',
+            `${noteForMode} · pre-crop`,
+            pipeline.name,
+          );
+          if (maskedVer) maskedFile = maskedVer.file;
+        } catch (e) {
+          onStatus(
+            `[${pipeline.name}] 保存 masked 中间产物失败：${e instanceof Error ? e.message : String(e)}`,
+            'warning',
+          );
+        }
+      }
+
       // ── Step ③: SmartCropAndEnlargeAuto with workflow-specific params ──
       onStatus(`[${pipeline.name}] Smart Crop & Enlarge (Auto)…`, 'info');
       let processedBlob: Blob;
@@ -477,7 +497,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
               // SAM3_ExtractParts.json node 13 params (with overrides per project spec:
               // workflow had max_objects=16 / uniform_scale=false / preserve_position=false
               // by mistake — corrected here to keep 4-view layout aligned)
-              padding: 8,
+              padding: 30,
               whiteThreshold: 240,
               useAlpha: false,
               minArea: 64,
@@ -489,7 +509,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
             })
           : await smartCropAndEnlargeAutoWithMeta(maskedBlob, {
               // BananaExtractJacket.json node 12 params
-              padding: 1,
+              padding: 30,
               whiteThreshold: 240,
               useAlpha: false,
               minArea: 10,
@@ -567,7 +587,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
           1,
           partNodes,
         ),
-        extraction: { ...extraction, resultUrl: processedUrl, resultFile: savedFile, smartCropMeta, splitMeta, error: undefined },
+        extraction: { ...extraction, resultUrl: processedUrl, resultFile: savedFile, smartCropMeta, splitMeta, maskedFile, error: undefined },
       });
       onStatus(`[${pipeline.name}] ${modeLabel} 完成`, 'success');
       // Reload the per-pipeline history dropdown.

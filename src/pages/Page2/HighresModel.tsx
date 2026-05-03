@@ -7,6 +7,10 @@ import { useProject } from '../../contexts/ProjectContext';
 import type { PersistedPipeline } from '../../services/projectStore';
 import { detectAndConvertToGlobalJoints } from '../../services/dwpose';
 import { generatePipelineJoints } from '../../services/jointsGeneration';
+import {
+  smartCropAndEnlargeAutoWithMeta,
+  splitMultiViewWithMeta,
+} from '../../services/multiviewSplit';
 
 const PIPELINE_MODE_LABEL: Record<PipelineMode, string> = {
   extraction: 'General Extract',
@@ -63,6 +67,7 @@ function toPersisted(p: PartPipelineState): PersistedPipeline {
     modelMode: p.model3d?.mode ?? 'fourView',
     smartCropMeta: p.extraction?.smartCropMeta,
     splitMeta: p.extraction?.splitMeta,
+    maskedFile: p.extraction?.maskedFile ?? null,
     jointsMeta: p.jointsMeta,
   };
 }
@@ -109,6 +114,7 @@ function fromPersisted(pp: PersistedPipeline, index: number): PartPipelineState 
       resultFile: pp.resultFile ?? null,
       smartCropMeta: pp.smartCropMeta,
       splitMeta: pp.splitMeta,
+      maskedFile: pp.maskedFile ?? null,
     },
     modify: {
       resultUrl: null,
@@ -124,7 +130,7 @@ function fromPersisted(pp: PersistedPipeline, index: number): PartPipelineState 
 }
 
 export function HighresModel({ onStatusChange }: Props) {
-  const { project, savePipelines, loadPipelines, loadLatest } = useProject();
+  const { project, savePipelines, loadPipelines, loadLatest, loadByName } = useProject();
   const [parts, setParts] = useState<PartPipelineState[]>(() => [makePart(0, 'extraction'), makePart(1, 'extraction')]);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const addDropdownRef = useRef<HTMLDivElement>(null);
@@ -213,6 +219,8 @@ export function HighresModel({ onStatusChange }: Props) {
   // ── Generate Joint Info ──────────────────────────────────────────────
   const [jointsGenerating, setJointsGenerating] = useState(false);
   const [jointsStatus, setJointsStatus] = useState<string | null>(null);
+  const [jointsOverlayUrl, setJointsOverlayUrl] = useState<string | null>(null);
+  const [jointsOverlayPreview, setJointsOverlayPreview] = useState(false);
 
   const handleGenerateJoints = useCallback(async () => {
     if (!project) {
@@ -223,6 +231,9 @@ export function HighresModel({ onStatusChange }: Props) {
     setJointsGenerating(true);
     setJointsStatus('Running DWPose on Page1 MultiView…');
     onStatusChange('Joints: 开始生成…', 'info');
+    // Revoke previous overlay URL
+    if (jointsOverlayUrl) URL.revokeObjectURL(jointsOverlayUrl);
+    setJointsOverlayUrl(null);
 
     try {
       // 1. Load Page1 MultiView image
@@ -243,10 +254,16 @@ export function HighresModel({ onStatusChange }: Props) {
       });
 
       // 3. Run DWPose on the MultiView 2x2 image
-      const { joints: globalJoints } = await detectAndConvertToGlobalJoints(
+      const { joints: globalJoints, overlayBase64 } = await detectAndConvertToGlobalJoints(
         base64,
         r.version.file,
       );
+
+      // Convert overlay base64 to object URL for display
+      if (overlayBase64) {
+        const overlayBlob = await (await fetch(overlayBase64)).blob();
+        setJointsOverlayUrl(URL.createObjectURL(overlayBlob));
+      }
 
       // 4. For each pipeline with SmartCrop + Split metadata, generate pipeline joints
       let successCount = 0;
@@ -306,8 +323,11 @@ export function HighresModel({ onStatusChange }: Props) {
       const summary =
         `Joints 完成：${successCount} 条 Pipeline 成功` +
         (skipCount > 0 ? `, ${skipCount} 条跳过` : '');
-      setJointsStatus(summary);
-      onStatusChange(summary + '\n' + statusLines.join('\n'), successCount > 0 ? 'success' : 'warning');
+      const fullStatus = statusLines.length > 0
+        ? summary + '\n' + statusLines.join('\n')
+        : summary;
+      setJointsStatus(fullStatus);
+      onStatusChange(fullStatus, successCount > 0 ? 'success' : 'warning');
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setJointsStatus(`失败: ${msg}`);
@@ -316,6 +336,109 @@ export function HighresModel({ onStatusChange }: Props) {
       setJointsGenerating(false);
     }
   }, [project, parts, loadLatest, onStatusChange]);
+
+  // ── Smart Crop All ───────────────────────────────────────────────────
+  // Re-runs SmartCrop + Split on each pipeline's saved maskedBlob
+  // (pre-crop intermediate), updating smartCropMeta / splitMeta without
+  // touching resultUrl.  This avoids re-running the slow Extraction step
+  // (Banana / SAM3).
+  const [smartCropAllRunning, setSmartCropAllRunning] = useState(false);
+  const [smartCropAllStatus, setSmartCropAllStatus] = useState<string | null>(null);
+
+  const handleSmartCropAll = useCallback(async () => {
+    if (!project || parts.length === 0) return;
+
+    setSmartCropAllRunning(true);
+    setSmartCropAllStatus('Smart Crop All: 开始…');
+    onStatusChange('Smart Crop All: 开始重算 SmartCrop + Split 元数据…', 'info');
+
+    const statusLines: string[] = [];
+    let okCount = 0;
+    let skipCount = 0;
+
+    const updatedParts = await Promise.all(
+      parts.map(async (p) => {
+        const maskedFile = p.extraction?.maskedFile;
+        if (!maskedFile) {
+          skipCount++;
+          statusLines.push(
+            `${p.name}: 跳过（缺 pre-crop 中间产物，请重跑一次 Extraction 即可复用）`,
+          );
+          return p;
+        }
+
+        try {
+          const loaded = await loadByName('page2.extraction_masked', maskedFile);
+          if (!loaded) {
+            skipCount++;
+            statusLines.push(
+              `${p.name}: 跳过（无法读取 masked 中间产物 ${maskedFile}，请重跑 Extraction）`,
+            );
+            return p;
+          }
+
+          const blob = loaded.blob;
+          const useSAM3 = p.mode === 'extraction';
+          const scOpts = useSAM3
+            ? {
+                padding: 30,
+                whiteThreshold: 240,
+                useAlpha: false,
+                minArea: 64,
+                maxObjects: 4,
+                layout: 'auto' as const,
+                uniformScale: true,
+                preservePosition: true,
+                background: '#ffffff',
+              }
+            : {
+                padding: 30,
+                whiteThreshold: 240,
+                useAlpha: false,
+                minArea: 10,
+                maxObjects: 16,
+                layout: 'auto' as const,
+                uniformScale: true,
+                preservePosition: true,
+                background: '#ffffff',
+              };
+
+          const scResult = await smartCropAndEnlargeAutoWithMeta(blob, scOpts);
+          const splitResult = await splitMultiViewWithMeta(scResult.blob);
+
+          okCount++;
+          statusLines.push(
+            `${p.name}: SmartCrop OK (${scResult.meta.objects.length} objects) · Split OK (${splitResult.slices.length} views)`,
+          );
+
+          return {
+            ...p,
+            extraction: {
+              ...p.extraction!,
+              smartCropMeta: scResult.meta,
+              splitMeta: splitResult.meta,
+            },
+          };
+        } catch (err) {
+          skipCount++;
+          statusLines.push(
+            `${p.name}: 失败（${err instanceof Error ? err.message : String(err)}）`,
+          );
+          return p;
+        }
+      }),
+    );
+
+    setParts(updatedParts);
+
+    const summary =
+      `Smart Crop All: ${okCount} 成功` +
+      (skipCount > 0 ? `, ${skipCount} 跳过/失败` : '');
+    const fullStatus = summary + '\n' + statusLines.join('\n');
+    setSmartCropAllStatus(fullStatus);
+    onStatusChange(fullStatus, okCount > 0 ? 'success' : 'warning');
+    setSmartCropAllRunning(false);
+  }, [project, parts, loadByName, onStatusChange]);
 
   // ── Render ───────────────────────────────────────────────────────────
 
@@ -351,10 +474,59 @@ export function HighresModel({ onStatusChange }: Props) {
         >
           {jointsGenerating ? '⏳ Generating…' : '🦴 Generate Joint Info'}
         </Button>
-        {jointsStatus && !jointsGenerating && (
-          <span style={{ fontSize: 10, color: 'var(--text-muted)', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {jointsStatus}
+        <Button
+          variant="secondary"
+          size="sm"
+          disabled={smartCropAllRunning || !project}
+          onClick={handleSmartCropAll}
+          title={smartCropAllStatus ?? '对所有 Pipeline 重算 SmartCrop + Split 元数据（跳过慢速的 Banana/SAM3 提取）'}
+        >
+          {smartCropAllRunning ? '⏳ Smart Crop…' : '🪄 Smart Crop All'}
+        </Button>
+        {smartCropAllStatus && !smartCropAllRunning && (
+          <span
+            title={smartCropAllStatus}
+            style={{
+              fontSize: 10,
+              color: 'var(--text-muted)',
+              maxWidth: 320,
+              whiteSpace: 'pre-line',
+              lineHeight: 1.35,
+            }}
+          >
+            {smartCropAllStatus}
           </span>
+        )}
+        {jointsStatus && !jointsGenerating && (
+          <>
+            <span
+              title={jointsStatus}
+              style={{
+                fontSize: 10,
+                color: 'var(--text-muted)',
+                maxWidth: 320,
+                whiteSpace: 'pre-line',
+                lineHeight: 1.35,
+              }}
+            >
+              {jointsStatus}
+            </span>
+            {jointsOverlayUrl && (
+              <img
+                src={jointsOverlayUrl}
+                alt="DWPose skeleton overlay"
+                title="点击查看骨骼 overlay 大图"
+                onClick={() => setJointsOverlayPreview(true)}
+                style={{
+                  height: 28,
+                  border: '1px solid var(--border-default)',
+                  borderRadius: 3,
+                  cursor: 'pointer',
+                  background: '#111',
+                }}
+              />
+            )}
+          </>
         )}
         <div ref={addDropdownRef} style={{ position: 'relative' }}>
           <Button variant="primary" size="sm" onClick={() => setAddDropdownOpen((v) => !v)}>
@@ -465,6 +637,49 @@ export function HighresModel({ onStatusChange }: Props) {
           onConfirm={confirmDelete}
           onCancel={() => setPendingDelete(null)}
         />
+      )}
+      {jointsOverlayPreview && jointsOverlayUrl && (
+        <div
+          onClick={() => setJointsOverlayPreview(false)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 10000,
+            background: 'rgba(0,0,0,0.85)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            cursor: 'pointer',
+          }}
+        >
+          <img
+            src={jointsOverlayUrl}
+            alt="DWPose skeleton overlay (full)"
+            style={{
+              maxWidth: '90vw',
+              maxHeight: '90vh',
+              objectFit: 'contain',
+              borderRadius: 4,
+              background: '#111',
+            }}
+          />
+          <button
+            onClick={() => setJointsOverlayPreview(false)}
+            style={{
+              position: 'absolute',
+              top: 16,
+              right: 24,
+              background: 'none',
+              border: 'none',
+              color: '#fff',
+              fontSize: 28,
+              cursor: 'pointer',
+              lineHeight: 1,
+            }}
+          >
+            ✕
+          </button>
+        </div>
       )}
     </div>
   );

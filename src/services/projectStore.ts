@@ -579,6 +579,8 @@ export interface PersistedPipeline {
   splitMeta?: SplitTransformMeta;
   /** Pipeline joints metadata (Page2 output for Page3 alignment) */
   jointsMeta?: PipelineJointsMeta;
+  /** Pre-crop masked blob 文件名（存于 page2.extraction_masked 节点，供 Smart Crop All 复用） */
+  maskedFile?: string | null;
 }
 
 export interface Page2PipelinesIndex {

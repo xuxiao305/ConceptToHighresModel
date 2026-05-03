@@ -53,6 +53,8 @@ export interface ExtractionState {
   smartCropMeta?: SmartCropTransformMeta;
   /** Split transform metadata — captured during extraction for joints generation */
   splitMeta?: SplitTransformMeta;
+  /** Pre-crop masked blob 文件名（存于 page2.extraction_masked 节点，供 Smart Crop All 复用） */
+  maskedFile?: string | null;
 }
 
 export interface ModifyState {
