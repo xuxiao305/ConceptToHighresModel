@@ -469,7 +469,7 @@ function makeDemoTarget(source: MeshData): MeshData {
 }
 
 export function ModelAssemble({ onStatusChange }: Props) {
-  const { project, listHistory, loadByName, loadPipelines } = useProject();
+  const { project, listHistory, loadByName, loadLatest, loadPipelines } = useProject();
   const demoTarget = useMemo(() => makeDemoTarget(DEMO_SOURCE), []);
 
   const [srcMesh, setSrcMesh] = useState<MeshData>(DEMO_SOURCE);
@@ -2923,6 +2923,52 @@ export function ModelAssemble({ onStatusChange }: Props) {
     }
   }, [clearAllLandmarks, demoTarget, onStatusChange]);
 
+  const loadRoughModel = useCallback(async () => {
+    if (!project) {
+      onStatusChange('请先打开工程', 'warning');
+      return;
+    }
+    try {
+      onStatusChange('正在加载 Page1 粗模 (3D Model) 到 Target…', 'info');
+      const rough = await loadLatest('page1.rough');
+      if (!rough) {
+        onStatusChange('Page1 尚未生成 3D Model（粗模），请先在 Page1 完成生成', 'warning');
+        return;
+      }
+      const mesh = await loadGlbAsMesh(rough.url);
+      setTarMesh({
+        name: rough.version.file,
+        vertices: mesh.vertices,
+        faces: mesh.faces,
+      });
+      clearAllLandmarks();
+      setAlignResult(null);
+      setResultPreview(null);
+      setAutoAlignSummary(null);
+      setSelectedTarIndex(null);
+      setTarRegion(null);
+      setTarRegionLabel(null);
+      setOrthoRenderUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+      setOrthoCamera(null);
+      setMaskReproj(null);
+      setCandidates([]);
+      setAcceptedCandidateIds(new Set());
+      setCenterViewMode('landmark');
+      onStatusChange(
+        `已加载 Page1 粗模到 Target：${rough.version.file} · V/F=${mesh.vertices.length}/${mesh.faces.length}`,
+        'success',
+      );
+    } catch (err) {
+      onStatusChange(
+        `加载 Page1 粗模失败：${err instanceof Error ? err.message : '未知错误'}`,
+        'error',
+      );
+    }
+  }, [project, loadLatest, clearAllLandmarks, onStatusChange]);
+
   // 页面挂载时自动加载 Demo (arm hires Deformed)，作为初始模型
   const initialDemoLoadedRef = useRef(false);
   useEffect(() => {
@@ -3123,6 +3169,15 @@ export function ModelAssemble({ onStatusChange }: Props) {
               title="加载 alignmenttest_arm_hires_Deformed.glb (源手臂) + alignmenttest_bot.glb (整身角色)"
             >
               加载 Demo (arm deformed)
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => {
+                void loadRoughModel();
+              }}
+              title="加载 Page1 的 3D Model（粗模）到 Target 视口"
+            >
+              加载粗模
             </Button>
           </div>
           <input ref={srcInputRef} type="file" accept=".glb" style={{ display: 'none' }} onChange={onSrcFileChange} />
