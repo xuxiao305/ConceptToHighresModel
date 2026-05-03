@@ -89,17 +89,6 @@ export type {
   PoseAlignmentResult,
 } from './types';
 
-export {
-  matchObjectsToViews,
-  globalToProcessed,
-  processedToView,
-  globalToView,
-  globalJointsToProcessed,
-  processedJointsToViews,
-  globalJointsToViews,
-  jointToViewUV,
-} from './jointsTransform';
-
 export { buildSkeletonProxy, jointsToSeeds3D } from './skeletonProxy';
 
 export { computePoseAlignment } from './poseAlignment';

@@ -5,8 +5,6 @@ import { GLBViewer } from '../../components/GLBViewer';
 import { getPartNodes, PartPipeline } from './PartPipeline';
 import { useProject } from '../../contexts/ProjectContext';
 import type { PersistedPipeline } from '../../services/projectStore';
-import { detectAndConvertToGlobalJoints } from '../../services/dwpose';
-import { generatePipelineJoints } from '../../services/jointsGeneration';
 import {
   smartCropAndEnlargeAutoWithMeta,
   splitMultiViewWithMeta,
@@ -130,7 +128,7 @@ function fromPersisted(pp: PersistedPipeline, index: number): PartPipelineState 
 }
 
 export function HighresModel({ onStatusChange }: Props) {
-  const { project, savePipelines, loadPipelines, loadLatest, loadByName } = useProject();
+  const { project, savePipelines, loadPipelines, loadByName } = useProject();
   const [parts, setParts] = useState<PartPipelineState[]>(() => [makePart(0, 'extraction'), makePart(1, 'extraction')]);
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const addDropdownRef = useRef<HTMLDivElement>(null);
@@ -216,126 +214,9 @@ export function HighresModel({ onStatusChange }: Props) {
     setPendingDelete(null);
   };
 
-  // ── Generate Joint Info ──────────────────────────────────────────────
-  const [jointsGenerating, setJointsGenerating] = useState(false);
-  const [jointsStatus, setJointsStatus] = useState<string | null>(null);
-  const [jointsOverlayUrl, setJointsOverlayUrl] = useState<string | null>(null);
-  const [jointsOverlayPreview, setJointsOverlayPreview] = useState(false);
-
-  const handleGenerateJoints = useCallback(async () => {
-    if (!project) {
-      onStatusChange('请先打开工程', 'error');
-      return;
-    }
-
-    setJointsGenerating(true);
-    setJointsStatus('Running DWPose on Page1 MultiView…');
-    onStatusChange('Joints: 开始生成…', 'info');
-    // Revoke previous overlay URL
-    if (jointsOverlayUrl) URL.revokeObjectURL(jointsOverlayUrl);
-    setJointsOverlayUrl(null);
-
-    try {
-      // 1. Load Page1 MultiView image
-      const r = await loadLatest('page1.multiview');
-      if (!r) {
-        onStatusChange('Page1 MultiView 图片不存在，请先在 Page1 生成 Multi-View', 'error');
-        setJointsGenerating(false);
-        setJointsStatus(null);
-        return;
-      }
-
-      // 2. Convert blob to base64 data URI
-      const base64 = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result as string);
-        reader.onerror = () => reject(new Error('Failed to convert blob to base64'));
-        reader.readAsDataURL(r.blob);
-      });
-
-      // 3. Run DWPose on the MultiView 2x2 image
-      const { joints: globalJoints, overlayBase64 } = await detectAndConvertToGlobalJoints(
-        base64,
-        r.version.file,
-      );
-
-      // Convert overlay base64 to object URL for display
-      if (overlayBase64) {
-        const overlayBlob = await (await fetch(overlayBase64)).blob();
-        setJointsOverlayUrl(URL.createObjectURL(overlayBlob));
-      }
-
-      // 4. For each pipeline with SmartCrop + Split metadata, generate pipeline joints
-      let successCount = 0;
-      let skipCount = 0;
-      const statusLines: string[] = [];
-
-      const updatedParts = await Promise.all(
-        parts.map(async (p) => {
-          const ext = p.extraction;
-          if (!ext?.smartCropMeta || !ext?.splitMeta) {
-            skipCount++;
-            statusLines.push(`${p.name}: 跳过（缺 SmartCrop/Split 元数据，请重新运行 Extraction）`);
-            return p;
-          }
-
-          // P0-A: Verify DWPose input image size matches SmartCrop source size.
-          // A mismatch means the MultiView image was regenerated at a different
-          // resolution than the SmartCrop input, which would map joints to wrong
-          // coordinates.
-          const srcW = ext.smartCropMeta.sourceSize.width;
-          const srcH = ext.smartCropMeta.sourceSize.height;
-          const globalW = globalJoints.imageSize.width;
-          const globalH = globalJoints.imageSize.height;
-          if (srcW !== globalW || srcH !== globalH) {
-            skipCount++;
-            statusLines.push(
-              `${p.name}: 跳过（尺寸不一致：DWPose ${globalW}×${globalH} ≠ SmartCrop ${srcW}×${srcH}，请重新运行 Page1 MultiView 和 Page2 Extraction）`,
-            );
-            return p;
-          }
-
-          const dims = ext.smartCropMeta.outputSize;
-
-          const persisted = toPersisted(p);
-          const pipelineJoints = generatePipelineJoints(
-            globalJoints,
-            persisted,
-            ext.smartCropMeta,
-            ext.splitMeta,
-            dims,
-          );
-
-          const frontCount = pipelineJoints.views.front.length;
-          const leftCount = pipelineJoints.views.left.length;
-          const backCount = pipelineJoints.views.back.length;
-          const rightCount = pipelineJoints.views.right.length;
-          statusLines.push(
-            `${p.name}: front ${frontCount} / left ${leftCount} / back ${backCount} / right ${rightCount}`,
-          );
-          successCount++;
-          return { ...p, jointsMeta: pipelineJoints };
-        }),
-      );
-
-      setParts(updatedParts); // Triggers auto-save via useEffect
-
-      const summary =
-        `Joints 完成：${successCount} 条 Pipeline 成功` +
-        (skipCount > 0 ? `, ${skipCount} 条跳过` : '');
-      const fullStatus = statusLines.length > 0
-        ? summary + '\n' + statusLines.join('\n')
-        : summary;
-      setJointsStatus(fullStatus);
-      onStatusChange(fullStatus, successCount > 0 ? 'success' : 'warning');
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setJointsStatus(`失败: ${msg}`);
-      onStatusChange(`生成 Joints 失败: ${msg}`, 'error');
-    } finally {
-      setJointsGenerating(false);
-    }
-  }, [project, parts, loadLatest, onStatusChange]);
+  // ── Generate Joint Info (Stage 3 已移除) ────────────────────────────
+  // 关节生产现在统一在 Page1 multiview 之后自动跑（见 Stage 1）。Page2 只是
+  // 抽取/3D 代工，不再生产关节。整个 handler、状态、按钮、overlay 预览均已删除。
 
   // ── Smart Crop All ───────────────────────────────────────────────────
   // Re-runs SmartCrop + Split on each pipeline's saved maskedBlob
@@ -468,15 +349,6 @@ export function HighresModel({ onStatusChange }: Props) {
         <Button
           variant="secondary"
           size="sm"
-          disabled={jointsGenerating || !project}
-          onClick={handleGenerateJoints}
-          title={jointsStatus ?? '从 Page1 MultiView 生成 DWPose 骨骼，按 SmartCrop/Split 映射到各 Pipeline'}
-        >
-          {jointsGenerating ? '⏳ Generating…' : '🦴 Generate Joint Info'}
-        </Button>
-        <Button
-          variant="secondary"
-          size="sm"
           disabled={smartCropAllRunning || !project}
           onClick={handleSmartCropAll}
           title={smartCropAllStatus ?? '对所有 Pipeline 重算 SmartCrop + Split 元数据（跳过慢速的 Banana/SAM3 提取）'}
@@ -496,37 +368,6 @@ export function HighresModel({ onStatusChange }: Props) {
           >
             {smartCropAllStatus}
           </span>
-        )}
-        {jointsStatus && !jointsGenerating && (
-          <>
-            <span
-              title={jointsStatus}
-              style={{
-                fontSize: 10,
-                color: 'var(--text-muted)',
-                maxWidth: 320,
-                whiteSpace: 'pre-line',
-                lineHeight: 1.35,
-              }}
-            >
-              {jointsStatus}
-            </span>
-            {jointsOverlayUrl && (
-              <img
-                src={jointsOverlayUrl}
-                alt="DWPose skeleton overlay"
-                title="点击查看骨骼 overlay 大图"
-                onClick={() => setJointsOverlayPreview(true)}
-                style={{
-                  height: 28,
-                  border: '1px solid var(--border-default)',
-                  borderRadius: 3,
-                  cursor: 'pointer',
-                  background: '#111',
-                }}
-              />
-            )}
-          </>
         )}
         <div ref={addDropdownRef} style={{ position: 'relative' }}>
           <Button variant="primary" size="sm" onClick={() => setAddDropdownOpen((v) => !v)}>
@@ -637,49 +478,6 @@ export function HighresModel({ onStatusChange }: Props) {
           onConfirm={confirmDelete}
           onCancel={() => setPendingDelete(null)}
         />
-      )}
-      {jointsOverlayPreview && jointsOverlayUrl && (
-        <div
-          onClick={() => setJointsOverlayPreview(false)}
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 10000,
-            background: 'rgba(0,0,0,0.85)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            cursor: 'pointer',
-          }}
-        >
-          <img
-            src={jointsOverlayUrl}
-            alt="DWPose skeleton overlay (full)"
-            style={{
-              maxWidth: '90vw',
-              maxHeight: '90vh',
-              objectFit: 'contain',
-              borderRadius: 4,
-              background: '#111',
-            }}
-          />
-          <button
-            onClick={() => setJointsOverlayPreview(false)}
-            style={{
-              position: 'absolute',
-              top: 16,
-              right: 24,
-              background: 'none',
-              border: 'none',
-              color: '#fff',
-              fontSize: 28,
-              cursor: 'pointer',
-              lineHeight: 1,
-            }}
-          >
-            ✕
-          </button>
-        </div>
       )}
     </div>
   );
