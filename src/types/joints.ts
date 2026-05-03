@@ -185,6 +185,59 @@ export interface PipelineJointsMeta {
   generatedAt: string;
 }
 
+// ── Page1 Splits / Joints (Stage 1: Page1 = sole joints producer) ──────
+
+/**
+ * Per-view split record produced by Page1's auto-split after multiview.
+ * Records the per-view image file (saved as a SegmentSet) and its bbox in
+ * the original 4-in-1 multiview image. Used by Page3 to render src/tar to
+ * the same image space as the joints.
+ */
+export interface Page1ViewSplit {
+  view: ViewName;
+  /** filename inside the segment set directory, e.g. "front_v0001.png" */
+  file: string;
+  /** bbox in the global 2x2 multiview image (end-exclusive) */
+  bbox: { x0: number; y0: number; x1: number; y1: number };
+  /** size of this slice (pixel) */
+  size: { w: number; h: number };
+}
+
+export interface Page1SplitsMeta {
+  version: 1;
+  /** the multiview filename this split was produced from */
+  source: string;
+  /** the segment set directory name (under page1.multiview node) */
+  segmentDir: string;
+  /** per-view split info */
+  views: Record<ViewName, Page1ViewSplit>;
+  generatedAt: string;
+}
+
+/**
+ * Page1 joints record: holds DWPose result on the 4-in-1 multiview, plus
+ * per-view joints already converted into split-local coordinates so that
+ * Page3 can consume them directly without any further transform.
+ */
+export interface Page1ViewJoints {
+  view: ViewName;
+  /** image space these joint coordinates live in (= split slice size) */
+  imageSize: { width: number; height: number };
+  /** joints in split-local pixel coordinates */
+  joints: Joint2D[];
+}
+
+export interface Page1JointsMeta {
+  version: 1;
+  /** the multiview filename DWPose was run against */
+  source: string;
+  /** raw global result (joints in 4-in-1 coords, kept for traceability) */
+  global: GlobalJointsMeta;
+  /** per-view joints in split-local coords (Page3 consumes these) */
+  views: Record<ViewName, Page1ViewJoints>;
+  generatedAt: string;
+}
+
 // ── Joint Name Constants ────────────────────────────────────────────────
 
 /** Primary keypoints supported in Phase 1. */

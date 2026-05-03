@@ -13,7 +13,7 @@
  *   14:R_Eye  15:L_Eye  16:R_Ear  17:L_Ear
  */
 
-import type { Joint2D, GlobalJointsMeta, MultiViewLayout, ViewName } from '../types/joints';
+import type { Joint2D, GlobalJointsMeta, MultiViewLayout, ViewName, Page1SplitsMeta, Page1ViewJoints } from '../types/joints';
 
 // ── Raw DWPose API types ────────────────────────────────────────────────
 
@@ -234,6 +234,49 @@ export async function detectAndConvertToGlobalJoints(
   const result = await detectPoses(imageBase64, opts);
   const joints = convertToGlobalJoints(result.raw, imageFile);
   return { joints, overlayBase64: result.overlayBase64 };
+}
+
+/**
+ * Convert a {@link GlobalJointsMeta} (joints in 4-in-1 image space) into
+ * per-view joints expressed in each split slice's local coordinates.
+ *
+ * For each view V:
+ *   local = (global - bbox.x0/y0)
+ *
+ * Joints whose global pixel falls outside the corresponding split bbox are
+ * dropped (they were quadrant-assigned but the split bbox might be tighter
+ * after padding). This matches how Page3 expects to consume them.
+ */
+export function globalJointsToPage1Views(
+  global: GlobalJointsMeta,
+  splits: Page1SplitsMeta,
+): Record<ViewName, Page1ViewJoints> {
+  const out: Partial<Record<ViewName, Page1ViewJoints>> = {};
+  const views: ViewName[] = ['front', 'left', 'back', 'right'];
+  for (const v of views) {
+    const split = splits.views[v];
+    const srcJoints = global.views[v] ?? [];
+    const localJoints: Joint2D[] = srcJoints
+      .filter((j) => j.x >= split.bbox.x0 && j.x < split.bbox.x1 && j.y >= split.bbox.y0 && j.y < split.bbox.y1)
+      .map((j) => ({
+        name: j.name,
+        x: j.x - split.bbox.x0,
+        y: j.y - split.bbox.y0,
+        confidence: j.confidence,
+      }));
+    out[v] = {
+      view: v,
+      imageSize: { width: split.size.w, height: split.size.h },
+      joints: localJoints,
+    };
+  }
+  // Stage 1 guard: 必须四视图齐全（splits 已按四视图构建，理论必中；缺失即数据异常）
+  for (const v of views) {
+    if (!out[v]) {
+      throw new Error(`globalJointsToPage1Views: missing view "${v}" after conversion`);
+    }
+  }
+  return out as Record<ViewName, Page1ViewJoints>;
 }
 // ── Single-view COCO → Joint2D[] ───────────────────────────────────────
 

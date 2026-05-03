@@ -17,6 +17,8 @@ import {
   type Trellis2Params,
 } from '../../services/trellis2';
 import { splitMultiView } from '../../services/multiviewSplit';
+import { detectAndConvertToGlobalJoints, globalJointsToPage1Views } from '../../services/dwpose';
+import type { Page1JointsMeta, Page1SplitsMeta, ViewName } from '../../types/joints';
 import { extractWithPrompt, REMOVE_JACKET_PROMPT } from '../../services/extraction';
 import { useProject } from '../../contexts/ProjectContext';
 import type { AssetVersion } from '../../services/projectStore';
@@ -97,7 +99,7 @@ interface NodeOutputs {
 }
 
 export function ConceptToRoughModel({ onStatusChange }: Props) {
-  const { project, saveAsset, loadLatest, listHistory, loadByName, saveSegments, loadLatestSegments } = useProject();
+  const { project, saveAsset, loadLatest, listHistory, loadByName, saveSegments, loadLatestSegments, savePage1Splits, savePage1Joints } = useProject();
   const [states, setStates] = useState<NodeState[]>([
     'idle', 'idle', 'idle', 'idle', 'idle', 'idle',
   ]);
@@ -458,6 +460,77 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                   `已切分 4 视图 → ${setHandle.dirName}/`,
                   'success',
                 );
+
+                // ── Stage 1: 持久化 page1.splits + page1.joints ───────────
+                // 设计意图：Page1 是唯一的关节生产者；这里把 split bbox 和
+                // DWPose 结果一并塞进 project.json，让 Page3 不再依赖 Page2.
+                try {
+                  // Stage 1 guard: split 必须返回完整四视图
+                  const requiredViews: ViewName[] = ['front', 'left', 'back', 'right'];
+                  const gotViews = new Set(slices.map((s) => s.view));
+                  const missing = requiredViews.filter((v) => !gotViews.has(v));
+                  if (missing.length > 0) {
+                    throw new Error(`splitMultiView 缺少视图: ${missing.join(', ')}（共 ${slices.length}/4）`);
+                  }
+                  const versionTag = setHandle.index.version; // e.g. "v0001"
+                  const viewMeta = new Map<ViewName, { bbox: { x0: number; y0: number; x1: number; y1: number }; size: { w: number; h: number } }>();
+                  for (const s of slices) viewMeta.set(s.view, { bbox: s.bbox, size: s.size });
+                  const fileFor = (vw: ViewName) => `${vw}_${versionTag}.png`;
+                  const splitsMeta: Page1SplitsMeta = {
+                    version: 1,
+                    source: v.file,
+                    segmentDir: setHandle.dirName,
+                    views: {
+                      front: { view: 'front', file: fileFor('front'), ...viewMeta.get('front')! },
+                      left:  { view: 'left',  file: fileFor('left'),  ...viewMeta.get('left')!  },
+                      back:  { view: 'back',  file: fileFor('back'),  ...viewMeta.get('back')!  },
+                      right: { view: 'right', file: fileFor('right'), ...viewMeta.get('right')! },
+                    },
+                    generatedAt: new Date().toISOString(),
+                  };
+                  await savePage1Splits(splitsMeta);
+
+                  // DWPose 失败仅打 warning，不阻塞主流程
+                  try {
+                    const dataUrl = await blobToDataUrl(blob);
+                    const { joints: globalJoints } = await detectAndConvertToGlobalJoints(
+                      dataUrl,
+                      v.file,
+                      { includeHand: false, includeFace: false },
+                    );
+                    const perView = globalJointsToPage1Views(globalJoints, splitsMeta);
+                    const jointsMeta: Page1JointsMeta = {
+                      version: 1,
+                      source: v.file,
+                      global: globalJoints,
+                      views: perView,
+                      generatedAt: new Date().toISOString(),
+                    };
+                    await savePage1Joints(jointsMeta);
+                    const total = globalJoints.keypoints.length;
+                    // Stage 1 guard: 关键点过少（< 4）通常是输入图质量差或遮挡，提示但不阻塞
+                    if (total < 4) {
+                      onStatusChange(
+                        `⚠️ 关节检测异常：仅检到 ${total} 个关键点，建议检查输入图质量（已写入但 Page3 可能不可用）`,
+                        'warning',
+                      );
+                    } else {
+                      onStatusChange(`关节已检测：${total} 个关键点已写入 project.json`, 'success');
+                    }
+                  } catch (e) {
+                    console.warn('[Page1] DWPose 失败（不阻塞 multiview）:', e);
+                    onStatusChange(
+                      `DWPose 关节检测失败（已忽略，可稍后重跑）：${e instanceof Error ? e.message : String(e)}`,
+                      'warning',
+                    );
+                  }
+                } catch (e) {
+                  console.warn('[Page1] 写入 page1.splits/joints 失败:', e);
+                  onStatusChange(
+                    `Page1 splits/joints 持久化失败：${e instanceof Error ? e.message : String(e)}`,
+                    'warning',
+                  );
+                }
               }
             } catch (e) {
               onStatusChange(
@@ -482,7 +555,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       onStatusChange(`Multi-View 生成失败：${msg}`, 'error');
       return null;
     }
-  }, [onStatusChange, setNodeState, project, saveAsset, saveSegments, refreshHistory]);
+  }, [onStatusChange, setNodeState, project, saveAsset, saveSegments, refreshHistory, savePage1Splits, savePage1Joints]);
 
   // ---- 3D Model node (Tripo / TRELLIS.2 image → GLB) ----------------
   const runRoughModel = useCallback(async (sourceUrl?: string): Promise<string | null> => {
@@ -1048,13 +1121,29 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                   state={state}
                   actions={actions}
                   headerExtra={
-                    project && (histories[idx]?.length ?? 0) > 0 ? (
-                      <HistoryDropdown
-                        history={histories[idx] ?? []}
-                        selected={selectedFiles[idx]}
-                        onSelect={(f) => handleSelectHistory(idx, f)}
-                      />
-                    ) : undefined
+                    <>
+                      {/* Stage 1: Multi-View 节点显示"关节已检测"绿勾 */}
+                      {idx === 2 && project?.meta.page1?.joints ? (
+                        <span
+                          title={`page1.joints @ ${project.meta.page1.joints.source}`}
+                          style={{
+                            color: '#16a34a',
+                            fontSize: 12,
+                            marginRight: 8,
+                            fontWeight: 500,
+                          }}
+                        >
+                          ✓ 关节已检测
+                        </span>
+                      ) : null}
+                      {project && (histories[idx]?.length ?? 0) > 0 ? (
+                        <HistoryDropdown
+                          history={histories[idx] ?? []}
+                          selected={selectedFiles[idx]}
+                          onSelect={(f) => handleSelectHistory(idx, f)}
+                        />
+                      ) : null}
+                    </>
                   }
                   onBodyClick={
                     // Concept (idx 0) 不支持单击运行链；
@@ -1110,6 +1199,21 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       )}
     </div>
   );
+}
+
+/** Encode a Blob into a data: URL (used as input to /api/dwpose). */
+async function blobToDataUrl(blob: Blob): Promise<string> {
+  const buf = new Uint8Array(await blob.arrayBuffer());
+  const CHUNK = 0x8000;
+  let bin = '';
+  for (let i = 0; i < buf.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(
+      null,
+      buf.subarray(i, Math.min(i + CHUNK, buf.length)) as unknown as number[],
+    );
+  }
+  const mime = blob.type || 'image/png';
+  return `data:${mime};base64,${btoa(bin)}`;
 }
 
 function imageForNode(idx: number, outputs: NodeOutputs): string | undefined {

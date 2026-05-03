@@ -100,7 +100,10 @@ export interface PartPipelineState {
   modify?: ModifyState;
   /** 3D Model 节点结果 */
   model3d?: Model3DState;
-  /** Pipeline joints (generated via "Generate Joint Info" button for Page3 alignment) */
+  /**
+   * @deprecated Stage 3: 关节统一在 Page1 生产并存到 project.meta.page1.joints。
+   * 旧工程加载时仍可携带本字段（Page3 通过双源查询兼容回退）。
+   */
   jointsMeta?: PipelineJointsMeta;
 }
 

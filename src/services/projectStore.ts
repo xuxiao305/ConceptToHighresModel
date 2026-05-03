@@ -24,6 +24,16 @@ export interface ProjectMeta {
   /** 工程根目录的本地绝对路径（如 D:\AI\Prototypes\.../GirlOrangeJacket）。
    *  浏览器无法直接获取，需用户首次打开工程时人工提供，存盘后复用。 */
   absolutePath?: string;
+  /**
+   * Stage 1 (refactor master plan) — Page1 作为唯一关节生产者。
+   * - splits: 4 视图切分元信息（指向 page1.multiview 节点下的 segment set）
+   * - joints: DWPose 跑在 4 合 1 多视图上后，按视图切分到 split-local 坐标
+   * 这两份数据让 Page3 完全脱离 Page2 的关节生产链。
+   */
+  page1?: {
+    splits?: Page1SplitsMeta;
+    joints?: Page1JointsMeta;
+  };
 }
 
 export interface AssetVersion {
@@ -36,7 +46,7 @@ export interface NodeIndex {
   history: AssetVersion[];   // 按时间倒序，[0] = 最新
 }
 
-import type { PipelineJointsMeta, SmartCropTransformMeta, SplitTransformMeta } from '../types/joints';
+import type { PipelineJointsMeta, SmartCropTransformMeta, SplitTransformMeta, Page1SplitsMeta, Page1JointsMeta } from '../types/joints';
 
 // 节点目录命名（含序号便于在文件管理器中按顺序查看）
 export interface NodeDir {
@@ -577,7 +587,11 @@ export interface PersistedPipeline {
   smartCropMeta?: SmartCropTransformMeta;
   /** Split transform metadata — captured during extraction for joints generation */
   splitMeta?: SplitTransformMeta;
-  /** Pipeline joints metadata (Page2 output for Page3 alignment) */
+  /**
+   * @deprecated Stage 3: Page2 不再生产关节。新工程一律读 `project.meta.page1.joints`。
+   * 保留字段仅用于读取旧 project.json 的兼容回退（Page3 双源查询）。
+   * 下一次 schema bump 时移除。
+   */
   jointsMeta?: PipelineJointsMeta;
   /** Pre-crop masked blob 文件名（存于 page2.extraction_masked 节点，供 Smart Crop All 复用） */
   maskedFile?: string | null;
@@ -648,4 +662,41 @@ export async function getPipelineJointsByModelFile(
   if (!index) return undefined;
   const pipeline = index.pipelines.find((p) => p.modelFile === modelFile);
   return pipeline?.jointsMeta;
+}
+
+// ---------------------------------------------------------------------------
+// Page1 Splits / Joints (Stage 1: Page1 = sole joints producer)
+// ---------------------------------------------------------------------------
+
+/**
+ * 写入 Page1 splits 元信息到 project.json.meta.page1.splits.
+ * 工程未打开时静默跳过。
+ */
+export async function savePage1Splits(
+  handle: ProjectHandle,
+  splits: Page1SplitsMeta,
+): Promise<void> {
+  if (!handle.meta.page1) handle.meta.page1 = {};
+  handle.meta.page1.splits = splits;
+  await touchProject(handle);
+}
+
+/**
+ * 写入 Page1 joints 元信息到 project.json.meta.page1.joints.
+ */
+export async function savePage1Joints(
+  handle: ProjectHandle,
+  joints: Page1JointsMeta,
+): Promise<void> {
+  if (!handle.meta.page1) handle.meta.page1 = {};
+  handle.meta.page1.joints = joints;
+  await touchProject(handle);
+}
+
+export function getPage1Splits(handle: ProjectHandle): Page1SplitsMeta | undefined {
+  return handle.meta.page1?.splits;
+}
+
+export function getPage1Joints(handle: ProjectHandle): Page1JointsMeta | undefined {
+  return handle.meta.page1?.joints;
 }
