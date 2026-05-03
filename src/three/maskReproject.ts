@@ -61,6 +61,14 @@ export interface MaskReprojectionOptions {
   maskDilatePx?: number;
 }
 
+export interface LoadMaskGrayOptions {
+  /**
+   * Decode the mask into this working resolution. Nearest-neighbor
+   * scaling preserves integer class ids / mask values.
+   */
+  resizeTo?: { width: number; height: number };
+}
+
 /**
  * Project all mesh vertices to image pixel space using the standard
  * front-view orthographic camera.
@@ -130,7 +138,10 @@ export function buildFrontVertexMap(
  * Read a single-channel grayscale mask PNG (multi-region encoded by
  * mask_value) into a Uint8Array. Returns null on failure.
  */
-export function loadMaskGray(url: string): Promise<{
+export function loadMaskGray(
+  url: string,
+  options: LoadMaskGrayOptions = {},
+): Promise<{
   data: Uint8Array;
   width: number;
   height: number;
@@ -140,8 +151,8 @@ export function loadMaskGray(url: string): Promise<{
     img.crossOrigin = 'anonymous';
     img.onload = () => {
       try {
-        const w = img.naturalWidth;
-        const h = img.naturalHeight;
+        const w = Math.max(1, Math.round(options.resizeTo?.width ?? img.naturalWidth));
+        const h = Math.max(1, Math.round(options.resizeTo?.height ?? img.naturalHeight));
         const c = document.createElement('canvas');
         c.width = w;
         c.height = h;
@@ -150,7 +161,8 @@ export function loadMaskGray(url: string): Promise<{
           resolve(null);
           return;
         }
-        ctx.drawImage(img, 0, 0);
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(img, 0, 0, w, h);
         const rgba = ctx.getImageData(0, 0, w, h).data;
         const gray = new Uint8Array(w * h);
         // Mask was authored as grayscale, so any of the RGB channels

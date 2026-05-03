@@ -409,6 +409,40 @@ function chooseGarmentRegionLabel(labels: string[]): string {
   return labels[0] ?? '';
 }
 
+const LOCALIZATION_LONG_EDGE = 1024;
+
+interface LocalizationSpace {
+  w: number;
+  h: number;
+  scaleX: number;
+  scaleY: number;
+}
+
+function computeLocalizationSpace(size: { w: number; h: number } | null): LocalizationSpace | null {
+  if (!size || size.w <= 0 || size.h <= 0) return null;
+  const scale = LOCALIZATION_LONG_EDGE / Math.max(size.w, size.h);
+  const w = Math.max(1, Math.round(size.w * scale));
+  const h = Math.max(1, Math.round(size.h * scale));
+  return {
+    w,
+    h,
+    scaleX: w / size.w,
+    scaleY: h / size.h,
+  };
+}
+
+function scaleBBoxToLocalization(
+  bbox: { x: number; y: number; w: number; h: number } | null,
+  space: LocalizationSpace | null,
+): { x: number; y: number; w: number; h: number } | null {
+  if (!bbox || !space) return null;
+  const x = Math.max(0, Math.min(space.w - 1, Math.round(bbox.x * space.scaleX)));
+  const y = Math.max(0, Math.min(space.h - 1, Math.round(bbox.y * space.scaleY)));
+  const x2 = Math.max(x + 1, Math.min(space.w, Math.round((bbox.x + bbox.w) * space.scaleX)));
+  const y2 = Math.max(y + 1, Math.min(space.h, Math.round((bbox.y + bbox.h) * space.scaleY)));
+  return { x, y, w: x2 - x, h: y2 - y };
+}
+
 const DEMO_SOURCE: MeshData = {
   name: 'Demo Source',
   vertices: [
@@ -609,6 +643,34 @@ export function ModelAssemble({ onStatusChange }: Props) {
       ? { x: refSubjectBBox.x, y: refSubjectBBox.y, w: refSubjectBBox.w, h: refSubjectBBox.h }
       : null;
   }, [segPack, refSubjectBBox]);
+
+  const subjectFitBBox = useMemo(
+    () => refSubjectBBox
+      ? { x: refSubjectBBox.x, y: refSubjectBBox.y, w: refSubjectBBox.w, h: refSubjectBBox.h }
+      : null,
+    [refSubjectBBox],
+  );
+  const isSegFormerSegPack = useMemo(
+    () => segPackName === 'segformer_segmentation.json' || maskImageName === 'segformer_label_mask.png' || segformerClasses.length > 0,
+    [segPackName, maskImageName, segformerClasses.length],
+  );
+  // Fitting the full Target mesh to a clothing-only SegFormer bbox makes
+  // the 2D mask look uniformly 10-20% larger than the mesh. For SegFormer,
+  // use the full image subject bbox for camera fitting; keep the clothing
+  // bbox only as the semantic mask region.
+  const renderFitBBox = useMemo(
+    () => (isSegFormerSegPack ? subjectFitBBox ?? fitBBox : fitBBox),
+    [isSegFormerSegPack, subjectFitBBox, fitBBox],
+  );
+
+  // Page1 T-pose node images can be generated at arbitrary resolutions.
+  // Reprojection therefore runs in a fixed canonical image space while
+  // preview/UI keeps showing the original reference image dimensions.
+  const localizationSpace = useMemo(() => computeLocalizationSpace(refImageSize), [refImageSize]);
+  const localizationFitBBox = useMemo(
+    () => scaleBBoxToLocalization(renderFitBBox, localizationSpace),
+    [renderFitBBox, localizationSpace],
+  );
 
   const regionLabels = useMemo(() => segPack?.regions.map((r) => r.label) ?? [], [segPack]);
   const recommendedRegionLabel = useMemo(
@@ -1248,7 +1310,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
   }, [refImageUrl, refImageSize, refImageName, appendAlignmentTrace, onStatusChange]);
 
   const handleRenderOrtho = useCallback(() => {
-    if (!refImageSize) {
+    if (!refImageSize || !localizationSpace) {
       onStatusChange('请先加载参考图（用于决定渲染尺寸）', 'warning');
       return;
     }
@@ -1257,17 +1319,17 @@ export function ModelAssemble({ onStatusChange }: Props) {
       return;
     }
     try {
-      const useAuto = autoFit && !!fitBBox;
+      const useAuto = autoFit && !!localizationFitBBox;
       const { dataUrl, camera } = renderOrthoFrontViewWithCamera(
         tarMesh.vertices,
         tarMesh.faces,
         {
-          width: refImageSize.w,
-          height: refImageSize.h,
+          width: localizationSpace.w,
+          height: localizationSpace.h,
           background: null,
           meshColor: '#dddddd',
           ...(useAuto
-            ? { fitToImageBBox: fitBBox! }
+            ? { fitToImageBBox: localizationFitBBox! }
             : {
                 scale: orthoScale,
                 offsetX: orthoOffsetX,
@@ -1287,21 +1349,29 @@ export function ModelAssemble({ onStatusChange }: Props) {
       appendAlignmentTrace('render-ortho', {
         useAuto,
         refImageSize,
+        localizationSpace,
         fitBBox,
+        renderFitBBox,
+        isSegFormerSegPack,
+        localizationFitBBox,
         manualFit: { scale: orthoScale, offsetX: orthoOffsetX, offsetY: orthoOffsetY },
         camera: summarizeCamera(camera),
         targetMesh: { vertices: tarMesh.vertices.length, faces: tarMesh.faces.length },
       });
       if (useAuto) {
-        const b = fitBBox!;
-        const src = segPack ? `${segPack.regions.length}-region 并集` : '图像主体';
+        const b = renderFitBBox!;
+        const src = isSegFormerSegPack && subjectFitBBox
+          ? '图像主体（SegFormer mask 仅用于服装选区）'
+          : segPack
+            ? `${segPack.regions.length}-region 并集`
+            : '图像主体';
         onStatusChange(
-          `已渲染 Target 正视图 ${refImageSize.w}×${refImageSize.h} · 自动拟合到 ${src} ${b.w}×${b.h}@(${b.x},${b.y})`,
+          `已渲染 Target 正视图 ${localizationSpace.w}×${localizationSpace.h} · 参考图 ${refImageSize.w}×${refImageSize.h} · 自动拟合到 ${src} ${b.w}×${b.h}@(${b.x},${b.y})`,
           'success',
         );
       } else {
         onStatusChange(
-          `已渲染 Target 正交正视图 ${refImageSize.w}×${refImageSize.h}` +
+          `已渲染 Target 正交正视图 ${localizationSpace.w}×${localizationSpace.h} · 参考图 ${refImageSize.w}×${refImageSize.h}` +
             ` · scale=${orthoScale.toFixed(2)} offset=(${orthoOffsetX.toFixed(2)}, ${orthoOffsetY.toFixed(2)})`,
           'success',
         );
@@ -1312,7 +1382,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         'error',
       );
     }
-  }, [refImageSize, tarMesh, autoFit, fitBBox, segPack, orthoScale, orthoOffsetX, orthoOffsetY, onStatusChange]);
+  }, [refImageSize, localizationSpace, tarMesh, autoFit, localizationFitBBox, fitBBox, renderFitBBox, isSegFormerSegPack, subjectFitBBox, segPack, orthoScale, orthoOffsetX, orthoOffsetY, onStatusChange]);
 
   // Reproject the SAM3 mask onto Target mesh vertices using the camera
   // captured from the most recent ortho render. Output: per-region
@@ -1332,7 +1402,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
     }
     try {
       const t0 = performance.now();
-      const mask = await loadMaskGray(maskImageUrl);
+      const mask = await loadMaskGray(maskImageUrl, {
+        resizeTo: { width: orthoCamera.width, height: orthoCamera.height },
+      });
       if (!mask) {
         onStatusChange('mask 解码失败', 'error');
         return;
@@ -1350,6 +1422,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
       appendAlignmentTrace('manual-reproject-mask', {
         camera: summarizeCamera(orthoCamera),
         mask: maskImageName,
+        maskDecodeSize: mask ? { width: mask.width, height: mask.height } : null,
         segmentation: segPackName,
         result: summarizeMaskReprojection(result),
       });
@@ -1481,7 +1554,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
   // to target vertices, then adopt the selected region as the Target seed.
   useEffect(() => {
     const targetRegionLabel = activeTargetRegionLabel;
-    if (!segPack || !maskImageUrl || !refImageSize) return;
+    if (!segPack || !maskImageUrl || !refImageSize || !localizationSpace) return;
     if (maskReproj) return;
     if (tarMesh.vertices.length === 0 || tarMesh.faces.length === 0) return;
 
@@ -1490,17 +1563,17 @@ export function ModelAssemble({ onStatusChange }: Props) {
       setAutoLocalizing(true);
       const t0 = performance.now();
       try {
-        const useAuto = autoFit && !!fitBBox;
+        const useAuto = autoFit && !!localizationFitBBox;
         const rendered = renderOrthoFrontViewWithCamera(
           tarMesh.vertices,
           tarMesh.faces,
           {
-            width: refImageSize.w,
-            height: refImageSize.h,
+            width: localizationSpace.w,
+            height: localizationSpace.h,
             background: null,
             meshColor: '#dddddd',
             ...(useAuto
-              ? { fitToImageBBox: fitBBox! }
+              ? { fitToImageBBox: localizationFitBBox! }
               : {
                   scale: orthoScale,
                   offsetX: orthoOffsetX,
@@ -1517,12 +1590,18 @@ export function ModelAssemble({ onStatusChange }: Props) {
         appendAlignmentTrace('auto-localize-render-ortho', {
           useAuto,
           refImageSize,
+          localizationSpace,
           fitBBox,
+          renderFitBBox,
+          isSegFormerSegPack,
+          localizationFitBBox,
           manualFit: { scale: orthoScale, offsetX: orthoOffsetX, offsetY: orthoOffsetY },
           camera: summarizeCamera(rendered.camera),
         });
 
-        const mask = await loadMaskGray(maskImageUrl);
+        const mask = await loadMaskGray(maskImageUrl, {
+          resizeTo: { width: rendered.camera.width, height: rendered.camera.height },
+        });
         if (cancelled) return;
         if (!mask) {
           onStatusChange('分割包已加载，但 mask 解码失败，无法自动反投影', 'error');
@@ -1542,6 +1621,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           selectionMode: targetRegionSelectionMode,
           camera: summarizeCamera(rendered.camera),
           mask: maskImageName,
+          maskDecodeSize: { width: mask.width, height: mask.height },
           segmentation: segPackName,
           result: summarizeMaskReprojection(reproj),
         });
@@ -1562,7 +1642,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           .map(([label, regionSet]) => `${label}=${regionSet.size}`)
           .join(', ');
         onStatusChange(
-          `分割包 3D 定位完成：已渲染 Target 正视图并反投影 mask · ${stats} · ${(performance.now() - t0).toFixed(1)}ms`,
+          `分割包 3D 定位完成：工作分辨率 ${localizationSpace.w}×${localizationSpace.h}，已渲染 Target 正视图并反投影 mask · ${stats} · ${(performance.now() - t0).toFixed(1)}ms`,
           'success',
         );
       } catch (err) {
@@ -1585,12 +1665,14 @@ export function ModelAssemble({ onStatusChange }: Props) {
     segPack,
     maskImageUrl,
     refImageSize,
+    localizationSpace,
     activeTargetRegionLabel,
     targetRegionSelectionMode,
     maskReproj,
     tarMesh,
     autoFit,
     fitBBox,
+    localizationFitBBox,
     orthoScale,
     orthoOffsetX,
     orthoOffsetY,
@@ -2351,7 +2433,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
       );
       return;
     }
-    if (!maskReproj && (!segPack || !maskImageUrl || !refImageSize)) {
+    if (!maskReproj && (!segPack || !maskImageUrl || !refImageSize || !localizationSpace)) {
       onStatusChange(
         '目标区域尚未定位：请加载完整 SAM3 分割包（segmentation.json + 参考图 + mask）。',
         'error',
@@ -2375,7 +2457,11 @@ export function ModelAssemble({ onStatusChange }: Props) {
       refImageName,
       maskImageName,
       refImageSize,
+      localizationSpace,
       fitBBox,
+      renderFitBBox,
+      isSegFormerSegPack,
+      localizationFitBBox,
       source: { name: srcMesh.name, vertices: srcMesh.vertices.length, faces: srcMesh.faces.length },
       target: { name: tarMesh.name, vertices: tarMesh.vertices.length, faces: tarMesh.faces.length },
     });
@@ -2413,20 +2499,20 @@ export function ModelAssemble({ onStatusChange }: Props) {
                 region: summarizeRegion(workingTarRegion),
               });
             }
-          } else if (segPack && maskImageUrl && refImageSize) {
+          } else if (segPack && maskImageUrl && refImageSize && localizationSpace) {
             let camera = orthoCamera;
             if (!camera) {
-              const useAuto = autoFit && !!fitBBox;
+              const useAuto = autoFit && !!localizationFitBBox;
               const rendered = renderOrthoFrontViewWithCamera(
                 tarMesh.vertices,
                 tarMesh.faces,
                 {
-                  width: refImageSize.w,
-                  height: refImageSize.h,
+                  width: localizationSpace.w,
+                  height: localizationSpace.h,
                   background: null,
                   meshColor: '#dddddd',
                   ...(useAuto
-                    ? { fitToImageBBox: fitBBox! }
+                    ? { fitToImageBBox: localizationFitBBox! }
                     : {
                         scale: orthoScale,
                         offsetX: orthoOffsetX,
@@ -2443,13 +2529,19 @@ export function ModelAssemble({ onStatusChange }: Props) {
               appendAlignmentTrace('auto-render-ortho', {
                 useAuto,
                 refImageSize,
+                localizationSpace,
                 fitBBox,
+                renderFitBBox,
+                isSegFormerSegPack,
+                localizationFitBBox,
                 manualFit: { scale: orthoScale, offsetX: orthoOffsetX, offsetY: orthoOffsetY },
                 camera: summarizeCamera(camera),
               });
             }
 
-            const mask = await loadMaskGray(maskImageUrl);
+            const mask = await loadMaskGray(maskImageUrl, {
+              resizeTo: { width: camera.width, height: camera.height },
+            });
             if (mask) {
               const reproj = reprojectMaskToVertices(
                 tarMesh.vertices,
@@ -2464,6 +2556,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
                 label: targetRegionLabel,
                 camera: summarizeCamera(camera),
                 mask: maskImageName,
+                maskDecodeSize: { width: mask.width, height: mask.height },
                 segmentation: segPackName,
                 result: summarizeMaskReprojection(reproj),
               });
@@ -2812,9 +2905,13 @@ export function ModelAssemble({ onStatusChange }: Props) {
     segPack,
     maskImageUrl,
     refImageSize,
+    localizationSpace,
     orthoCamera,
     autoFit,
     fitBBox,
+    renderFitBBox,
+    isSegFormerSegPack,
+    localizationFitBBox,
     orthoScale,
     orthoOffsetX,
     orthoOffsetY,
@@ -3403,11 +3500,11 @@ export function ModelAssemble({ onStatusChange }: Props) {
               size="sm"
               variant="primary"
               onClick={handleRenderOrtho}
-              disabled={!refImageSize || tarMesh.vertices.length === 0}
+              disabled={!localizationSpace || tarMesh.vertices.length === 0}
               title={
-                !refImageSize
+                !localizationSpace
                   ? '请先加载参考图以确定渲染尺寸'
-                  : '按参考图分辨率渲染 Target 的正交正视图'
+                  : `按归一化工作分辨率 ${localizationSpace.w}×${localizationSpace.h} 渲染 Target 正交正视图`
               }
             >
               渲染 Target 正视图
@@ -3551,8 +3648,10 @@ export function ModelAssemble({ onStatusChange }: Props) {
               自动拟合参考图主体（推荐）
             </label>
             <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6, lineHeight: 1.5 }}>
-              {segPack && fitBBox
-                ? `使用 segmentation.json 区域并集：${fitBBox.w}×${fitBBox.h}@(${fitBBox.x},${fitBBox.y}) · ${segPack.regions.length} 区域`
+              {isSegFormerSegPack && subjectFitBBox
+                ? `SegFormer：相机拟合使用图像主体 bbox ${subjectFitBBox.w}×${subjectFitBBox.h}@(${subjectFitBBox.x},${subjectFitBBox.y})，服装 bbox 仅用于 mask 选区`
+                : segPack && fitBBox
+                  ? `使用 segmentation.json 区域并集：${fitBBox.w}×${fitBBox.h}@(${fitBBox.x},${fitBBox.y}) · ${segPack.regions.length} 区域`
                 : refSubjectBBox
                   ? `已检测主体 bbox：${refSubjectBBox.w}×${refSubjectBBox.h}@(${refSubjectBBox.x},${refSubjectBBox.y}) [${refSubjectBBox.method}]`
                   : refImageUrl
@@ -3636,7 +3735,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
                 size="sm"
                 variant="primary"
                 onClick={handleRenderOrtho}
-                disabled={!refImageSize || tarMesh.vertices.length === 0}
+                disabled={!localizationSpace || tarMesh.vertices.length === 0}
                 style={{ flex: 1, justifyContent: 'center' }}
               >
                 重新渲染
@@ -3681,6 +3780,9 @@ export function ModelAssemble({ onStatusChange }: Props) {
             参考图: {refImageName ?? '(未加载)'}
             {refImageSize && (
               <> · {refImageSize.w}×{refImageSize.h}</>
+            )}
+            {localizationSpace && (
+              <> · 反投影工作分辨率 {localizationSpace.w}×{localizationSpace.h}</>
             )}
             <br />
             Mask: {maskImageName ?? '(未加载)'}
@@ -4836,7 +4938,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
           width={refImageSize.w}
           height={refImageSize.h}
           title="2D 定位对照"
-          highlightBBox={fitBBox ?? refSubjectBBox ?? null}
+          highlightBBox={renderFitBBox ?? fitBBox ?? refSubjectBBox ?? null}
           onClose={() => setShowOrthoCompare(false)}
           layers={[
             ...(refImageUrl
