@@ -25,6 +25,7 @@ import {
 import {
   icpRefine,
   buildSkeletonProxy,
+  matchLimbStructureToWhole,
 } from '../../three';
 import { computePoseAlignment } from '../../three/poseAlignment';
 
@@ -315,6 +316,57 @@ export function runPoseProxy(input: RunPoseProxyInput, opts: RunnerOptions = {})
     input.src.vertices,
     input.tar.vertices,
     posePairs,
+    opts,
+    input.tarConstraintVertices,
+  );
+}
+
+// ── Strategy: Limb Structure ──────────────────────────────────
+
+export interface RunLimbStructureInput {
+  src: RunnerMesh;
+  tar: RunnerMesh;
+  /** Optional SAM3 region restricting both anchor detection and ICP search. */
+  tarConstraintVertices?: Set<number>;
+  /** Optional set of "body" vertices used to disambiguate root vs end anchor. */
+  tarBodyVertices?: Set<number>;
+}
+
+export class LimbStructureMatchError extends Error {
+  constructor(public reason: string, public pairs: number) {
+    super(`runLimbStructure: match failed (reason=${reason}, pairs=${pairs})`);
+    this.name = 'LimbStructureMatchError';
+  }
+}
+
+/**
+ * Limb-structure strategy: detect 3 raw limb anchors (root/bend/end) on both
+ * meshes via PCA + slice histogram, then finalize with ICP. Mirrors the
+ * 'limb-structure' branch of V1 handleAutoAlign (L2992–3003).
+ */
+export function runLimbStructure(
+  input: RunLimbStructureInput,
+  opts: RunnerOptions = {},
+): RunnerOutcome {
+  const pm = matchLimbStructureToWhole(
+    { vertices: input.src.vertices },
+    { vertices: input.tar.vertices },
+    {
+      tarConstraintVertices: input.tarConstraintVertices,
+      tarBodyVertices: input.tarBodyVertices,
+      mode: opts.alignmentMode ?? DEFAULT_ALIGNMENT_MODE,
+    },
+  );
+
+  if (!pm.matrix4x4 || pm.pairs.length < 3) {
+    const reason = typeof pm.diagnostics?.reason === 'string' ? pm.diagnostics.reason : 'unknown';
+    throw new LimbStructureMatchError(reason, pm.pairs.length);
+  }
+
+  return finalizeWithIcp(
+    input.src.vertices,
+    input.tar.vertices,
+    pm.pairs,
     opts,
     input.tarConstraintVertices,
   );
