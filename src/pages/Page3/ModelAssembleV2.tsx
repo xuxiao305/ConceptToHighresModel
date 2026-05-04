@@ -12,13 +12,18 @@
  *
  * Stage 7/1 切片（2026-05-04）：
  *   - useProject() 接通：hasPoseProxyJoints 现在来自 project.meta.page1.joints。
- *   - 其他 ctx 字段仍是 stub，逐个 TODO 标明谁负责下一切片接入。
- *   - 底部状态条显示实时接通进度（1/9）。
+ *
+ * Stage 7/2 切片（2026-05-04）：
+ *   - 接通 hasSource / hasTarget：通过 listHistory('page2.highres') 和
+ *     listHistory('page1.rough') 检测工程内是否已有可加载的 GLB 文件。
+ *   - 这里只判存在性，不实际 load blob（避免 URL.createObjectURL 泄漏，且接
+ *     通 mesh 视口是更后面的切片）。
+ *   - 进度：3/9。
  *
  * 边界：
  *   - 不重新实现任何对齐算法；策略 run 仍由现存 ModelAssemble 持有。
  */
-import { useMemo, useState, type CSSProperties, type ReactNode } from 'react';
+import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react';
 import { Button } from '../../components/Button';
 import { useProject } from '../../contexts/ProjectContext';
 import {
@@ -39,17 +44,17 @@ interface ModelAssembleV2Props {
 /**
  * Stub 定义：记录哪些字段还不是真实数据。后续切片逐个拿掉。
  *
- * TODO 未接入字段 (8/9)：
- *   - hasSource / hasTarget         : 需 ModelAssemble 的 source/target mesh state
+ * TODO 未接入字段 (6/9)：
  *   - hasTargetRegion               : 需 SAM3 region selector state
  *   - hasSegPack / hasMaskReprojection: 需 SegPack 加载 state
  *   - hasOrthoCamera                : 需 正交相机装载 state
  *   - hasBodyTorsoRegion / hasAdjacency: 需 SegPack 推导
  *   - srcLandmarkCount / tarLandmarkCount: 需 manual landmark 收集 state
  */
-const STUB_FALLBACK: Omit<AlignStrategyContext, 'hasPoseProxyJoints'> = {
-  hasSource: true,
-  hasTarget: true,
+const STUB_FALLBACK: Omit<
+  AlignStrategyContext,
+  'hasPoseProxyJoints' | 'hasSource' | 'hasTarget'
+> = {
   hasTargetRegion: true,
   hasSegPack: true,
   hasMaskReprojection: true,
@@ -60,8 +65,12 @@ const STUB_FALLBACK: Omit<AlignStrategyContext, 'hasPoseProxyJoints'> = {
   tarLandmarkCount: 0,
 };
 
-/** Stage 7/1: 实时接通的字段名单，用于底部状态条显示进度。 */
-const REAL_FIELDS: ReadonlyArray<keyof AlignStrategyContext> = ['hasPoseProxyJoints'];
+/** Stage 7/1+7/2: 实时接通的字段名单，用于底部状态条显示进度。 */
+const REAL_FIELDS: ReadonlyArray<keyof AlignStrategyContext> = [
+  'hasPoseProxyJoints',
+  'hasSource',
+  'hasTarget',
+];
 const TOTAL_FIELDS = 9; // AlignStrategyContext 总字段数
 
 
@@ -82,20 +91,48 @@ const READINESS_LABEL: Record<StrategyReadiness, string> = {
 };
 
 export function ModelAssembleV2(_props: ModelAssembleV2Props) {
-  const { project } = useProject();
+  const { project, listHistory } = useProject();
   const [selectedId, setSelectedId] = useState<AlignStrategyId>('pose-proxy');
   const [expandedReqs, setExpandedReqs] = useState<Set<AlignStrategyId>>(new Set());
   const [showLogs, setShowLogs] = useState(false);
   const [showQuality, setShowQuality] = useState(false);
 
-  // Stage 7/1: hasPoseProxyJoints 走真实数据，其余仍 stub。
+  // Stage 7/2: 检测工程内是否已存在 source/target GLB（不实际 load blob）。
+  //   source = page2.highres（高模，对齐起点）
+  //   target = page1.rough（粗模，对齐目标姿态）
+  // 命名沿用生产 ModelAssemble 的语义（src→tar 表示对齐方向）。
+  const [sourceFileCount, setSourceFileCount] = useState(0);
+  const [targetFileCount, setTargetFileCount] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    if (!project) {
+      setSourceFileCount(0);
+      setTargetFileCount(0);
+      return;
+    }
+    void Promise.all([
+      listHistory('page2.highres'),
+      listHistory('page1.rough'),
+    ]).then(([src, tar]) => {
+      if (cancelled) return;
+      setSourceFileCount(src.length);
+      setTargetFileCount(tar.length);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [project, listHistory]);
+
+  // Stage 7/1+7/2: hasPoseProxyJoints / hasSource / hasTarget 走真实数据，其余仍 stub。
   const ctx: AlignStrategyContext = useMemo(() => {
     const front = project?.meta.page1?.joints?.views.front?.joints;
     return {
       ...STUB_FALLBACK,
       hasPoseProxyJoints: !!(front && front.length > 0),
+      hasSource: sourceFileCount > 0,
+      hasTarget: targetFileCount > 0,
     };
-  }, [project?.meta.page1?.joints]);
+  }, [project?.meta.page1?.joints, sourceFileCount, targetFileCount]);
 
   const selectedStrategy = useMemo(
     () => ALIGN_STRATEGIES.find((s) => s.id === selectedId) ?? ALIGN_STRATEGIES[0],
@@ -127,7 +164,11 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
             <Button size="sm">Source GLB</Button>
             <Button size="sm">Target GLB</Button>
           </Row>
-          <Hint>V2 scaffold · 待接入 useProject / loadByName 真实数据</Hint>
+          <Hint>
+            page2.highres: {sourceFileCount} 个 · page1.rough: {targetFileCount} 个
+            {sourceFileCount === 0 && targetFileCount === 0 && '（工程内尚无 GLB）'}
+          </Hint>
+          <Hint>Stage 7/2 · 仅检测存在性；实际加载等后续切片接入视口</Hint>
         </PanelSection>
 
         <PanelSection title="🎯 目标区域 (必填)">
