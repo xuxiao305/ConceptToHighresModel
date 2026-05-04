@@ -81,8 +81,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { Button } from '../../components/Button';
 import { useProject } from '../../contexts/ProjectContext';
-import type { Page3Session } from '../../services/projectStore';
+import type { Page3Session, AssetVersion } from '../../services/projectStore';
 import { parseSegmentationJson } from '../../services/segmentationPack';
+import { parseGarmentsSegFormer } from '../../services/garmentParsing';
 import {
   DualViewport,
   MeshViewer,
@@ -171,7 +172,7 @@ interface MeshData {
 
 export function ModelAssemble(props: ModelAssembleProps) {
   const { onStatusChange } = props;
-  const { project, listHistory, loadLatest, loadPage3SegPack, loadPage3Session, saveAsset } = useProject();
+  const { project, listHistory, loadLatest, loadByName, loadPage3SegPack, loadPage3Session, saveAsset, savePage3SegPack } = useProject();
   // Stage 7/4: 订阅全局 landmark store（V1/V2 共享）。
   const srcLandmarks = useLandmarkStore((s) => s.srcLandmarks);
   const tarLandmarks = useLandmarkStore((s) => s.tarLandmarks);
@@ -250,6 +251,11 @@ export function ModelAssemble(props: ModelAssembleProps) {
   // 命名沿用生产 ModelAssemble 的语义（src→tar 表示对齐方向）。
   const [sourceFileCount, setSourceFileCount] = useState(0);
   const [targetFileCount, setTargetFileCount] = useState(0);
+  // Stage 11: full version history per side + currently chosen file name.
+  const [srcHistory, setSrcHistory] = useState<AssetVersion[]>([]);
+  const [tarHistory, setTarHistory] = useState<AssetVersion[]>([]);
+  const [srcChosenName, setSrcChosenName] = useState<string | null>(null);
+  const [tarChosenName, setTarChosenName] = useState<string | null>(null);
   // Stage 7/3c: SegPack 检测。
   const [segPackDirName, setSegPackDirName] = useState<string | null>(null);
   // Stage 7/5: SegPack 里是否有 body/torso 标签。
@@ -278,6 +284,8 @@ export function ModelAssemble(props: ModelAssembleProps) {
       if (seq !== refreshSeqRef.current) return;
       setSourceFileCount(src.length);
       setTargetFileCount(tar.length);
+      setSrcHistory(src);
+      setTarHistory(tar);
       setSegPackDirName(segpack?.dirName ?? null);
       setSession(sess);
       // Stage 7/5: 只解析 json（快），不加载 mask。
@@ -295,9 +303,18 @@ export function ModelAssemble(props: ModelAssembleProps) {
       }
       // Stage 8/1: 加载实际 mesh 数据。失败不阻塞 readiness 面板。
       setMeshLoadError(null);
-      const loadSide = async (nodeKey: string): Promise<MeshData | null> => {
+      const loadSide = async (
+        nodeKey: string,
+        chosenName: string | null,
+        history: AssetVersion[],
+      ): Promise<MeshData | null> => {
         try {
-          const latest = await loadLatest(nodeKey);
+          // Stage 11: prefer the explicitly-chosen version when present in
+          // history; otherwise fall through to loadLatest.
+          const useChosen = chosenName && history.some((v) => v.file === chosenName);
+          const latest = useChosen
+            ? await loadByName(nodeKey, chosenName!)
+            : await loadLatest(nodeKey);
           if (!latest) return null;
           const loaded = await loadGlbAsMesh(latest.url);
           // 解析完成立刻 revoke，避免 ObjectURL 泄漏（与 V1 line 2366 同模式）。
@@ -310,8 +327,8 @@ export function ModelAssemble(props: ModelAssembleProps) {
       };
       try {
         const [s, t] = await Promise.all([
-          src.length > 0 ? loadSide('page2.highres') : Promise.resolve(null),
-          tar.length > 0 ? loadSide('page1.rough') : Promise.resolve(null),
+          src.length > 0 ? loadSide('page2.highres', srcChosenName, src) : Promise.resolve(null),
+          tar.length > 0 ? loadSide('page1.rough', tarChosenName, tar) : Promise.resolve(null),
         ]);
         if (seq !== refreshSeqRef.current) return;
         setSrcMesh(s);
@@ -321,7 +338,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
         setMeshLoadError(err instanceof Error ? err.message : String(err));
       }
     });
-  }, [project, listHistory, loadLatest, loadPage3SegPack, loadPage3Session]);
+  }, [project, listHistory, loadLatest, loadByName, loadPage3SegPack, loadPage3Session, srcChosenName, tarChosenName]);
   // Effect 只在 project 变化时跑；在其他页面落盘后的新资产需手动 ↻ 按钮。
   useEffect(() => {
     refreshAssets();
@@ -443,6 +460,88 @@ export function ModelAssemble(props: ModelAssembleProps) {
       }
     },
     [project, saveAsset, onStatusChange, refreshAssets],
+  );
+
+  // Stage 11: manual SegPack file upload (json + mask + optional ref). Mirrors
+  // V1 handleLoadSegPackFiles. Writes through savePage3SegPack so V2 reads it
+  // identically to a SegFormer-produced pack.
+  const segPackInputRef = useRef<HTMLInputElement | null>(null);
+  const [segPackBusy, setSegPackBusy] = useState(false);
+  const importSegPack = useCallback(
+    async (files: FileList | File[]) => {
+      if (!project) {
+        onStatusChange?.('未打开工程', 'error');
+        return;
+      }
+      const arr = Array.from(files);
+      const json = arr.find((f) => f.name.toLowerCase().endsWith('.json'));
+      const mask = arr.find((f) => /mask.*\.(png|jpg|jpeg|webp)$/i.test(f.name))
+        ?? arr.find((f) => /\.(png|jpg|jpeg|webp)$/i.test(f.name) && f !== json);
+      if (!json || !mask) {
+        onStatusChange?.('SegPack 需至少 1 个 .json + 1 个 mask 图片', 'error');
+        return;
+      }
+      setSegPackBusy(true);
+      try {
+        // Validate JSON shape early (throws if malformed).
+        parseSegmentationJson(await json.text());
+        await savePage3SegPack(json, mask, mask.name, `manual upload: ${json.name}+${mask.name}`);
+        onStatusChange?.(`SegPack 已导入：${json.name} + ${mask.name}`, 'success');
+        refreshAssets();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        onStatusChange?.(`SegPack 导入失败：${msg}`, 'error');
+      } finally {
+        setSegPackBusy(false);
+      }
+    },
+    [project, savePage3SegPack, onStatusChange, refreshAssets],
+  );
+
+  // Stage 11: SegFormer garment parse trigger. Takes a reference image,
+  // runs the dev bridge, persists json+mask via savePage3SegPack so the
+  // pack appears in the SAM3 region picker on next refresh.
+  const refImageInputRef = useRef<HTMLInputElement | null>(null);
+  const [segformerBusy, setSegformerBusy] = useState(false);
+  const runSegFormer = useCallback(
+    async (refImage: File) => {
+      if (!project) {
+        onStatusChange?.('未打开工程', 'error');
+        return;
+      }
+      setSegformerBusy(true);
+      onStatusChange?.('SegFormer 服装语义分割中…', 'info');
+      try {
+        const result = await parseGarmentsSegFormer({
+          source: refImage,
+          classes: ['Upper-clothes', 'Dress', 'Skirt', 'Pants', 'Scarf'],
+        });
+        const jsonBlob = new Blob([JSON.stringify(result.json, null, 2)], { type: 'application/json' });
+        // base64 → Blob (reuse atob).
+        const bin = atob(result.labelMaskBase64);
+        const buf = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+        const maskBlob = new Blob([buf], { type: 'image/png' });
+        const maskName = 'segformer_label_mask.png';
+        await savePage3SegPack(
+          jsonBlob,
+          maskBlob,
+          maskName,
+          `segformer (${result.classesPresent.map((c) => c.label).join(',')}) ref=${refImage.name}`,
+        );
+        onStatusChange?.(
+          `SegFormer 完成 · ${result.classesPresent.length} 类 · 已写入 page3.segpack`,
+          'success',
+        );
+        refreshAssets();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        onStatusChange?.(`SegFormer 失败：${msg}`, 'error');
+      } finally {
+        setSegformerBusy(false);
+      }
+    },
+    [project, savePage3SegPack, onStatusChange, refreshAssets],
   );
 
   // Stage 8/3: Manual 策略 Run。其余 3 套 auto 策略运行仍在 V1。
@@ -784,17 +883,76 @@ export function ModelAssemble(props: ModelAssembleProps) {
             {sourceFileCount === 0 && targetFileCount === 0 && '（工程内尚无 GLB）'}
           </Hint>
           <Hint>导入后会以新版本写入对应 node，不覆盖历史</Hint>
+          {srcHistory.length > 1 && (
+            <VersionPicker
+              label="src 版本"
+              versions={srcHistory}
+              chosen={srcChosenName}
+              onChoose={(name) => { setSrcChosenName(name); refreshAssets(); }}
+            />
+          )}
+          {tarHistory.length > 1 && (
+            <VersionPicker
+              label="tar 版本"
+              versions={tarHistory}
+              chosen={tarChosenName}
+              onChoose={(name) => { setTarChosenName(name); refreshAssets(); }}
+            />
+          )}
         </PanelSection>
 
         <PanelSection title="🎯 目标区域 (必填)">
           <Hint>
             SegPack: {segPackDirName ?? '未保存'}
-            {segPackDirName && '（V1 加载后自动持久化）'}
+            {segPackDirName && '（加载后自动持久化）'}
           </Hint>
           {segPackRegionLabels.length > 0 && (
             <Hint>区域: {segPackRegionLabels.join(', ')}</Hint>
           )}
-          <Hint>SAM3 区域选择器待挂接（当前仅检测 SegPack 存在性 + body/torso 标签）</Hint>
+          <input
+            ref={segPackInputRef}
+            type="file"
+            multiple
+            accept=".json,image/*"
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              if (e.target.files && e.target.files.length > 0) void importSegPack(e.target.files);
+              e.target.value = '';
+            }}
+          />
+          <input
+            ref={refImageInputRef}
+            type="file"
+            accept="image/*"
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) void runSegFormer(f);
+              e.target.value = '';
+            }}
+          />
+          <Row>
+            <Button
+              size="sm"
+              onClick={() => segPackInputRef.current?.click()}
+              disabled={!project || segPackBusy}
+              loading={segPackBusy}
+              title="选中 JSON + mask 图片（可一起选）"
+            >
+              手动上传 SegPack
+            </Button>
+            <Button
+              size="sm"
+              variant="primary"
+              onClick={() => refImageInputRef.current?.click()}
+              disabled={!project || segformerBusy}
+              loading={segformerBusy}
+              title="选中一张参考图 → 运行 SegFormer 服装分割并写入 SegPack"
+            >
+              🧑 SegFormer
+            </Button>
+          </Row>
+          <Hint>SegFormer 需 dev 服务已启动（/api/segformer-garment）</Hint>
         </PanelSection>
 
         <PanelSection
@@ -1513,6 +1671,44 @@ function PanelSection({
 
 function Row({ children }: { children: ReactNode }) {
   return <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>{children}</div>;
+}
+
+function VersionPicker({
+  label,
+  versions,
+  chosen,
+  onChoose,
+}: {
+  label: string;
+  versions: AssetVersion[];
+  chosen: string | null;
+  onChoose: (name: string | null) => void;
+}) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4, fontSize: 11 }}>
+      <span style={{ color: 'var(--text-muted)', flex: '0 0 auto' }}>{label}</span>
+      <select
+        value={chosen ?? ''}
+        onChange={(e) => onChoose(e.target.value === '' ? null : e.target.value)}
+        style={{
+          flex: 1,
+          fontSize: 11,
+          background: 'var(--bg-app)',
+          color: 'var(--text-primary)',
+          border: '1px solid var(--border-default)',
+          borderRadius: 3,
+          padding: '2px 4px',
+        }}
+      >
+        <option value="">最新（默认）</option>
+        {versions.map((v) => (
+          <option key={v.file} value={v.file}>
+            {v.file}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
 }
 
 function NumberRow({
