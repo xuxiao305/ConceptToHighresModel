@@ -206,6 +206,8 @@ export function ModelAssemble(props: ModelAssembleProps) {
   const [showJointSeeds, setShowJointSeeds] = useState(true);
   const [showCapsuleAnchors, setShowCapsuleAnchors] = useState(true);
   const [showSpecialAnchors, setShowSpecialAnchors] = useState(true);
+  /** Show pipeline joints (SmartCrop affine-mapped 2D→3D unprojected) on src side. */
+  const [showPipelineJointsOverlay, setShowPipelineJointsOverlay] = useState(false);
 
   // Stage 8/4: 中央视图模式 与 结果预览子模式。
   type CenterView = 'landmark' | 'result';
@@ -936,6 +938,51 @@ export function ModelAssemble(props: ModelAssembleProps) {
     };
   }, [poseProxyState.proxies, srcMesh, tarMesh, showJointSeeds, showCapsuleAnchors, showSpecialAnchors]);
 
+  // ── Pipeline Joints 2D→3D 可视化 ────────────────────────────────────
+  // 将 SmartCrop 仿射变换后的 pipeline joints 通过 srcCamera 反向投影
+  // 到 3D，画在 src mesh 前方的一个平面上。Joints 和 camera 现在使用
+  // 相同的 image size（pipelineJointImageSize），无需 XY 缩放。
+  const pipelineJoint3DMarkers = useMemo(() => {
+    if (!showPipelineJointsOverlay) return undefined;
+    const cam = poseProxyState.srcRender?.srcCamera;
+    if (!cam || !pipelineJoints?.front || !srcMesh) return undefined;
+
+    // Joints and camera now share the same image size, so no XY scaling needed.
+    const joints = pipelineJoints.front;
+
+    const cx = cam.width / 2;
+    const cy = cam.height / 2;
+    const wpp = cam.worldPerPx;
+    const worldX = cam.meshFrontX - 2;
+
+    // Same color scheme as joint seeds for consistency
+    const color = (name: string): string => {
+      if (name.includes('neck')) return '#ffffff';
+      if (name.includes('shoulder')) return '#ff7875';
+      if (name.includes('elbow') || name.includes('wrist')) return '#ffa940';
+      if (name.includes('hip')) return '#36cfc9';
+      if (name.includes('knee') || name.includes('ankle')) return '#597ef7';
+      return '#888888';
+    };
+
+    const markers: Array<{ position: Vec3; color: string; size: number; label: string; opacity: number }> = [];
+    for (const j of joints) {
+      // Inverse of projectVerticesToImage:
+      //   u = cx + (camZ - wz) / wpp  →  wz = camZ - (u - cx) * wpp
+      //   v = cy - (wy - camY) / wpp  →  wy = camY + (cy - v) * wpp
+      const wz = cam.camZ - (j.x - cx) * wpp;
+      const wy = cam.camY + (cy - j.y) * wpp;
+      markers.push({
+        position: [worldX, wy, wz],
+        color: color(j.name),
+        size: 0.02,  // fixed world size for 2D-projected joints
+        label: `2D:${j.name}`,
+        opacity: 0.85,
+      });
+    }
+    return markers;
+  }, [showPipelineJointsOverlay, poseProxyState.srcRender, pipelineJoints, srcMesh]);
+
   // Stage 8/8 + 9: limb-structure + surface + pose-proxy auto runners.
   // tarConstraintVertices comes from SAM3Panel (Stage 9). When the user
   // hasn’t adopted a region, runners execute unconstrained (whole mesh).
@@ -1248,24 +1295,19 @@ export function ModelAssemble(props: ModelAssembleProps) {
     setAligning(true);
     try {
       // SmartCrop coordinate mapping: use jacket-space joints for src.
-      // pipelineJoints are in Page2 split-local coords; scale to Page1
-      // split-local so they match srcCamera (renders at page1Size).
-      let srcFrontJoints = pipelineJoints?.front ?? front.joints;
-      if (pipelineJoints?.front && pipelineJointImageSize && front.imageSize) {
-        const sx = front.imageSize.width / Math.max(1, pipelineJointImageSize.width);
-        const sy = front.imageSize.height / Math.max(1, pipelineJointImageSize.height);
-        srcFrontJoints = srcFrontJoints.map((j) => ({
-          ...j,
-          x: Math.round(j.x * sx),
-          y: Math.round(j.y * sy),
-        }));
-      }
+      // When pipelineJoints are available, use their native split size as
+      // srcCamera resolution — joints and camera then share the same
+      // coordinate space without XY scaling, avoiding stretch artifacts.
+      const srcImageSize = (pipelineJointImageSize && pipelineJoints?.front)
+        ? pipelineJointImageSize
+        : front.imageSize;
+      const srcFrontJoints = pipelineJoints?.front ?? front.joints;
       // Step 1: collectJoints
       const joints = collectJoints({
         srcJointsRaw: srcFrontJoints,
         tarJointsRaw: front.joints,
         tarCamera: tarOrthoCamera,
-        page1Size: front.imageSize,
+        page1Size: srcImageSize,
       });
       setPoseProxyState((prev) => ({ ...prev, joints }));
       validateCollectJoints(joints, front, tarOrthoCamera);
@@ -1274,10 +1316,10 @@ export function ModelAssemble(props: ModelAssembleProps) {
       const srcRender = renderSrcOrtho({
         srcVertices: srcMesh.vertices,
         srcFaces: srcMesh.faces,
-        page1Size: front.imageSize,
+        page1Size: srcImageSize,
       });
       setPoseProxyState((prev) => ({ ...prev, srcRender }));
-      validateRenderSrcOrtho(srcRender, front.imageSize);
+      validateRenderSrcOrtho(srcRender, srcImageSize);
 
       // Step 3: buildProxies
       const proxies = buildProxies({
@@ -1367,23 +1409,18 @@ export function ModelAssemble(props: ModelAssembleProps) {
     setAlignResult(null);
     try {
       // SmartCrop coordinate mapping: use jacket-space joints for src.
-      let srcFrontJoints = pipelineJoints?.front ?? front.joints;
-      if (pipelineJoints?.front && pipelineJointImageSize && front.imageSize) {
-        const sx = front.imageSize.width / Math.max(1, pipelineJointImageSize.width);
-        const sy = front.imageSize.height / Math.max(1, pipelineJointImageSize.height);
-        srcFrontJoints = srcFrontJoints.map((j) => ({
-          ...j,
-          x: Math.round(j.x * sx),
-          y: Math.round(j.y * sy),
-        }));
-      }
+      // Same as handleRunPoseProxyStepwise — native split size avoids scaling.
+      const srcImageSize = (pipelineJointImageSize && pipelineJoints?.front)
+        ? pipelineJointImageSize
+        : front.imageSize;
+      const srcFrontJoints = pipelineJoints?.front ?? front.joints;
       switch (stepIndex) {
         case 0: {
           const joints = collectJoints({
             srcJointsRaw: srcFrontJoints,
             tarJointsRaw: front.joints,
             tarCamera: tarOrthoCamera,
-            page1Size: front.imageSize,
+            page1Size: srcImageSize,
           });
           setPoseProxyState((prev) => ({ ...prev, joints }));
           validateCollectJoints(joints, front, tarOrthoCamera);
@@ -1394,10 +1431,10 @@ export function ModelAssemble(props: ModelAssembleProps) {
           const srcRender = renderSrcOrtho({
             srcVertices: srcMesh.vertices,
             srcFaces: srcMesh.faces,
-            page1Size: front.imageSize,
+            page1Size: srcImageSize,
           });
           setPoseProxyState((prev) => ({ ...prev, srcRender }));
-          validateRenderSrcOrtho(srcRender, front.imageSize);
+          validateRenderSrcOrtho(srcRender, srcImageSize);
           onStatusChange?.(`pose-proxy step2 重跑完成 · srcCamera ${srcRender.srcCamera.width}×${srcRender.srcCamera.height}`, 'success');
           break;
         }
@@ -1752,6 +1789,17 @@ export function ModelAssemble(props: ModelAssembleProps) {
               >Special</Button>
             </>
           )}
+          {pipelineJoints?.front && (
+            <>
+              <span style={{ width: 1, height: 16, background: 'var(--border-default)', margin: '0 4px' }} />
+              <Button
+                size="sm"
+                variant={showPipelineJointsOverlay ? 'primary' : 'secondary'}
+                onClick={() => setShowPipelineJointsOverlay((v) => !v)}
+                title="Pipeline Joints — SmartCrop 仿射变换后的 2D joints 反向投影到 3D 前方平面"
+              >2D→3D</Button>
+            </>
+          )}
           <div style={{ flex: 1 }} />
           <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
             策略: {selectedStrategy.label}
@@ -1780,7 +1828,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
               onMoveSrcLandmark={handleMoveSrc}
               onMoveTarLandmark={handleMoveTar}
               tarPointLayers={tarSegpackLayers}
-              srcMarkers={anchorMarkers.src}
+              srcMarkers={[...(anchorMarkers.src ?? []), ...(pipelineJoint3DMarkers ?? [])]}
               tarMarkers={anchorMarkers.tar}
               srcLabel="Source (page2.highres)"
               tarLabel="Target (page1.rough)"
