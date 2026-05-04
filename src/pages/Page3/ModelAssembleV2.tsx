@@ -88,13 +88,18 @@ import {
   MeshViewer,
   loadGlbAsMesh,
   useLandmarkStore,
+  buildMeshAdjacency,
+  renderOrthoFrontViewWithCamera,
   type Face3,
   type Vec3,
   type ViewMode,
+  type MeshRegion,
+  type OrthoFrontCamera,
 } from '../../three';
 import { alignSourceMeshByLandmarks, type AlignmentResult } from '../../three/alignment';
-import { buildMeshAdjacency } from '../../three/meshAdjacency';
-import { runLimbStructure, runSurface } from '../../services/alignStrategies/runners';
+import { runLimbStructure, runSurface, runPoseProxy } from '../../services/alignStrategies/runners';
+import { SAM3Panel } from './SAM3Panel';
+import type { Joint2D } from '../../types/joints';
 import {
   ALIGN_STRATEGIES,
   summarizeReadiness,
@@ -189,6 +194,18 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
   type ResultView = 'overlay' | 'aligned' | 'target' | 'original';
   const [centerView, setCenterView] = useState<CenterView>('landmark');
   const [resultView, setResultView] = useState<ResultView>('overlay');
+  // Stage 9: SAM3 target region + ortho camera (V2-native, replaces V1 panel).
+  const [tarRegion, setTarRegion] = useState<MeshRegion | null>(null);
+  const [tarRegionLabel, setTarRegionLabel] = useState<string | null>(null);
+  const [tarOrthoCamera, setTarOrthoCamera] = useState<OrthoFrontCamera | null>(null);
+  const handleAdoptRegion = useCallback(
+    (region: MeshRegion | null, label: string | null, camera: OrthoFrontCamera | null) => {
+      setTarRegion(region);
+      setTarRegionLabel(label);
+      setTarOrthoCamera(camera);
+    },
+    [],
+  );
   // Stage 8/1: 中央视口需要的 mesh 数据。null = 尚未加载/工程内无文件。
   const [srcMesh, setSrcMesh] = useState<MeshData | null>(null);
   const [tarMesh, setTarMesh] = useState<MeshData | null>(null);
@@ -454,12 +471,11 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
     return buildMeshAdjacency(tarMesh.vertices, tarMesh.faces);
   }, [tarMesh]);
 
-  // Stage 8/8: limb-structure + surface auto runners.
-  // V2 does NOT yet wire SAM3 mask → tarConstraintVertices, so both runners
-  // execute unconstrained ("whole target mesh" mode). This matches V1
-  // behaviour when the user has not yet selected a target region.
+  // Stage 8/8 + 9: limb-structure + surface + pose-proxy auto runners.
+  // tarConstraintVertices comes from SAM3Panel (Stage 9). When the user
+  // hasn’t adopted a region, runners execute unconstrained (whole mesh).
   const canRunAuto = srcMesh !== null && tarMesh !== null;
-  const handleRunAuto = useCallback(async (id: 'limb-structure' | 'surface') => {
+  const handleRunAuto = useCallback(async (id: 'limb-structure' | 'surface' | 'pose-proxy') => {
     if (!srcMesh || !tarMesh) {
       setRunError('Source / target mesh 未加载');
       return;
@@ -469,14 +485,59 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
     try {
       let outcome;
       if (id === 'limb-structure') {
-        outcome = runLimbStructure({ src: srcMesh, tar: tarMesh });
-      } else {
+        outcome = runLimbStructure({
+          src: srcMesh,
+          tar: tarMesh,
+          tarConstraintVertices: tarRegion?.vertices,
+        });
+      } else if (id === 'surface') {
         if (!srcAdjacency || !tarAdjacency) {
           throw new Error('mesh adjacency 尚未就绪');
         }
         outcome = runSurface({
           src: { vertices: srcMesh.vertices, adjacency: srcAdjacency },
           tar: { vertices: tarMesh.vertices, adjacency: tarAdjacency },
+          tarConstraintVertices: tarRegion?.vertices,
+          tarSeedCentroid: tarRegion?.centroid,
+          tarSeedRadius: tarRegion?.boundingRadius,
+        });
+      } else {
+        // pose-proxy: needs Page1 joints + src ortho camera (rendered on the
+        // fly to match the page1 front view size) + tarOrthoCamera (from SAM3).
+        const front = project?.meta.page1?.joints?.views.front;
+        if (!front || front.joints.length === 0) {
+          throw new Error('pose-proxy 需 Page1 joints：请先在 Page1 完成 DWPose 检测');
+        }
+        if (!tarOrthoCamera) {
+          throw new Error('pose-proxy 需 Target SAM3 正交相机：请先在 SAM3 面板点 “渲染 + 反投影”');
+        }
+        const srcRender = renderOrthoFrontViewWithCamera(
+          srcMesh.vertices,
+          srcMesh.faces,
+          {
+            width: front.imageSize.width,
+            height: front.imageSize.height,
+            background: null,
+            meshColor: '#dddddd',
+          },
+        );
+        // Tar joints live in page1 split-local space; rescale them to the
+        // SAM3 ortho camera resolution (V1 scaleJointsToImageSize).
+        const sx = tarOrthoCamera.width / Math.max(1, front.imageSize.width);
+        const sy = tarOrthoCamera.height / Math.max(1, front.imageSize.height);
+        const tarJoints: Joint2D[] = front.joints.map((j) => ({
+          ...j,
+          x: Math.round(j.x * sx),
+          y: Math.round(j.y * sy),
+        }));
+        outcome = runPoseProxy({
+          src: srcMesh,
+          tar: tarMesh,
+          srcJoints: front.joints,
+          tarJoints,
+          srcCamera: srcRender.camera,
+          tarCamera: tarOrthoCamera,
+          tarConstraintVertices: tarRegion?.vertices,
         });
       }
       setAlignResult(outcome.result);
@@ -493,7 +554,7 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
     } finally {
       setAligning(false);
     }
-  }, [srcMesh, tarMesh, srcAdjacency, tarAdjacency, onStatusChange]);
+  }, [srcMesh, tarMesh, srcAdjacency, tarAdjacency, tarRegion, tarOrthoCamera, project, onStatusChange]);
 
   return (
     <div
@@ -531,7 +592,7 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
           BETA
         </span>
         <span>
-          Page3 V2（Stage 8/8）：manual + limb-structure + surface 可运行；pose-proxy 仍留在 V1（需 SAM3 面板移植）。
+          Page3 V2（Stage 9）：Manual + Limb-Structure + Surface + Pose-Proxy 均可运行。SAM3 区域供 pose-proxy / surface。
         </span>
       </div>
       <div
@@ -772,7 +833,7 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
                 ↶
               </Button>
             </div>
-          ) : selectedId === 'limb-structure' || selectedId === 'surface' ? (
+          ) : selectedId === 'limb-structure' || selectedId === 'surface' || selectedId === 'pose-proxy' ? (
             <div style={{ display: 'flex', gap: 6 }}>
               <Button
                 size="sm"
@@ -813,10 +874,19 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
                 padding: 6,
               }}
             >
-              pose-proxy 仍需 V2 接入 SAM3/正交相机（Stage 9）。请在默认路由运行。
+              未知策略。
             </div>
           )}
         </div>
+
+        <PanelSection title="🧩 SAM3 区域">
+          <SAM3Panel
+            tarMesh={tarMesh}
+            adoptedLabel={tarRegionLabel}
+            onAdoptRegion={handleAdoptRegion}
+            onStatus={onStatusChange}
+          />
+        </PanelSection>
 
         <PanelSection title="🎯 对齐模式">
           {ALIGN_STRATEGIES.map((s) => (
