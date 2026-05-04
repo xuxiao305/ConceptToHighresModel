@@ -262,12 +262,37 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       const roughNojacket = await loadLatest('page1.rough.nojacket');
       if (cancelled) return;
 
-      // SegPack 节点缩略图：用 mask blob（保留至少有视觉差异的灰度图）。
-      // 源图（T-Pose / Remove Jacket）已经由各自上游节点的 URL 显示。
-      const segpackClothedThumb = segpackClothed
+      // SegPack 节点 source 缩略图：
+      //   - Clothed:  优先用 T-Pose blob（克隆出独立 URL，避免与 tposeUrl 共享 ObjectURL
+      //               导致互相 revoke）；缺失时退化到 mask thumb。
+      //   - NoJacket: 即时把 Remove Jacket 4-view 切出 front 单视图作为 source；
+      //               切分失败时退化到 mask thumb。
+      let segpackClothedSourceUrl: string | null = null;
+      if (segpackClothed) {
+        if (tpose?.blob) {
+          segpackClothedSourceUrl = URL.createObjectURL(tpose.blob);
+        } else {
+          segpackClothedSourceUrl = URL.createObjectURL(segpackClothed.maskBlob);
+        }
+      }
+      let segpackNojacketSourceUrl: string | null = null;
+      if (segpackNojacket && extraction) {
+        try {
+          const slices = await splitMultiView(extraction.blob);
+          const front = slices.find((s) => s.view === 'front');
+          if (front) segpackNojacketSourceUrl = URL.createObjectURL(front.blob);
+        } catch (e) {
+          console.warn('[project-load] split front for SegPack(NoJacket) failed:', e);
+        }
+      }
+      if (!segpackNojacketSourceUrl && segpackNojacket) {
+        segpackNojacketSourceUrl = URL.createObjectURL(segpackNojacket.maskBlob);
+      }
+      // mask 单独走自己的 URL（用于 overlay 着色 LUT）
+      const segpackClothedMaskThumb = segpackClothed
         ? URL.createObjectURL(segpackClothed.maskBlob)
         : null;
-      const segpackNojacketThumb = segpackNojacket
+      const segpackNojacketMaskThumb = segpackNojacket
         ? URL.createObjectURL(segpackNojacket.maskBlob)
         : null;
 
@@ -309,13 +334,13 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           roughFile: rough?.version.file ?? null,
           extractionUrl: extraction?.url ?? null,
           extractionFile: extraction?.version.file ?? null,
-          segpackClothedUrl: segpackClothedThumb,
+          segpackClothedUrl: segpackClothedSourceUrl,
           segpackClothedFile: segpackClothed?.dirName ?? null,
-          segpackClothedMaskUrl: segpackClothedThumb,
+          segpackClothedMaskUrl: segpackClothedMaskThumb,
           segpackClothedPack: segpackClothedPack,
-          segpackNojacketUrl: segpackNojacketThumb,
+          segpackNojacketUrl: segpackNojacketSourceUrl,
           segpackNojacketFile: segpackNojacket?.dirName ?? null,
-          segpackNojacketMaskUrl: segpackNojacketThumb,
+          segpackNojacketMaskUrl: segpackNojacketMaskThumb,
           segpackNojacketPack: segpackNojacketPack,
           roughNojacketUrl: roughNojacket?.url ?? null,
           roughNojacketFile: roughNojacket?.version.file ?? null,
@@ -1200,7 +1225,9 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
   }, [onStatusChange, setNodeState, project, savePage1SegPack, refreshHistory]);
 
   // ---- SegPack (NoJacket) node — 接 SAM3 GUI 桥 --------------------------
-  // 输入：Remove Jacket 4-view 整图（去外套）。同上流程，写到 page1.segpack.nojacket。
+  // 输入：Remove Jacket 4-view 中的 **front 单视图**（与 SegPack(Clothed) 对称：
+  // 都用正面整图来产生服装语义图，而不是 4 合一）。运行时即时切分 4-view，
+  // 取 front 切片喂给 SAM3，写到 page1.segpack.nojacket。
   const runSegpackNojacket = useCallback(async (): Promise<void> => {
     const extractionUrl = outputsRef.current.extractionUrl;
     if (!extractionUrl) {
@@ -1209,10 +1236,20 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     }
     setNodeState(7, 'running');
     setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 7: '' } }));
+    let frontUrl: string | null = null;
     try {
+      // 把 4-view 整图切成 4 张 → 取 front 单视图
+      const mvBlob = await (await fetch(extractionUrl)).blob();
+      const slices = await splitMultiView(mvBlob);
+      const frontSlice = slices.find((s) => s.view === 'front');
+      if (!frontSlice) {
+        throw new Error(`splitMultiView 未返回 front 切片（共 ${slices.length} 张）`);
+      }
+      frontUrl = URL.createObjectURL(frontSlice.blob);
+
       const result = await runSegPackBridge(
-        extractionUrl,
-        outputsRef.current.extractionFile ?? 'page1.extraction',
+        frontUrl,
+        `${outputsRef.current.extractionFile ?? 'page1.extraction'}#front`,
         (msg) => onStatusChange(`SegPack (NoJacket) · ${msg}`, 'info'),
       );
 
@@ -1266,6 +1303,10 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       setNodeState(7, 'error');
       setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 7: msg } }));
       onStatusChange(`SegPack (NoJacket) 失败：${msg}`, 'error');
+    } finally {
+      // 即时切出来的 front 临时 URL 已通过 thumbnailUrl 复制到节点 state，
+      // 这里释放原始切片 URL 防止内存泄漏。
+      if (frontUrl) URL.revokeObjectURL(frontUrl);
     }
   }, [onStatusChange, setNodeState, project, savePage1SegPack, refreshHistory]);
 
@@ -1621,9 +1662,9 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                     pack={outputs.segpackClothedPack}
                     height={160}
                   />
-                ) : node.id === 'segpackNojacket' && state === 'complete' && outputs.extractionUrl ? (
+                ) : node.id === 'segpackNojacket' && state === 'complete' && outputs.segpackNojacketUrl ? (
                   <SegPackOverlay
-                    sourceUrl={outputs.extractionUrl}
+                    sourceUrl={outputs.segpackNojacketUrl}
                     maskUrl={outputs.segpackNojacketMaskUrl}
                     pack={outputs.segpackNojacketPack}
                     height={160}
