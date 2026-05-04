@@ -10,13 +10,17 @@
  *     拆成可复用组件再嵌入（计划中的 "2-3 commits by component slice"）。
  *   - 通过 ?v2 query param 切换，与生产 ModelAssemble 并存（Stage 7 才考虑做默认）。
  *
+ * Stage 7/1 切片（2026-05-04）：
+ *   - useProject() 接通：hasPoseProxyJoints 现在来自 project.meta.page1.joints。
+ *   - 其他 ctx 字段仍是 stub，逐个 TODO 标明谁负责下一切片接入。
+ *   - 底部状态条显示实时接通进度（1/9）。
+ *
  * 边界：
  *   - 不重新实现任何对齐算法；策略 run 仍由现存 ModelAssemble 持有。
- *   - 本组件目前不挂接真实 ProjectContext 数据，requirements 走 stub 上下文，
- *     验证注册表契约可用即可。后续切片用 useProject() 把真实值喂进去。
  */
 import { useMemo, useState, type CSSProperties, type ReactNode } from 'react';
 import { Button } from '../../components/Button';
+import { useProject } from '../../contexts/ProjectContext';
 import {
   ALIGN_STRATEGIES,
   summarizeReadiness,
@@ -33,22 +37,33 @@ interface ModelAssembleV2Props {
 }
 
 /**
- * 占位上下文：让 requirements() 在没接通 ProjectContext 时也能渲染合理状态。
- * 后续切片把 useProject() / ModelAssemble state hook 的值搬过来即可。
+ * Stub 定义：记录哪些字段还不是真实数据。后续切片逐个拿掉。
+ *
+ * TODO 未接入字段 (8/9)：
+ *   - hasSource / hasTarget         : 需 ModelAssemble 的 source/target mesh state
+ *   - hasTargetRegion               : 需 SAM3 region selector state
+ *   - hasSegPack / hasMaskReprojection: 需 SegPack 加载 state
+ *   - hasOrthoCamera                : 需 正交相机装载 state
+ *   - hasBodyTorsoRegion / hasAdjacency: 需 SegPack 推导
+ *   - srcLandmarkCount / tarLandmarkCount: 需 manual landmark 收集 state
  */
-const STUB_CTX: AlignStrategyContext = {
+const STUB_FALLBACK: Omit<AlignStrategyContext, 'hasPoseProxyJoints'> = {
   hasSource: true,
   hasTarget: true,
   hasTargetRegion: true,
   hasSegPack: true,
   hasMaskReprojection: true,
-  hasPoseProxyJoints: true,
   hasOrthoCamera: true,
   hasBodyTorsoRegion: false, // 故意 missing → limb-structure 显示 partial
   hasAdjacency: true,
   srcLandmarkCount: 0,
   tarLandmarkCount: 0,
 };
+
+/** Stage 7/1: 实时接通的字段名单，用于底部状态条显示进度。 */
+const REAL_FIELDS: ReadonlyArray<keyof AlignStrategyContext> = ['hasPoseProxyJoints'];
+const TOTAL_FIELDS = 9; // AlignStrategyContext 总字段数
+
 
 const READINESS_COLOR: Record<StrategyReadiness, string> = {
   ready: '#5cb85c',
@@ -67,12 +82,21 @@ const READINESS_LABEL: Record<StrategyReadiness, string> = {
 };
 
 export function ModelAssembleV2(_props: ModelAssembleV2Props) {
+  const { project } = useProject();
   const [selectedId, setSelectedId] = useState<AlignStrategyId>('pose-proxy');
   const [expandedReqs, setExpandedReqs] = useState<Set<AlignStrategyId>>(new Set());
   const [showLogs, setShowLogs] = useState(false);
   const [showQuality, setShowQuality] = useState(false);
 
-  const ctx = STUB_CTX;
+  // Stage 7/1: hasPoseProxyJoints 走真实数据，其余仍 stub。
+  const ctx: AlignStrategyContext = useMemo(() => {
+    const front = project?.meta.page1?.joints?.views.front?.joints;
+    return {
+      ...STUB_FALLBACK,
+      hasPoseProxyJoints: !!(front && front.length > 0),
+    };
+  }, [project?.meta.page1?.joints]);
+
   const selectedStrategy = useMemo(
     () => ALIGN_STRATEGIES.find((s) => s.id === selectedId) ?? ALIGN_STRATEGIES[0],
     [selectedId],
@@ -223,6 +247,8 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
             <StepCardV2 key={step.id} step={step} />
           ))}
         </PanelSection>
+
+        <DataSourceStatusBar project={project} />
       </aside>
     </div>
   );
@@ -501,4 +527,36 @@ function asideStyle(side: 'left' | 'right'): CSSProperties {
     flexDirection: 'column',
     overflow: 'auto',
   };
+}
+
+/**
+ * Stage 7/1 切片：实时显示 V2 ctx 字段接通进度。
+ * 后续切片每接通一个字段，就把 REAL_FIELDS 数组扩一个，UI 自动反映。
+ */
+function DataSourceStatusBar({ project }: { project: ReturnType<typeof useProject>['project'] }) {
+  const realCount = REAL_FIELDS.length;
+  const projectName = project?.meta.name ?? '(未打开工程)';
+  const front = project?.meta.page1?.joints?.views.front?.joints;
+  const jointsHint = front
+    ? `page1.joints.front: ${front.length} pts`
+    : 'page1.joints: 缺失';
+  return (
+    <div
+      style={{
+        marginTop: 'auto',
+        padding: '8px 12px',
+        borderTop: '1px solid var(--border-default)',
+        background: 'var(--bg-app)',
+        fontSize: 10,
+        color: 'var(--text-muted)',
+        lineHeight: 1.5,
+      }}
+    >
+      <div>
+        <strong style={{ color: '#5cb85c' }}>Stage 7/1</strong> · 真实数据接通{' '}
+        {realCount}/{TOTAL_FIELDS} · 工程：{projectName}
+      </div>
+      <div>{jointsHint}</div>
+    </div>
+  );
 }
