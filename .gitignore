@@ -21,3 +21,13 @@ Data/multiview_test_*.png
 # SAM3 / 反投影测试数据
 Data/SAM3_SegInfo/
 Data/mask.png
+# 远程调试脚本（含 SSH 密钥路径，不入库）
+scripts/_*.py
+scripts/dl_model.py
+scripts/fix_*.py
+scripts/test_*.py
+scripts/*.ps1
+
+# 临时调试输出
+console.txt
+repro.js
