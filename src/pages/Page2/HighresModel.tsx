@@ -136,6 +136,10 @@ export function HighresModel({ onStatusChange }: Props) {
   const [viewerUrl, setViewerUrl] = useState<string | null>(null);
   const [viewerLabel, setViewerLabel] = useState<string | null>(null);
 
+  // Resizable split: left panel width as percentage
+  const [splitPos, setSplitPos] = useState(58);
+  const splitContainerRef = useRef<HTMLDivElement>(null);
+
   // Track whether we've restored pipelines for the current open project.
   const loadedForProject = useRef<string | null>(null);
   const initialised = useRef(false);
@@ -191,6 +195,41 @@ export function HighresModel({ onStatusChange }: Props) {
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [addDropdownOpen]);
+
+  // Drag-to-resize splitter
+  useEffect(() => {
+    const container = splitContainerRef.current;
+    if (!container) return;
+
+    let dragging = false;
+
+    const onMouseDown = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.dataset.splitter) return;
+      dragging = true;
+      e.preventDefault();
+    };
+
+    const onMouseMove = (e: MouseEvent) => {
+      if (!dragging) return;
+      const rect = container.getBoundingClientRect();
+      const pct = ((e.clientX - rect.left) / rect.width) * 100;
+      setSplitPos(Math.max(20, Math.min(85, pct)));
+    };
+
+    const onMouseUp = () => {
+      dragging = false;
+    };
+
+    container.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    return () => {
+      container.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+  }, []);
 
   const updatePart = useCallback((id: string, next: PartPipelineState) => {
     setParts((prev) => prev.map((p) => (p.id === id ? next : p)));
@@ -420,6 +459,7 @@ export function HighresModel({ onStatusChange }: Props) {
 
       {/* Main split: pipelines on the left, 3D preview on the right */}
       <div
+        ref={splitContainerRef}
         style={{
           flex: 1,
           minHeight: 0,
@@ -429,12 +469,11 @@ export function HighresModel({ onStatusChange }: Props) {
       >
         <div
           style={{
-            flex: '0 0 58%',
-            minWidth: 420,
-            maxWidth: '62%',
+            width: `${splitPos}%`,
+            minWidth: 280,
+            maxWidth: '85%',
             overflow: 'auto',
             padding: '12px 12px 12px 16px',
-            borderRight: '1px solid var(--border-default)',
           }}
         >
           {parts.length === 0 && (
@@ -464,6 +503,35 @@ export function HighresModel({ onStatusChange }: Props) {
               onStatus={onStatusChange}
             />
           ))}
+        </div>
+
+        {/* Draggable splitter */}
+        <div
+          data-splitter="true"
+          style={{
+            width: 6,
+            marginLeft: -3,
+            marginRight: -3,
+            zIndex: 10,
+            cursor: 'col-resize',
+            background: 'transparent',
+            flexShrink: 0,
+            position: 'relative',
+          }}
+          title="拖拽调整面板宽度"
+        >
+          <div
+            style={{
+              position: 'absolute',
+              top: 0,
+              bottom: 0,
+              left: '50%',
+              width: 2,
+              transform: 'translateX(-50%)',
+              background: 'var(--border-default)',
+              transition: 'background 0.15s',
+            }}
+          />
         </div>
 
         <div style={{ flex: 1, minWidth: 0, minHeight: 0, position: 'relative' }}>
