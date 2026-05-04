@@ -6,8 +6,10 @@ interface NodeCardProps {
   title: string;
   state: NodeState;
   children: ReactNode;
-  /** Footer button area */
+  /** Footer button area (right-aligned) */
   actions?: ReactNode;
+  /** Footer left-side controls; appears left of actions in the same bar */
+  actionsLeft?: ReactNode;
   /** Optional header right-side controls (e.g. dropdown) */
   headerExtra?: ReactNode;
   width?: number | string;
@@ -43,6 +45,7 @@ export function NodeCard({
   state,
   children,
   actions,
+  actionsLeft,
   headerExtra,
   width = 'var(--node-width)',
   optional = false,
@@ -160,18 +163,20 @@ export function NodeCard({
           >
             {children}
           </div>
-          {actions && (
+          {(actions || actionsLeft) && (
             <div
               style={{
                 padding: '8px 10px',
                 borderTop: '1px solid var(--border-subtle)',
                 background: 'var(--bg-surface-2)',
                 display: 'flex',
+                alignItems: 'center',
                 gap: 6,
                 flexWrap: 'wrap',
                 justifyContent: 'flex-end',
               }}
             >
+              {actionsLeft && <div style={{ flex: 1, minWidth: 0 }}>{actionsLeft}</div>}
               {actions}
             </div>
           )}

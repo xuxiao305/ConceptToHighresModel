@@ -5,6 +5,12 @@ import { NodeCard } from '../../components/NodeCard';
 import { NodeConnector } from '../../components/NodeConnector';
 import { Button } from '../../components/Button';
 import { Placeholder } from '../../components/Placeholder';
+import {
+  MultiViewOverlay,
+  MultiViewOverlayControls,
+  DEFAULT_OVERLAY_STATE,
+  type MultiViewOverlayState,
+} from '../../components/MultiViewOverlay';
 import { ImagePreviewModal } from '../../components/ImagePreviewModal';
 import { GLBViewer } from '../../components/GLBViewer';
 import { GLBThumbnail } from '../../components/GLBThumbnail';
@@ -121,6 +127,11 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
   const [trellis2Params, setTrellis2Params] = useState<Trellis2Params>(loadTrellis2Params);
   // 仅当 backend === 'trellis2' 时显示参数面板
   const [showTrellis2Params, setShowTrellis2Params] = useState(false);
+
+  // Multi-View 节点的 overlay 显示开关（切分轮廓 / 关节 / 子图模式）
+  const [mvOverlayState, setMvOverlayState] = useState<MultiViewOverlayState>(
+    DEFAULT_OVERLAY_STATE,
+  );
 
   useEffect(() => {
     try { localStorage.setItem(ROUGH_BACKEND_LS_KEY, roughBackend); } catch { /* ignore */ }
@@ -556,6 +567,99 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       return null;
     }
   }, [onStatusChange, setNodeState, project, saveAsset, saveSegments, refreshHistory, savePage1Splits, savePage1Joints]);
+
+  // ---- 单独重检关节（在已有 multi-view 图上重跑 DWPose）--------------
+  const [redetecting, setRedetecting] = useState(false);
+  const redetectJoints = useCallback(async () => {
+    const mvBlob = outputsRef.current.multiviewUrl
+      ? await fetch(outputsRef.current.multiviewUrl).then((r) => r.blob())
+      : null;
+    const splits = project?.meta.page1?.splits;
+    if (!mvBlob || !splits) {
+      onStatusChange('重检关节：需要先有 Multi-View 图和切分数据', 'error');
+      return;
+    }
+    setRedetecting(true);
+    onStatusChange('重检关节：正在运行 DWPose…', 'info');
+    try {
+      const dataUrl = await blobToDataUrl(mvBlob);
+      const { joints: globalJoints } = await detectAndConvertToGlobalJoints(
+        dataUrl,
+        splits.source,
+        { includeHand: false, includeFace: false },
+      );
+      const perView = globalJointsToPage1Views(globalJoints, splits);
+      const jointsMeta: Page1JointsMeta = {
+        version: 1,
+        source: splits.source,
+        global: globalJoints,
+        views: perView,
+        generatedAt: new Date().toISOString(),
+      };
+      await savePage1Joints(jointsMeta);
+      onStatusChange(`关节重检完成：${globalJoints.keypoints.length} 个关键点`, 'success');
+    } catch (e) {
+      onStatusChange(`关节重检失败：${e instanceof Error ? e.message : String(e)}`, 'error');
+    } finally {
+      setRedetecting(false);
+    }
+  }, [onStatusChange, project, savePage1Joints]);
+
+  // ---- 导出 multi-view 4-in-1 图到用户选定路径 -------------------
+  const exportMultiView = useCallback(async () => {
+    const url = outputsRef.current.multiviewUrl;
+    if (!url) {
+      onStatusChange('没有可导出的 Multi-View 图', 'error');
+      return;
+    }
+    try {
+      const blob = await fetch(url).then((r) => r.blob());
+      const projectName = project?.meta.name ?? 'project';
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const defaultName = `${projectName}_multiview_${ts}.png`;
+
+      // 优先使用 File System Access API 弹出原生保存对话框
+      const w = window as unknown as {
+        showSaveFilePicker?: (opts?: {
+          suggestedName?: string;
+          types?: Array<{ description: string; accept: Record<string, string[]> }>;
+        }) => Promise<{
+          createWritable: () => Promise<{ write: (d: Blob) => Promise<void>; close: () => Promise<void> }>;
+        }>;
+      };
+      if (typeof w.showSaveFilePicker === 'function') {
+        try {
+          const handle = await w.showSaveFilePicker({
+            suggestedName: defaultName,
+            types: [{ description: 'PNG Image', accept: { 'image/png': ['.png'] } }],
+          });
+          const writable = await handle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+          onStatusChange(`已导出多视图`, 'success');
+          return;
+        } catch (e) {
+          // 用户取消（AbortError）不报错
+          if (e instanceof Error && e.name === 'AbortError') return;
+          // 其他错误退回 fallback
+          console.warn('[exportMultiView] showSaveFilePicker failed, fallback to <a download>:', e);
+        }
+      }
+
+      // Fallback：普通下载（会落到浏览器默认下载目录）
+      const a = document.createElement('a');
+      const objUrl = URL.createObjectURL(blob);
+      a.href = objUrl;
+      a.download = defaultName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(objUrl), 0);
+      onStatusChange(`已下载多视图到默认目录`, 'success');
+    } catch (e) {
+      onStatusChange(`导出多视图失败：${e instanceof Error ? e.message : String(e)}`, 'error');
+    }
+  }, [onStatusChange, project]);
 
   // ---- 3D Model node (Tripo / TRELLIS.2 image → GLB) ----------------
   const runRoughModel = useCallback(async (sourceUrl?: string): Promise<string | null> => {
@@ -1011,6 +1115,41 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
               <>
                 {node.id === 'rough' && state === 'complete' && outputs.roughUrl ? (
                   <GLBThumbnail url={outputs.roughUrl} height={160} />
+                ) : node.id === 'multiview' && state === 'complete' && imageUrl ? (
+                  <MultiViewOverlay
+                    // segmentDir 变更（重选历史 / 重新生成）时强制重挂载，
+                    // 让旧的子图 blob URL 通过 unmount 钩子被 revoke
+                    key={project?.meta.page1?.splits?.segmentDir ?? 'no-splits'}
+                    imageUrl={imageUrl}
+                    state={mvOverlayState}
+                    splits={project?.meta.page1?.splits ?? undefined}
+                    joints={project?.meta.page1?.joints ?? undefined}
+                    loadSubImages={
+                      project?.meta.page1?.splits
+                        ? async () => {
+                            const splits = project.meta.page1?.splits;
+                            if (!splits) return null;
+                            const baseName = splits.source.replace(/\.[^.]+$/, '');
+                            const seg = await loadLatestSegments(
+                              'page1.multiview',
+                              baseName,
+                            );
+                            if (!seg) return null;
+                            const out: Partial<Record<ViewName, string>> = {};
+                            (['front', 'left', 'back', 'right'] as ViewName[]).forEach(
+                              (v) => {
+                                const file = splits.views[v]?.file;
+                                if (!file) return;
+                                const blob = seg.files.get(file);
+                                if (blob) out[v] = URL.createObjectURL(blob);
+                              },
+                            );
+                            return out;
+                          }
+                        : undefined
+                    }
+                    height={160}
+                  />
                 ) : (
                   <Placeholder
                     type={node.display}
@@ -1037,27 +1176,14 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                     {errMsg}
                   </div>
                 )}
-                {!errMsg && node.description && (
-                  <div
-                    style={{
-                      marginTop: 6,
-                      fontSize: 11,
-                      color: 'var(--text-muted)',
-                      lineHeight: 1.4,
-                    }}
-                  >
-                    {node.id === 'rough'
-                      ? `后端：${BACKEND_LABEL[roughBackend]}`
-                      : node.description}
-                    {idx === 0 && outputs.conceptFile && (
-                      <div style={{ marginTop: 2, color: 'var(--text-secondary)' }}>
-                        {outputs.conceptFile.name}
-                      </div>
-                    )}
+                {idx === 0 && !errMsg && outputs.conceptFile && (
+                  <div style={{ marginTop: 4, fontSize: 10, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {outputs.conceptFile.name}
                   </div>
                 )}
-                {node.id === 'rough' && (
+                {node.id === 'rough' && roughBackend === 'trellis2' && (
                   <RoughBackendPanel
+                    hideSelect
                     backend={roughBackend}
                     onChangeBackend={setRoughBackend}
                     trellis2Params={trellis2Params}
@@ -1079,11 +1205,6 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                     }}
                     disabled={state === 'running'}
                   />
-                )}
-                {node.id === 'extraction' && (
-                  <div style={{ marginTop: 6, fontSize: 10, color: 'var(--text-muted)' }}>
-                    固定提示词：移除外套，补全 T 恤与手臂
-                  </div>
                 )}
               </>
             );
@@ -1112,7 +1233,61 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
               multiviewReady: !!outputs.multiviewUrl,
               roughReady: !!outputs.roughUrl,
               extractionReady: !!outputs.extractionUrl,
+              redetectJoints,
+              redetecting,
+              onExportMultiView: exportMultiView,
             });
+
+            // 节点自定义功能（放在 actions 栏左侧）
+            const actionsLeft: ReactNode = (() => {
+              const selStyle: CSSProperties = {
+                fontSize: 11,
+                padding: '2px 4px',
+                background: 'var(--bg-input, var(--bg-app))',
+                color: 'var(--text-primary)',
+                border: '1px solid var(--border-default)',
+                borderRadius: 3,
+              };
+              if (node.id === 'rough') {
+                return (
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                    onClick={(e) => e.stopPropagation()}
+                    onDoubleClick={(e) => { e.stopPropagation(); e.preventDefault(); }}
+                  >
+                    <select
+                      disabled={state === 'running'}
+                      value={roughBackend}
+                      onChange={(e) => setRoughBackend(e.target.value as RoughBackend)}
+                      style={selStyle}
+                    >
+                      <option value="tripo">Tripo (multi-view)</option>
+                      <option value="trellis2">TRELLIS.2 (single-view)</option>
+                    </select>
+                  </div>
+                );
+              }
+              if (node.id === 'multiview' && state === 'complete' && imageUrl) {
+                return (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}
+                    onClick={(e) => e.stopPropagation()}
+                    onDoubleClick={(e) => { e.stopPropagation(); e.preventDefault(); }}
+                  >
+                    <MultiViewOverlayControls
+                      inline
+                      state={mvOverlayState}
+                      onChange={setMvOverlayState}
+                      hasJoints={
+                        !!project?.meta.page1?.joints &&
+                        project.meta.page1.joints.global.keypoints.length > 0
+                      }
+                      canLoadSubImages={!!project?.meta.page1?.splits}
+                    />
+                  </div>
+                );
+              }
+              return null;
+            })();
 
             return (
               <div key={node.id} style={{ display: 'flex', alignItems: 'center' }}>
@@ -1120,6 +1295,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                   title={`${idx + 1}. ${node.title}`}
                   state={state}
                   actions={actions}
+                  actionsLeft={actionsLeft ?? undefined}
                   headerExtra={
                     <>
                       {/* Stage 1: Multi-View 节点显示"关节已检测"绿勾 */}
@@ -1240,6 +1416,125 @@ interface ActionHandlers {
   multiviewReady: boolean;
   roughReady: boolean;
   extractionReady: boolean;
+  /** 重检关节 */
+  redetectJoints: () => void;
+  redetecting: boolean;
+  /** 导出 multi-view 4-in-1 图到用户选定路径 */
+  onExportMultiView: () => void;
+}
+
+interface MultiViewMoreMenuProps {
+  exportEnabled: boolean;
+  onExport: () => void;
+  onRedetect: () => void;
+  redetecting: boolean;
+}
+
+/**
+ * "更多" 下拉菜单：合并"导出 MV"和"重检关节"两个低频操作。
+ * 使用 position: fixed 渲染菜单，避免被 NodeCard 的 overflow:hidden 裁剪。
+ */
+function MultiViewMoreMenu({
+  exportEnabled,
+  onExport,
+  onRedetect,
+  redetecting,
+}: MultiViewMoreMenuProps) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
+  const btnRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (btnRef.current && btnRef.current.contains(t)) return;
+      // 菜单本身有 data-more-menu 标记
+      let n: Node | null = t;
+      while (n) {
+        if (n instanceof HTMLElement && n.dataset.moreMenu === '1') return;
+        n = n.parentNode;
+      }
+      setOpen(false);
+    };
+    const onScroll = () => setOpen(false);
+    document.addEventListener('click', onDocClick);
+    window.addEventListener('scroll', onScroll, true);
+    window.addEventListener('resize', onScroll);
+    return () => {
+      document.removeEventListener('click', onDocClick);
+      window.removeEventListener('scroll', onScroll, true);
+      window.removeEventListener('resize', onScroll);
+    };
+  }, [open]);
+
+  const toggle = () => {
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    const el = btnRef.current;
+    if (el) {
+      const r = el.getBoundingClientRect();
+      setPos({ top: r.bottom + 4, right: window.innerWidth - r.right });
+    }
+    setOpen(true);
+  };
+
+  const itemStyle = (enabled: boolean): CSSProperties => ({
+    display: 'block',
+    width: '100%',
+    padding: '6px 10px',
+    fontSize: 12,
+    background: 'transparent',
+    color: enabled ? 'var(--text-primary)' : 'var(--text-muted)',
+    border: 'none',
+    borderRadius: 3,
+    cursor: enabled ? 'pointer' : 'not-allowed',
+    textAlign: 'left',
+  });
+
+  return (
+    <div ref={btnRef} style={{ display: 'inline-block' }}>
+      <Button size="sm" onClick={toggle} title="更多功能">
+        更多 ▾
+      </Button>
+      {open && pos && (
+        <div
+          data-more-menu="1"
+          style={{
+            position: 'fixed',
+            top: pos.top,
+            right: pos.right,
+            background: 'var(--bg-surface)',
+            border: '1px solid var(--border-default)',
+            borderRadius: 4,
+            boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+            zIndex: 9999,
+            minWidth: 130,
+            padding: 4,
+          }}
+        >
+          <button
+            type="button"
+            disabled={!exportEnabled}
+            onClick={() => { setOpen(false); onExport(); }}
+            style={itemStyle(exportEnabled)}
+          >
+            导出多视图
+          </button>
+          <button
+            type="button"
+            disabled={redetecting}
+            onClick={() => { setOpen(false); onRedetect(); }}
+            style={{ ...itemStyle(!redetecting), opacity: redetecting ? 0.5 : 1 }}
+          >
+            {redetecting ? '检测中…' : '重检关节'}
+          </button>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function renderActions(
@@ -1292,7 +1587,12 @@ function renderActions(
   if (node.id === 'multiview') {
     return (
       <>
-        <Button size="sm" disabled={!isComplete}>导出</Button>
+        <MultiViewMoreMenu
+          exportEnabled={isComplete}
+          onExport={h.onExportMultiView}
+          onRedetect={h.redetectJoints}
+          redetecting={h.redetecting}
+        />
         {isError ? (
           <Button variant="primary" size="sm" onClick={h.onRunMultiView}>重试</Button>
         ) : isRunning ? (
@@ -1395,6 +1695,8 @@ interface RoughBackendPanelProps {
   onToggleExpanded: () => void;
   onWarmup: () => void;
   disabled?: boolean;
+  /** 隐藏后端 select 行（select 已移入 actionsLeft 时使用） */
+  hideSelect?: boolean;
 }
 
 function RoughBackendPanel({
@@ -1406,6 +1708,7 @@ function RoughBackendPanel({
   onToggleExpanded,
   onWarmup,
   disabled,
+  hideSelect,
 }: RoughBackendPanelProps) {
   const labelStyle: CSSProperties = {
     fontSize: 10,
@@ -1467,18 +1770,20 @@ function RoughBackendPanel({
         fontSize: 11,
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <span style={labelStyle}>后端</span>
-        <select
-          disabled={disabled}
-          value={backend}
-          onChange={(e) => onChangeBackend(e.target.value as RoughBackend)}
-          style={{ ...inputStyle, padding: '2px' }}
-        >
-          <option value="tripo">Tripo (multi-view)</option>
-          <option value="trellis2">TRELLIS.2 (single-view)</option>
-        </select>
-      </div>
+      {!hideSelect && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={labelStyle}>后端</span>
+          <select
+            disabled={disabled}
+            value={backend}
+            onChange={(e) => onChangeBackend(e.target.value as RoughBackend)}
+            style={{ ...inputStyle, padding: '2px' }}
+          >
+            <option value="tripo">Tripo (multi-view)</option>
+            <option value="trellis2">TRELLIS.2 (single-view)</option>
+          </select>
+        </div>
+      )}
 
       {backend === 'trellis2' && (
         <>

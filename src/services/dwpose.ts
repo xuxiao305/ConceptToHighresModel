@@ -59,6 +59,10 @@ const COCO_TO_JOINT: Record<number, string> = {
   7: 'left_wrist',
   8: 'right_hip',
   11: 'left_hip',
+  9: 'right_knee',
+  12: 'left_knee',
+  10: 'right_ankle',
+  13: 'left_ankle',
 };
 
 // ── API call ────────────────────────────────────────────────────────────
