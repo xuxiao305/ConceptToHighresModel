@@ -99,17 +99,12 @@ export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryP
   const refreshRef = useRef(refresh);
   useEffect(() => { refreshRef.current = refresh; }, [refresh]);
 
-  // 响应外部变化：Page2 保存 pipelines / 标签页切回前台 / 窗口重新聚焦时重刷。
+  // 仅响应 Page2 显式保存 pipelines 的事件，避免 focus/visibility 变化触发重刷导致卡顿。
   useEffect(() => {
     const handler = () => { void refreshRef.current(); };
-    const onVisibility = () => { if (document.visibilityState === 'visible') void refreshRef.current(); };
     window.addEventListener('page2:pipelines-updated', handler);
-    window.addEventListener('focus', handler);
-    document.addEventListener('visibilitychange', onVisibility);
     return () => {
       window.removeEventListener('page2:pipelines-updated', handler);
-      window.removeEventListener('focus', handler);
-      document.removeEventListener('visibilitychange', onVisibility);
     };
   }, []);
 
