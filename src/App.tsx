@@ -5,22 +5,8 @@ import { StatusBar } from './components/StatusBar';
 import { ConceptToRoughModel } from './pages/Page1/ConceptToRoughModel';
 import { HighresModel } from './pages/Page2/HighresModel';
 import { ModelAssemble } from './pages/Page3/ModelAssemble';
-import { ModelAssembleMockup } from './pages/Page3/ModelAssembleMockup';
-import { ModelAssembleV2 } from './pages/Page3/ModelAssembleV2';
 
 type StatusType = 'info' | 'success' | 'warning' | 'error';
-
-// Page3 variant routing:
-//   ?v2     → Stage 6 V2 GUI scaffold (registry-driven sidebar)
-//   ?mockup → original visual-only mockup
-//   none    → production ModelAssemble (default)
-const PAGE3_VARIANT: 'v2' | 'mockup' | 'prod' = (() => {
-  if (typeof window === 'undefined') return 'prod';
-  const params = new URLSearchParams(window.location.search);
-  if (params.has('v2')) return 'v2';
-  if (params.has('mockup')) return 'mockup';
-  return 'prod';
-})();
 
 export default function App() {
   const [page, setPage] = useState<PageId>('page1');
@@ -58,11 +44,7 @@ export default function App() {
           <HighresModel onStatusChange={handleStatus} />
         </PageHost>
         <PageHost active={page === 'page3'}>
-          {PAGE3_VARIANT === 'v2'
-            ? <ModelAssembleV2 onStatusChange={handleStatus} />
-            : PAGE3_VARIANT === 'mockup'
-              ? <ModelAssembleMockup onStatusChange={handleStatus} />
-              : <ModelAssemble onStatusChange={handleStatus} />}
+          <ModelAssemble onStatusChange={handleStatus} />
         </PageHost>
       </div>
 
