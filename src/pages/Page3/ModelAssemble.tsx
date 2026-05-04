@@ -87,9 +87,11 @@ import {
   DualViewport,
   MeshViewer,
   loadGlbAsMesh,
+  exportMeshAsGlb,
   useLandmarkStore,
   buildMeshAdjacency,
   renderOrthoFrontViewWithCamera,
+  icpRefine,
   type Face3,
   type Vec3,
   type ViewMode,
@@ -169,7 +171,7 @@ interface MeshData {
 
 export function ModelAssemble(props: ModelAssembleProps) {
   const { onStatusChange } = props;
-  const { project, listHistory, loadLatest, loadPage3SegPack, loadPage3Session } = useProject();
+  const { project, listHistory, loadLatest, loadPage3SegPack, loadPage3Session, saveAsset } = useProject();
   // Stage 7/4: 订阅全局 landmark store（V1/V2 共享）。
   const srcLandmarks = useLandmarkStore((s) => s.srcLandmarks);
   const tarLandmarks = useLandmarkStore((s) => s.tarLandmarks);
@@ -217,6 +219,30 @@ export function ModelAssemble(props: ModelAssembleProps) {
   const [expandedReqs, setExpandedReqs] = useState<Set<AlignStrategyId>>(new Set());
   const [showLogs, setShowLogs] = useState(false);
   const [showQuality, setShowQuality] = useState(false);
+  // Stage 10: ICP refine params (manual + auto post-refine).
+  const [icpMaxIter, setIcpMaxIter] = useState(30);
+  const [icpRejectMul, setIcpRejectMul] = useState(2.5);
+  const [icpSampleCount, setIcpSampleCount] = useState(400);
+  // Stage 10: trace log of align runs.
+  type TraceEntry = {
+    id: number;
+    ts: string;
+    method: string;
+    rmse: number;
+    meanError: number;
+    pairsKept?: number;
+    iterations?: number;
+    ok: boolean;
+    note?: string;
+  };
+  const [traceLog, setTraceLog] = useState<TraceEntry[]>([]);
+  const traceIdRef = useRef(0);
+  const pushTrace = useCallback((e: Omit<TraceEntry, 'id' | 'ts'>) => {
+    setTraceLog((prev) => [
+      { id: ++traceIdRef.current, ts: new Date().toLocaleTimeString(), ...e },
+      ...prev,
+    ].slice(0, 20));
+  }, []);
 
   // Stage 7/2: 检测工程内是否已存在 source/target GLB（不实际 load blob）。
   //   source = page2.highres（高模，对齐起点）
@@ -397,6 +423,28 @@ export function ModelAssemble(props: ModelAssembleProps) {
     [updateTarLandmark],
   );
 
+  // Stage 10: hidden file inputs for Source/Target GLB import.
+  const srcFileInputRef = useRef<HTMLInputElement | null>(null);
+  const tarFileInputRef = useRef<HTMLInputElement | null>(null);
+  const importGlb = useCallback(
+    async (side: 'src' | 'tar', file: File) => {
+      if (!project) {
+        onStatusChange?.('未打开工程，无法保存到项目', 'error');
+        return;
+      }
+      try {
+        const nodeKey = side === 'src' ? 'page2.highres' : 'page1.rough';
+        await saveAsset(nodeKey, file, 'glb', `imported via Page3 V2 (${file.name})`, 'import');
+        onStatusChange?.(`${side === 'src' ? 'Source' : 'Target'} GLB 已导入：${file.name}`, 'success');
+        refreshAssets();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        onStatusChange?.(`GLB 导入失败：${msg}`, 'error');
+      }
+    },
+    [project, saveAsset, onStatusChange, refreshAssets],
+  );
+
   // Stage 8/3: Manual 策略 Run。其余 3 套 auto 策略运行仍在 V1。
   // 语义与 V1 handleRunAlign (line 2436-2484) 一致：
   //   - srcLandmark.length === tarLandmark.length
@@ -430,15 +478,17 @@ export function ModelAssemble(props: ModelAssembleProps) {
       setAlignResult(result);
       setCenterView('result');
       setResultView('overlay');
+      pushTrace({ method: 'manual-svd', rmse: result.rmse, meanError: result.meanError, ok: true });
       onStatusChange?.(`Manual SVD 对齐完成 RMSE=${result.rmse.toFixed(4)}`, 'success');
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setRunError(msg);
+      pushTrace({ method: 'manual-svd', rmse: 0, meanError: 0, ok: false, note: msg });
       onStatusChange?.(`Manual 对齐失败：${msg}`, 'error');
     } finally {
       setAligning(false);
     }
-  }, [srcMesh, srcLandmarks, tarLandmarks, srcLandmarkCount, tarLandmarkCount, onStatusChange]);
+  }, [srcMesh, srcLandmarks, tarLandmarks, srcLandmarkCount, tarLandmarkCount, onStatusChange, pushTrace]);
 
   // 接受对齐：把 alignResult.matrix4x4 应用到 srcMesh + srcLandmarks。
   // 与 V1 handleApplyAlignedTransform (line 3273-3296) 同语义。
@@ -459,6 +509,99 @@ export function ModelAssemble(props: ModelAssembleProps) {
     setRunError(null);
     setCenterView('landmark');
   }, []);
+
+  // Stage 10: ICP refinement on top of an existing alignResult. Restricts
+  // NN search to tarRegion when adopted (prevents partial-to-whole drift).
+  const handleRefineIcp = useCallback(() => {
+    if (!alignResult || !srcMesh || !tarMesh) {
+      setRunError('需先运行一次初步对齐');
+      return;
+    }
+    setRunError(null);
+    setAligning(true);
+    try {
+      const icp = icpRefine(srcMesh.vertices, tarMesh.vertices, alignResult.matrix4x4, {
+        maxIterations: icpMaxIter,
+        rejectMultiplier: icpRejectMul,
+        sampleCount: icpSampleCount,
+        tarRestrictVertices: tarRegion?.vertices,
+      });
+      // Apply refined matrix to source vertices for preview parity with AlignmentResult shape.
+      const transformed: Vec3[] = srcMesh.vertices.map((v) => {
+        const m = icp.matrix4x4;
+        return [
+          m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2] + m[0][3],
+          m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2] + m[1][3],
+          m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2] + m[2][3],
+        ];
+      });
+      const alignedSrcLm: Vec3[] = srcLandmarks.map((l) => {
+        const v = l.position;
+        const m = icp.matrix4x4;
+        return [
+          m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2] + m[0][3],
+          m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2] + m[1][3],
+          m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2] + m[2][3],
+        ];
+      });
+      const refined: AlignmentResult = {
+        ...alignResult,
+        matrix4x4: icp.matrix4x4,
+        transformedVertices: transformed,
+        alignedSrcLandmarks: alignedSrcLm,
+        rmse: icp.rmse,
+        // ICP doesn't recompute mean/max in our wrapper; reuse rmse as a coarse proxy.
+        meanError: icp.rmse,
+        maxError: icp.rmse,
+      };
+      setAlignResult(refined);
+      const lastIter = icp.iterations[icp.iterations.length - 1];
+      pushTrace({
+        method: 'icp-refine',
+        rmse: icp.rmse,
+        meanError: icp.rmse,
+        pairsKept: lastIter?.pairsKept,
+        iterations: icp.iterations.length,
+        ok: true,
+        note: icp.stopReason,
+      });
+      onStatusChange?.(`ICP 精化完成 RMSE=${icp.rmse.toFixed(4)} (${icp.iterations.length} iter, ${icp.stopReason})`, 'success');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setRunError(msg);
+      pushTrace({ method: 'icp-refine', rmse: 0, meanError: 0, ok: false, note: msg });
+      onStatusChange?.(`ICP 精化失败：${msg}`, 'error');
+    } finally {
+      setAligning(false);
+    }
+  }, [alignResult, srcMesh, tarMesh, tarRegion, srcLandmarks, icpMaxIter, icpRejectMul, icpSampleCount, onStatusChange, pushTrace]);
+
+  // Stage 10: export aligned source mesh as GLB into project (page3.aligned).
+  const handleExportAligned = useCallback(async () => {
+    if (!project) {
+      onStatusChange?.('未打开工程', 'error');
+      return;
+    }
+    if (!srcMesh) {
+      onStatusChange?.('Source mesh 未加载', 'error');
+      return;
+    }
+    // Prefer alignResult.transformedVertices if a result is pending; else
+    // export srcMesh as-is (caller may have already “Accepted” a transform
+    // which means srcMesh is already aligned).
+    const verts = alignResult?.transformedVertices ?? srcMesh.vertices;
+    try {
+      const blob = await exportMeshAsGlb(verts, srcMesh.faces);
+      const note = alignResult
+        ? `aligned (RMSE=${alignResult.rmse.toFixed(4)} mode=${alignResult.mode})`
+        : 'aligned (accepted)';
+      await saveAsset('page3.aligned', blob, 'glb', note, 'aligned');
+      onStatusChange?.(`对齐后的 Source GLB 已写入 page3.aligned`, 'success');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      onStatusChange?.(`导出失败：${msg}`, 'error');
+    }
+  }, [project, srcMesh, alignResult, saveAsset, onStatusChange]);
 
   // Stage 8/8: lazy adjacency for surface strategy. Only computed when
   // both meshes are loaded; result is memoised on identity.
@@ -543,6 +686,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
       setAlignResult(outcome.result);
       setCenterView('result');
       setResultView('overlay');
+      pushTrace({ method: outcome.method, rmse: outcome.result.rmse, meanError: outcome.result.meanError, ok: true });
       onStatusChange?.(
         `${id} 对齐完成 RMSE=${outcome.result.rmse.toFixed(4)} (${outcome.method})`,
         'success',
@@ -550,11 +694,12 @@ export function ModelAssemble(props: ModelAssembleProps) {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setRunError(msg);
+      pushTrace({ method: id, rmse: 0, meanError: 0, ok: false, note: msg });
       onStatusChange?.(`${id} 对齐失败：${msg}`, 'error');
     } finally {
       setAligning(false);
     }
-  }, [srcMesh, tarMesh, srcAdjacency, tarAdjacency, tarRegion, tarOrthoCamera, project, onStatusChange]);
+  }, [srcMesh, tarMesh, srcAdjacency, tarAdjacency, tarRegion, tarOrthoCamera, project, onStatusChange, pushTrace]);
 
   return (
     <div
@@ -607,16 +752,38 @@ export function ModelAssemble(props: ModelAssembleProps) {
       {/* 左侧：数据 / 区域 / 日志 */}
       <aside style={asideStyle('left')}>
         <PanelSection title="📦 模型输入">
+          <input
+            ref={srcFileInputRef}
+            type="file"
+            accept=".glb,model/gltf-binary"
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) void importGlb('src', f);
+              e.target.value = '';
+            }}
+          />
+          <input
+            ref={tarFileInputRef}
+            type="file"
+            accept=".glb,model/gltf-binary"
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) void importGlb('tar', f);
+              e.target.value = '';
+            }}
+          />
           <Row>
-            <Button size="sm">Source GLB</Button>
-            <Button size="sm">Target GLB</Button>
+            <Button size="sm" onClick={() => srcFileInputRef.current?.click()} disabled={!project}>Source GLB</Button>
+            <Button size="sm" onClick={() => tarFileInputRef.current?.click()} disabled={!project}>Target GLB</Button>
             <Button size="sm" onClick={refreshAssets} title="重新扫描工程内 GLB">↻</Button>
           </Row>
           <Hint>
             page2.highres: {sourceFileCount} 个 · page1.rough: {targetFileCount} 个
             {sourceFileCount === 0 && targetFileCount === 0 && '（工程内尚无 GLB）'}
           </Hint>
-          <Hint>Stage 7/2 · 仅检测存在性；实际加载等后续切片接入视口</Hint>
+          <Hint>导入后会以新版本写入对应 node，不覆盖历史</Hint>
         </PanelSection>
 
         <PanelSection title="🎯 目标区域 (必填)">
@@ -649,7 +816,34 @@ export function ModelAssemble(props: ModelAssembleProps) {
               )}
             </>
           ) : (
-            <Hint>page3_session.json 未生成（请在 V1 完成 2D 定位交互）</Hint>
+            <Hint>page3_session.json 未生成</Hint>
+          )}
+          <div style={{ marginTop: 8, fontSize: 11, fontWeight: 600, color: 'var(--text-primary)' }}>对齐运行记录</div>
+          {traceLog.length === 0 ? (
+            <Hint>还未运行任何对齐</Hint>
+          ) : (
+            <div style={{ maxHeight: 180, overflowY: 'auto', marginTop: 4 }}>
+              {traceLog.map((t) => (
+                <div
+                  key={t.id}
+                  style={{
+                    fontSize: 10,
+                    padding: '4px 6px',
+                    marginBottom: 3,
+                    borderLeft: `3px solid ${t.ok ? '#5cb85c' : '#d9534f'}`,
+                    background: 'var(--bg-app)',
+                    color: 'var(--text-primary)',
+                    fontFamily: 'monospace',
+                  }}
+                >
+                  <div>{t.ts} · <strong>{t.method}</strong> · {t.ok ? `RMSE=${t.rmse.toFixed(4)}` : 'FAIL'}</div>
+                  {t.iterations !== undefined && (
+                    <div style={{ color: 'var(--text-muted)' }}>iter={t.iterations} pairs={t.pairsKept ?? '–'}</div>
+                  )}
+                  {t.note && <div style={{ color: 'var(--text-muted)' }}>{t.note}</div>}
+                </div>
+              ))}
+            </div>
           )}
         </PanelSection>
       </aside>
@@ -814,15 +1008,26 @@ export function ModelAssemble(props: ModelAssembleProps) {
                 loading={aligning}
                 title={canRunManual ? '' : `需 srcMesh + 至少 3 对 landmark（当前 src=${srcLandmarkCount} tar=${tarLandmarkCount}）`}
               >
-                ▶ 运行 Manual SVD
+                ▶ Manual SVD
               </Button>
               <Button
                 size="sm"
                 style={{ flex: 1, justifyContent: 'center' }}
+                onClick={handleRefineIcp}
+                disabled={!alignResult || !tarMesh || aligning}
+                loading={aligning}
+                title={alignResult ? 'ICP 精化当前变换' : '先跑一次 SVD'}
+              >
+                🔄 ICP
+              </Button>
+              <Button
+                size="sm"
+                style={{ justifyContent: 'center' }}
                 onClick={handleAcceptAlign}
                 disabled={!alignResult}
+                title="接受并应用变换到 src mesh"
               >
-                ✓ 接受
+                ✓
               </Button>
               <Button
                 size="sm"
@@ -849,10 +1054,20 @@ export function ModelAssemble(props: ModelAssembleProps) {
               <Button
                 size="sm"
                 style={{ flex: 1, justifyContent: 'center' }}
+                onClick={handleRefineIcp}
+                disabled={!alignResult || !tarMesh || aligning}
+                loading={aligning}
+                title={alignResult ? 'ICP 精化' : '先跑一次一键对齐'}
+              >
+                🔄 ICP
+              </Button>
+              <Button
+                size="sm"
+                style={{ justifyContent: 'center' }}
                 onClick={handleAcceptAlign}
                 disabled={!alignResult}
               >
-                ✓ 接受
+                ✓
               </Button>
               <Button
                 size="sm"
@@ -886,6 +1101,29 @@ export function ModelAssemble(props: ModelAssembleProps) {
             onAdoptRegion={handleAdoptRegion}
             onStatus={onStatusChange}
           />
+        </PanelSection>
+
+        <PanelSection title="⚙️ ICP 参数">
+          <NumberRow label="max iter" value={icpMaxIter} min={1} max={200} step={1} onChange={setIcpMaxIter} />
+          <NumberRow label="reject × median" value={icpRejectMul} min={0.5} max={10} step={0.1} onChange={setIcpRejectMul} />
+          <NumberRow label="sample count" value={icpSampleCount} min={50} max={5000} step={50} onChange={setIcpSampleCount} />
+          <Hint>限制范围：SAM3 适采的 region（避免 partial-to-whole 漂移）</Hint>
+        </PanelSection>
+
+        <PanelSection title="💾 导出">
+          <Button
+            size="sm"
+            variant="primary"
+            style={{ width: '100%', justifyContent: 'center' }}
+            onClick={handleExportAligned}
+            disabled={!project || !srcMesh}
+            title={!project ? '未打开工程' : !srcMesh ? 'src mesh 未加载' : '写入 page3.aligned'}
+          >
+            导出对齐后 Source GLB
+          </Button>
+          <Hint>
+            如果有待接受的变换，会导出应用后的 mesh；否则导出当前 srcMesh。
+          </Hint>
         </PanelSection>
 
         <PanelSection title="🎯 对齐模式">
@@ -1275,6 +1513,48 @@ function PanelSection({
 
 function Row({ children }: { children: ReactNode }) {
   return <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>{children}</div>;
+}
+
+function NumberRow({
+  label,
+  value,
+  min,
+  max,
+  step,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4, fontSize: 11 }}>
+      <span style={{ flex: 1, color: 'var(--text-muted)' }}>{label}</span>
+      <input
+        type="number"
+        value={value}
+        min={min}
+        max={max}
+        step={step}
+        onChange={(e) => {
+          const n = Number(e.target.value);
+          if (Number.isFinite(n)) onChange(Math.min(max, Math.max(min, n)));
+        }}
+        style={{
+          width: 72,
+          fontSize: 11,
+          background: 'var(--bg-app)',
+          color: 'var(--text-primary)',
+          border: '1px solid var(--border-default)',
+          borderRadius: 3,
+          padding: '2px 4px',
+        }}
+      />
+    </div>
+  );
 }
 
 function Hint({ children, style }: { children: ReactNode; style?: CSSProperties }) {

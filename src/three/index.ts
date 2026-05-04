@@ -23,6 +23,7 @@ export { useLandmarkStore } from './landmarkStore';
 export { useCameraSyncStore } from './cameraSyncStore';
 
 export { loadGlbAsMesh, loadGlb, extractMeshFromScene } from './glbLoader';
+export { exportMeshAsGlb } from './glbExporter';
 
 export { buildMeshAdjacency } from './meshAdjacency';
 export { growRegion, regionPositions } from './regionGrow';
