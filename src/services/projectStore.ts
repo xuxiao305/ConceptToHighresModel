@@ -631,6 +631,72 @@ export async function loadLatestPage3SegPack(
 
 
 // ---------------------------------------------------------------------------
+// Page3 会话快照（Stage 7/6a）
+// ---------------------------------------------------------------------------
+//
+// 记录 Page3 对齐会话中的轻量 state：V1 交互进展到哪一步。
+// 主要供 V2 接通进度状态条使用，不存重型运行时数据（如 maskReproj
+// 的 per-vertex map）。全局唯一份（同一工程内覆盖写），写在工程根。
+
+export interface Page3Session {
+  /** 正交相机是否已装载（宽度/高度作为凭证） */
+  orthoCamera?: {
+    width: number;
+    height: number;
+  };
+  /** 反投影是否完成。仅记录完成事实 + 区域数，不存 vertex map。 */
+  maskReprojection?: {
+    completedAt: string;
+    regionCount: number;
+  };
+  /** 用户选中的目标区域标签。 */
+  targetRegionLabel?: string;
+  /** 最后更新时间（诊断用）。 */
+  updatedAt: string;
+}
+
+async function readPage3Session(handle: ProjectHandle): Promise<Page3Session | null> {
+  return await tryReadJson<Page3Session>(handle.root, 'page3_session.json');
+}
+
+/**
+ * 合并写 Page3 会话快照（partial update）。
+ * - 传 patch 里为 undefined 的字段不动；null 表示明确清除。
+ */
+export async function updatePage3Session(
+  handle: ProjectHandle,
+  patch: Partial<{
+    orthoCamera: Page3Session['orthoCamera'] | null;
+    maskReprojection: Page3Session['maskReprojection'] | null;
+    targetRegionLabel: string | null;
+  }>,
+): Promise<Page3Session> {
+  const current = (await readPage3Session(handle)) ?? { updatedAt: new Date().toISOString() };
+  const next: Page3Session = { ...current, updatedAt: new Date().toISOString() };
+  if (patch.orthoCamera !== undefined) {
+    if (patch.orthoCamera === null) delete next.orthoCamera;
+    else next.orthoCamera = patch.orthoCamera;
+  }
+  if (patch.maskReprojection !== undefined) {
+    if (patch.maskReprojection === null) delete next.maskReprojection;
+    else next.maskReprojection = patch.maskReprojection;
+  }
+  if (patch.targetRegionLabel !== undefined) {
+    if (patch.targetRegionLabel === null) delete next.targetRegionLabel;
+    else next.targetRegionLabel = patch.targetRegionLabel;
+  }
+  await writeFile(handle.root, 'page3_session.json', JSON.stringify(next, null, 2));
+  await touchProject(handle);
+  return next;
+}
+
+/** 读取当前会话快照（不存在返 null）。 */
+export async function loadPage3Session(handle: ProjectHandle): Promise<Page3Session | null> {
+  return await readPage3Session(handle);
+}
+
+
+// ---------------------------------------------------------------------------
 // Page2 Pipeline 配置持久化
 // ---------------------------------------------------------------------------
 

@@ -593,7 +593,7 @@ function makeDemoTarget(source: MeshData): MeshData {
 }
 
 export function ModelAssemble({ onStatusChange }: Props) {
-  const { project, listHistory, loadByName, loadLatest, loadPipelines, savePage3SegPack } = useProject();
+  const { project, listHistory, loadByName, loadLatest, loadPipelines, savePage3SegPack, updatePage3Session } = useProject();
   const demoTarget = useMemo(() => makeDemoTarget(DEMO_SOURCE), []);
 
   const [srcMesh, setSrcMesh] = useState<MeshData>(DEMO_SOURCE);
@@ -1454,6 +1454,12 @@ export function ModelAssemble({ onStatusChange }: Props) {
       setMaskReproj(null);
       setTarRegion(null);
       setTarRegionLabel(null);
+      // Stage 7/6a: persist session snapshot → V2 progress bar can read.
+      void updatePage3Session({
+        orthoCamera: { width: camera.width, height: camera.height },
+        maskReprojection: null,
+        targetRegionLabel: null,
+      });
       appendAlignmentTrace('render-ortho', {
         useAuto,
         refImageSize,
@@ -1490,7 +1496,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         'error',
       );
     }
-  }, [refImageSize, localizationSpace, tarMesh, autoFit, localizationFitBBox, fitBBox, renderFitBBox, isSegFormerSegPack, subjectFitBBox, segPack, orthoScale, orthoOffsetX, orthoOffsetY, onStatusChange]);
+  }, [refImageSize, localizationSpace, tarMesh, autoFit, localizationFitBBox, fitBBox, renderFitBBox, isSegFormerSegPack, subjectFitBBox, segPack, orthoScale, orthoOffsetX, orthoOffsetY, updatePage3Session, onStatusChange]);
 
   // Reproject the SAM3 mask onto Target mesh vertices using the camera
   // captured from the most recent ortho render. Output: per-region
@@ -1527,6 +1533,14 @@ export function ModelAssemble({ onStatusChange }: Props) {
       setMaskReproj(result);
       setTarRegion(null);
       setTarRegionLabel(null);
+      // Stage 7/6a: persist completion fact (no per-vertex payload).
+      void updatePage3Session({
+        maskReprojection: {
+          completedAt: new Date().toISOString(),
+          regionCount: result.regions.size,
+        },
+        targetRegionLabel: null,
+      });
       appendAlignmentTrace('manual-reproject-mask', {
         camera: summarizeCamera(orthoCamera),
         mask: maskImageName,
@@ -1548,7 +1562,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         'error',
       );
     }
-  }, [orthoCamera, segPack, maskImageUrl, tarMesh, onStatusChange]);
+  }, [orthoCamera, segPack, maskImageUrl, tarMesh, updatePage3Session, onStatusChange]);
 
   // Adopt a reprojected SAM3 region as the partial-match Target seed.
   // Builds a synthetic MeshRegion (centroid + bounding radius) so the
@@ -1604,6 +1618,8 @@ export function ModelAssemble({ onStatusChange }: Props) {
       if (!region) return;
       setTarRegion(region);
       setTarRegionLabel(label);
+      // Stage 7/6a: persist target-region label → V2 progress bar.
+      void updatePage3Session({ targetRegionLabel: label });
       setSelectedTargetRegionLabel(label);
       setTargetRegionSelectionMode('manual');
       appendAlignmentTrace('adopt-target-region', {
@@ -1615,7 +1631,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         'success',
       );
     },
-    [maskReproj, buildTarRegionFromSet, onStatusChange],
+    [maskReproj, buildTarRegionFromSet, updatePage3Session, onStatusChange],
   );
 
   // Keep the semantic Target seed derived from the active SAM3 region,

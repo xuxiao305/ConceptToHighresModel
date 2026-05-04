@@ -34,12 +34,22 @@
  *     通 mesh 视口是更后面的切片）。
  *   - 进度：3/9。
  *
+ * Stage 7/6 切片（2026-05-04）：达成 9/9。
+ *   - 会话快照 page3_session.json（V1 在 setOrthoCamera/setMaskReproj/
+ *     setTarRegion 成功点写入）。V2 只读快照推导进度状态条，
+ *     不重复运行 2D 定位管线。
+ *   - hasOrthoCamera = !!session.orthoCamera
+ *   - hasMaskReprojection = !!session.maskReprojection
+ *   - hasTargetRegion = !!session.targetRegionLabel
+ *   - 不存购重 payload（per-vertex map）—— V2 进度条只需事实。
+ *
  * 边界：
  *   - 不重新实现任何对齐算法；策略 run 仍由现存 ModelAssemble 持有。
  */
 import { useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react';
 import { Button } from '../../components/Button';
 import { useProject } from '../../contexts/ProjectContext';
+import type { Page3Session } from '../../services/projectStore';
 import { parseSegmentationJson } from '../../services/segmentationPack';
 import { useLandmarkStore } from '../../three';
 import {
@@ -58,23 +68,11 @@ interface ModelAssembleV2Props {
 }
 
 /**
- * Stub 定义：仅剩 3 个真 transient 字段。
- *
- * TODO 为与交互强绑定的 state，需用户在 V1 跳走 2D 定位流程后产生：
- *   - hasTargetRegion               : SAM3 region selector 点选后产生
- *   - hasMaskReprojection           : 反投影结果
- *   - hasOrthoCamera                : 正交相机装载后产生
+ * Stage 7/6）：STUB_FALLBACK 已清空，所有 9 字段都从真实数据推导。
  */
-const STUB_FALLBACK: Pick<
-  AlignStrategyContext,
-  'hasTargetRegion' | 'hasMaskReprojection' | 'hasOrthoCamera'
-> = {
-  hasTargetRegion: true,
-  hasMaskReprojection: true,
-  hasOrthoCamera: true,
-};
+const STUB_FALLBACK = {} as const;
 
-/** Stage 7/1、7/2、7/3c、7/4、7/5: 实时接通的字段名单。 */
+/** Stage 7/1、7/2、7/3c、7/4、7/5、7/6: 实时接通的字段名单（9/9）。 */
 const REAL_FIELDS: ReadonlyArray<keyof AlignStrategyContext> = [
   'hasPoseProxyJoints',
   'hasSource',
@@ -84,8 +82,11 @@ const REAL_FIELDS: ReadonlyArray<keyof AlignStrategyContext> = [
   'hasAdjacency',
   'srcLandmarkCount',
   'tarLandmarkCount',
+  'hasOrthoCamera',
+  'hasMaskReprojection',
+  'hasTargetRegion',
 ];
-const TOTAL_FIELDS = 9;
+const TOTAL_FIELDS = 11;
 
 /** 与生产 ModelAssemble.findMaskRegion 同一组词汇（line 431-432）。 */
 const BODY_TORSO_LABELS = ['body', 'torso', 'jacket', 'coat'];
@@ -114,7 +115,7 @@ const READINESS_LABEL: Record<StrategyReadiness, string> = {
 };
 
 export function ModelAssembleV2(_props: ModelAssembleV2Props) {
-  const { project, listHistory, loadPage3SegPack } = useProject();
+  const { project, listHistory, loadPage3SegPack, loadPage3Session } = useProject();
   // Stage 7/4: 订阅全局 landmark store（V1/V2 共享）。
   const srcLandmarkCount = useLandmarkStore((s) => s.srcLandmarks.length);
   const tarLandmarkCount = useLandmarkStore((s) => s.tarLandmarks.length);
@@ -133,22 +134,27 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
   const [segPackDirName, setSegPackDirName] = useState<string | null>(null);
   // Stage 7/5: SegPack 里是否有 body/torso 标签。
   const [segPackRegionLabels, setSegPackRegionLabels] = useState<string[]>([]);
+  // Stage 7/6: 会话快照。
+  const [session, setSession] = useState<Page3Session | null>(null);
   const refreshAssets = useCallback(() => {
     if (!project) {
       setSourceFileCount(0);
       setTargetFileCount(0);
       setSegPackDirName(null);
       setSegPackRegionLabels([]);
+      setSession(null);
       return;
     }
     void Promise.all([
       listHistory('page2.highres'),
       listHistory('page1.rough'),
       loadPage3SegPack(),
-    ]).then(async ([src, tar, segpack]) => {
+      loadPage3Session(),
+    ]).then(async ([src, tar, segpack, sess]) => {
       setSourceFileCount(src.length);
       setTargetFileCount(tar.length);
       setSegPackDirName(segpack?.dirName ?? null);
+      setSession(sess);
       // Stage 7/5: 只解析 json（快），不加载 mask。
       if (segpack?.jsonBlob) {
         try {
@@ -163,13 +169,13 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
         setSegPackRegionLabels([]);
       }
     });
-  }, [project, listHistory, loadPage3SegPack]);
+  }, [project, listHistory, loadPage3SegPack, loadPage3Session]);
   // Effect 只在 project 变化时跑；在其他页面落盘后的新资产需手动 ↻ 按钮。
   useEffect(() => {
     refreshAssets();
   }, [refreshAssets]);
 
-  // Stage 7/1+7/2+7/3c+7/4+7/5: 逐个接通。
+  // Stage 7/1+7/2+7/3c+7/4+7/5+7/6: 9/9 全部接通。
   const ctx: AlignStrategyContext = useMemo(() => {
     const front = project?.meta.page1?.joints?.views.front?.joints;
     const hasSource = sourceFileCount > 0;
@@ -185,6 +191,10 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
       hasAdjacency: hasSource && hasTarget,
       srcLandmarkCount,
       tarLandmarkCount,
+      // Stage 7/6: 从 V1 会话快照推导。
+      hasOrthoCamera: !!session?.orthoCamera,
+      hasMaskReprojection: !!session?.maskReprojection,
+      hasTargetRegion: !!session?.targetRegionLabel,
     };
   }, [
     project?.meta.page1?.joints,
@@ -194,6 +204,7 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
     segPackRegionLabels,
     srcLandmarkCount,
     tarLandmarkCount,
+    session,
   ]);
 
   const selectedStrategy = useMemo(
@@ -288,7 +299,22 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
           collapsed={!showLogs}
           onToggle={() => setShowLogs((v) => !v)}
         >
-          <Hint>alignmentTrace 待接入</Hint>
+          {session ? (
+            <>
+              <Hint>page3_session.updatedAt: {session.updatedAt}</Hint>
+              {session.orthoCamera && (
+                <Hint>orthoCamera: {session.orthoCamera.width}×{session.orthoCamera.height}</Hint>
+              )}
+              {session.maskReprojection && (
+                <Hint>maskReprojection: {session.maskReprojection.regionCount} regions @ {session.maskReprojection.completedAt}</Hint>
+              )}
+              {session.targetRegionLabel && (
+                <Hint>targetRegion: {session.targetRegionLabel}</Hint>
+              )}
+            </>
+          ) : (
+            <Hint>page3_session.json 未生成（请在 V1 完成 2D 定位交互）</Hint>
+          )}
         </PanelSection>
       </aside>
 
@@ -711,7 +737,7 @@ function DataSourceStatusBar({ project }: { project: ReturnType<typeof useProjec
       <div>{jointsHint}</div>
       {realCount < TOTAL_FIELDS && (
         <div style={{ marginTop: 4, opacity: 0.8 }}>
-          剩余 stub：hasTargetRegion / hasMaskReprojection / hasOrthoCamera（需 V1 完成 2D 定位后产生）
+          剩余字段未接通（该提示不应出现）
         </div>
       )}
     </div>
