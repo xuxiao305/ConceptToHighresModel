@@ -15,6 +15,7 @@ import {
   loadLatestNodeAsset,
   loadLatestSegmentSet,
   loadLatestPage3SegPack,
+  loadLatestPage1SegPack,
   loadPage3Session,
   loadNodeAssetByName,
   loadPipelines,
@@ -22,6 +23,7 @@ import {
   renameProject as renameProjectApi,
   saveNodeAsset,
   savePage3SegPack,
+  savePage1SegPack,
   updatePage3Session,
   savePage1Joints,
   savePage1Splits,
@@ -36,6 +38,7 @@ import {
   type SegmentSetHandle,
   type SegmentSetIndex,
   type Page3Session,
+  type Page1SegPackSlot,
 } from '../services/projectStore';
 import type { Page1JointsMeta, Page1SplitsMeta } from '../types/joints';
 
@@ -111,6 +114,23 @@ interface ProjectContextValue {
 
   /** Stage 7/3a: 读取工程内最新一份 SegPack（原始 json + mask png）。 */
   loadPage3SegPack: () => Promise<
+    | { jsonBlob: Blob; maskBlob: Blob; maskName: string; source: string; dirName: string }
+    | null
+  >;
+
+  /** PR2: Page1 SegPack（clothed/nojacket 两个旁支节点）持久化到工程目录。 */
+  savePage1SegPack: (
+    slot: Page1SegPackSlot,
+    jsonBlob: Blob,
+    maskBlob: Blob,
+    maskName: string,
+    source: string,
+  ) => Promise<SegmentSetHandle | null>;
+
+  /** PR2: 读取工程内最新一份 Page1 SegPack（按 slot）。 */
+  loadPage1SegPack: (
+    slot: Page1SegPackSlot,
+  ) => Promise<
     | { jsonBlob: Blob; maskBlob: Blob; maskName: string; source: string; dirName: string }
     | null
   >;
@@ -285,6 +305,28 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     return await loadLatestPage3SegPack(project);
   }, [project]);
 
+  const savePage1SegPackCb = useCallback(
+    async (
+      slot: Page1SegPackSlot,
+      jsonBlob: Blob,
+      maskBlob: Blob,
+      maskName: string,
+      source: string,
+    ) => {
+      if (!project) return null;
+      return await savePage1SegPack(project, slot, jsonBlob, maskBlob, maskName, source);
+    },
+    [project],
+  );
+
+  const loadPage1SegPackCb = useCallback(
+    async (slot: Page1SegPackSlot) => {
+      if (!project) return null;
+      return await loadLatestPage1SegPack(project, slot);
+    },
+    [project],
+  );
+
   const updatePage3SessionCb = useCallback(
     async (
       patch: Partial<{
@@ -325,10 +367,12 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       savePage1Joints: savePage1JointsCb,
       savePage3SegPack: savePage3SegPackCb,
       loadPage3SegPack: loadPage3SegPackCb,
+      savePage1SegPack: savePage1SegPackCb,
+      loadPage1SegPack: loadPage1SegPackCb,
       updatePage3Session: updatePage3SessionCb,
       loadPage3Session: loadPage3SessionCb,
     }),
-    [project, supported, newOrOpenProject, closeProject, tryReopenLast, rename, setAbsolutePath, saveAsset, loadLatest, listHistory, loadByName, saveSegments, loadLatestSegments, savePipelinesCb, loadPipelinesCb, savePage1SplitsCb, savePage1JointsCb, savePage3SegPackCb, loadPage3SegPackCb, updatePage3SessionCb, loadPage3SessionCb]
+    [project, supported, newOrOpenProject, closeProject, tryReopenLast, rename, setAbsolutePath, saveAsset, loadLatest, listHistory, loadByName, saveSegments, loadLatestSegments, savePipelinesCb, loadPipelinesCb, savePage1SplitsCb, savePage1JointsCb, savePage3SegPackCb, loadPage3SegPackCb, savePage1SegPackCb, loadPage1SegPackCb, updatePage3SessionCb, loadPage3SessionCb]
   );
 
   return <ProjectContext.Provider value={value}>{children}</ProjectContext.Provider>;

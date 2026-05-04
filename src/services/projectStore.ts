@@ -63,6 +63,11 @@ export const NODE_DIRS: Record<string, NodeDir> = {
   'page1.rough':     { pageDir: 'page1_concept_to_rough', nodeDir: '04_rough' },
   'page1.rigging':   { pageDir: 'page1_concept_to_rough', nodeDir: '05_rigging' },
   'page1.extraction': { pageDir: 'page1_concept_to_rough', nodeDir: '06_extraction' },
+  // Page 1 SegPack 旁支（PR 1：clothed；PR 2 会再加 nojacket）
+  'page1.segpack.clothed':  { pageDir: 'page1_concept_to_rough', nodeDir: '07_segpack_clothed' },
+  'page1.segpack.nojacket': { pageDir: 'page1_concept_to_rough', nodeDir: '08_segpack_nojacket' },
+  // Page 1 NoJacket 3D 模型旁支
+  'page1.rough.nojacket':   { pageDir: 'page1_concept_to_rough', nodeDir: '09_rough_nojacket' },
   // Page 2
   'page2.imageInput': { pageDir: 'page2_highres', nodeDir: '00_image_input' },
   'page2.extraction': { pageDir: 'page2_highres', nodeDir: '01_extraction' },
@@ -597,6 +602,68 @@ export async function savePage3SegPack(
     { name: maskName, blob: maskBlob },
   ]);
 }
+
+// ---------------------------------------------------------------------------
+// Page1 SegPack 持久化（PR2：clothed / nojacket 两个旁支）
+// ---------------------------------------------------------------------------
+//
+// Page1 引入了两个旁支节点，分别针对 T-Pose（带外套）和 Remove Jacket
+// （去外套）的 SAM3 多区域分割包。Page3 对齐时会按身体侧（source/target）
+// 选择其中一份。复用 saveSegmentSet 多文件子目录机制，同 Page3 保存格式。
+
+export type Page1SegPackSlot = 'clothed' | 'nojacket';
+
+function page1SegPackKey(slot: Page1SegPackSlot): string {
+  return slot === 'clothed' ? 'page1.segpack.clothed' : 'page1.segpack.nojacket';
+}
+
+/**
+ * 保存一对 Page1 SegPack 文件（slot = clothed | nojacket）。
+ * 入参与 savePage3SegPack 完全一致，仅多了 slot 选择。
+ */
+export async function savePage1SegPack(
+  handle: ProjectHandle,
+  slot: Page1SegPackSlot,
+  jsonBlob: Blob,
+  maskBlob: Blob,
+  maskName: string,
+  source: string,
+): Promise<SegmentSetHandle> {
+  const baseName = `segpack_${makeTimestamp()}`;
+  return await saveSegmentSet(handle, page1SegPackKey(slot), baseName, source, [
+    { name: 'segmentation.json', blob: jsonBlob },
+    { name: maskName, blob: maskBlob },
+  ]);
+}
+
+/** 读取工程内最新一份 Page1 SegPack（按 slot）；返回 null 表示尚未生成。 */
+export async function loadLatestPage1SegPack(
+  handle: ProjectHandle,
+  slot: Page1SegPackSlot,
+): Promise<{
+  jsonBlob: Blob;
+  maskBlob: Blob;
+  maskName: string;
+  source: string;
+  dirName: string;
+} | null> {
+  const result = await loadLatestSegmentSet(handle, page1SegPackKey(slot));
+  if (!result) return null;
+  const jsonBlob = result.files.get('segmentation.json');
+  if (!jsonBlob) return null;
+  const maskEntry = result.index.entries.find((e) => e.file !== 'segmentation.json');
+  if (!maskEntry) return null;
+  const maskBlob = result.files.get(maskEntry.file);
+  if (!maskBlob) return null;
+  return {
+    jsonBlob,
+    maskBlob,
+    maskName: maskEntry.file,
+    source: result.index.source,
+    dirName: result.dirName,
+  };
+}
+
 
 /**
  * 读取工程内最新保存的 SegPack。返回 原始 json blob + mask blob + mask

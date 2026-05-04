@@ -14,6 +14,8 @@ import {
 import { ImagePreviewModal } from '../../components/ImagePreviewModal';
 import { GLBViewer } from '../../components/GLBViewer';
 import { GLBThumbnail } from '../../components/GLBThumbnail';
+import { SegPackOverlay } from '../../components/SegPackOverlay';
+import { parseSegmentationJson, type SegmentationPack } from '../../services/segmentationPack';
 import { runConceptToTPose, runTPoseMultiView } from '../../services/workflows';
 import { runImageToModel, runMultiViewToModel, TripoServiceError } from '../../services/tripo';
 import {
@@ -25,7 +27,7 @@ import {
 import { splitMultiView } from '../../services/multiviewSplit';
 import { detectAndConvertToGlobalJoints, globalJointsToPage1Views } from '../../services/dwpose';
 import type { Page1JointsMeta, Page1SplitsMeta, ViewName } from '../../types/joints';
-import { extractWithPrompt, REMOVE_JACKET_PROMPT } from '../../services/extraction';
+import { extractWithPrompt, REMOVE_JACKET_PROMPT, type SAM3ExportJson } from '../../services/extraction';
 import { useProject } from '../../contexts/ProjectContext';
 import type { AssetVersion } from '../../services/projectStore';
 
@@ -35,8 +37,12 @@ const NODES: NodeConfig[] = [
   { id: 'multiview', title: 'Multi-View', display: 'multiview', description: '生成多角度视图' },
   { id: 'rough', title: '3D Model', display: '3d', description: 'Tripo / TRELLIS.2 生成 3D 模型 (GLB)' },
   { id: 'rigging', title: '3D Model Rigging', display: '3d', description: '骨骼绑定' },
-  // 独立节点，与上游不走连线（输入从 Multi-View 读，输出单独供 Page 2 使用）
+  // 独立旁支节点（输入从 T-Pose 读）：SAM3 多区域分割包（带外套），供 Page 3 对齐使用
+  { id: 'segpackClothed', title: 'SegPack (Clothed)', display: 'image', description: '基于 T-Pose 用 SAM3 生成多区域分割包' },
+  // 以下 3 个为 NoJacket 旁支：Remove Jacket → SegPack(NoJacket) → 3D Model(NoJacket)
   { id: 'extraction', title: 'Remove Jacket', display: 'image', description: '基于 Multi-View，使用 Banana Pro 移除外套' },
+  { id: 'segpackNojacket', title: 'SegPack (NoJacket)', display: 'image', description: '基于 Remove Jacket 用 SAM3 生成多区域分割包' },
+  { id: 'roughNojacket', title: '3D Model (NoJacket)', display: '3d', description: '基于 Remove Jacket 4 视图生成去外套版 3D 模型 (GLB)' },
 ];
 
 /** 节点索引 → projectStore 中的 nodeKey（用于历史读写） */
@@ -46,7 +52,10 @@ const NODE_KEYS = [
   'page1.multiview',
   'page1.rough',
   'page1.rigging',
+  'page1.segpack.clothed',
   'page1.extraction',
+  'page1.segpack.nojacket',
+  'page1.rough.nojacket',
 ];
 
 // ----------------------------------------------------------------------------
@@ -101,13 +110,28 @@ interface NodeOutputs {
   /** Extraction（Banana Pro）输出 */
   extractionUrl: string | null;
   extractionFile: string | null;
+  /** SegPack (Clothed) — 源图缩略图 blob URL（节点 body 底图） */
+  segpackClothedUrl: string | null;
+  segpackClothedFile: string | null;
+  /** SegPack (Clothed) — 灰度 mask PNG blob URL，供 SegPackOverlay 着色用 */
+  segpackClothedMaskUrl: string | null;
+  /** 解析过的 SegPack，供 SegPackOverlay 渲染 bbox/label 使用 */
+  segpackClothedPack: SegmentationPack | null;
+  /** SegPack (NoJacket) — 同上 */
+  segpackNojacketUrl: string | null;
+  segpackNojacketFile: string | null;
+  segpackNojacketMaskUrl: string | null;
+  segpackNojacketPack: SegmentationPack | null;
+  /** 3D Model (NoJacket) — 去外套版 GLB blob URL */
+  roughNojacketUrl: string | null;
+  roughNojacketFile: string | null;
   errors: Record<number, string>;
 }
 
 export function ConceptToRoughModel({ onStatusChange }: Props) {
-  const { project, saveAsset, loadLatest, listHistory, loadByName, saveSegments, loadLatestSegments, savePage1Splits, savePage1Joints } = useProject();
+  const { project, saveAsset, loadLatest, listHistory, loadByName, saveSegments, loadLatestSegments, savePage1Splits, savePage1Joints, savePage1SegPack, loadPage1SegPack } = useProject();
   const [states, setStates] = useState<NodeState[]>([
-    'idle', 'idle', 'idle', 'idle', 'idle', 'idle',
+    'idle', 'idle', 'idle', 'idle', 'idle', 'idle', 'idle', 'idle', 'idle',
   ]);
   const [outputs, setOutputs] = useState<NodeOutputs>({
     conceptFile: null,
@@ -118,15 +142,30 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     roughFile: null,
     extractionUrl: null,
     extractionFile: null,
+    segpackClothedUrl: null,
+    segpackClothedFile: null,
+    segpackClothedMaskUrl: null,
+    segpackClothedPack: null,
+    segpackNojacketUrl: null,
+    segpackNojacketFile: null,
+    segpackNojacketMaskUrl: null,
+    segpackNojacketPack: null,
+    roughNojacketUrl: null,
+    roughNojacketFile: null,
     errors: {},
   });
   const roughAbortRef = useRef<AbortController | null>(null);
+  const roughNojacketAbortRef = useRef<AbortController | null>(null);
 
   // 3D Model 后端选择 + 各后端参数（持久化到 localStorage）
   const [roughBackend, setRoughBackend] = useState<RoughBackend>(loadRoughBackend);
   const [trellis2Params, setTrellis2Params] = useState<Trellis2Params>(loadTrellis2Params);
   // 仅当 backend === 'trellis2' 时显示参数面板
   const [showTrellis2Params, setShowTrellis2Params] = useState(false);
+
+  // TRELLIS.2 服务/模型就绪状态
+  type TrellisStatus = 'unknown' | 'checking' | 'not-loaded' | 'warming' | 'ready' | 'error';
+  const [trellisStatus, setTrellisStatus] = useState<TrellisStatus>('unknown');
 
   // Multi-View 节点的 overlay 显示开关（切分轮廓 / 关节 / 子图模式）
   const [mvOverlayState, setMvOverlayState] = useState<MultiViewOverlayState>(
@@ -140,6 +179,24 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
   useEffect(() => {
     try { localStorage.setItem(TRELLIS2_PARAMS_LS_KEY, JSON.stringify(trellis2Params)); } catch { /* ignore */ }
   }, [trellis2Params]);
+
+  // 当后端切换到 trellis2 时，自动探测服务状态
+  useEffect(() => {
+    if (roughBackend !== 'trellis2') return;
+    let cancelled = false;
+    setTrellisStatus('checking');
+    (async () => {
+      try {
+        const health = await getTrellis2Health();
+        if (cancelled) return;
+        setTrellisStatus(health.modelLoaded ? 'ready' : 'not-loaded');
+      } catch {
+        if (cancelled) return;
+        setTrellisStatus('error');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [roughBackend]);
 
   // Extraction (Banana Pro) 节点：固定使用 REMOVE_JACKET_PROMPT，不再提供下拉选择。
 
@@ -200,7 +257,32 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       const multiview = await loadLatest('page1.multiview');
       const rough = await loadLatest('page1.rough');
       const extraction = await loadLatest('page1.extraction');
+      const segpackClothed = await loadPage1SegPack('clothed');
+      const segpackNojacket = await loadPage1SegPack('nojacket');
+      const roughNojacket = await loadLatest('page1.rough.nojacket');
       if (cancelled) return;
+
+      // SegPack 节点缩略图：用 mask blob（保留至少有视觉差异的灰度图）。
+      // 源图（T-Pose / Remove Jacket）已经由各自上游节点的 URL 显示。
+      const segpackClothedThumb = segpackClothed
+        ? URL.createObjectURL(segpackClothed.maskBlob)
+        : null;
+      const segpackNojacketThumb = segpackNojacket
+        ? URL.createObjectURL(segpackNojacket.maskBlob)
+        : null;
+
+      // 解析 SegPack JSON 用于 overlay（bbox + label）
+      const parsePackBlob = async (blob: Blob | undefined): Promise<SegmentationPack | null> => {
+        if (!blob) return null;
+        try {
+          return parseSegmentationJson(await blob.text());
+        } catch (e) {
+          console.warn('[project-load] parse SegPack failed:', e);
+          return null;
+        }
+      };
+      const segpackClothedPack = await parsePackBlob(segpackClothed?.jsonBlob);
+      const segpackNojacketPack = await parsePackBlob(segpackNojacket?.jsonBlob);
 
       // 用读出的 Blob 构造一个 File 对象，使后续 T Pose 节点可直接复用
       const conceptFile = concept
@@ -213,6 +295,11 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         if (prev.multiviewUrl) URL.revokeObjectURL(prev.multiviewUrl);
         if (prev.roughUrl) URL.revokeObjectURL(prev.roughUrl);
         if (prev.extractionUrl) URL.revokeObjectURL(prev.extractionUrl);
+        if (prev.segpackClothedUrl) URL.revokeObjectURL(prev.segpackClothedUrl);
+        if (prev.segpackClothedMaskUrl) URL.revokeObjectURL(prev.segpackClothedMaskUrl);
+        if (prev.segpackNojacketUrl) URL.revokeObjectURL(prev.segpackNojacketUrl);
+        if (prev.segpackNojacketMaskUrl) URL.revokeObjectURL(prev.segpackNojacketMaskUrl);
+        if (prev.roughNojacketUrl) URL.revokeObjectURL(prev.roughNojacketUrl);
         return {
           conceptFile,
           conceptUrl: concept?.url ?? null,
@@ -222,11 +309,21 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           roughFile: rough?.version.file ?? null,
           extractionUrl: extraction?.url ?? null,
           extractionFile: extraction?.version.file ?? null,
+          segpackClothedUrl: segpackClothedThumb,
+          segpackClothedFile: segpackClothed?.dirName ?? null,
+          segpackClothedMaskUrl: segpackClothedThumb,
+          segpackClothedPack: segpackClothedPack,
+          segpackNojacketUrl: segpackNojacketThumb,
+          segpackNojacketFile: segpackNojacket?.dirName ?? null,
+          segpackNojacketMaskUrl: segpackNojacketThumb,
+          segpackNojacketPack: segpackNojacketPack,
+          roughNojacketUrl: roughNojacket?.url ?? null,
+          roughNojacketFile: roughNojacket?.version.file ?? null,
           errors: {},
         };
       });
       setStates(() => {
-        const next: NodeState[] = ['idle', 'idle', 'idle', 'idle', 'idle', 'idle'];
+        const next: NodeState[] = ['idle', 'idle', 'idle', 'idle', 'idle', 'idle', 'idle', 'idle', 'idle'];
         if (concept) next[0] = 'complete';
         if (tpose) next[1] = 'complete';
         else if (concept) next[1] = 'ready';
@@ -234,9 +331,15 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         else if (tpose) next[2] = 'ready';
         if (rough) next[3] = 'complete';
         else if (multiview) next[3] = 'ready';
-        // Extraction 是独立节点：源是 Multi-View，但不阻塞 3D Model 链路。
-        if (extraction) next[5] = 'complete';
-        else if (multiview) next[5] = 'ready';
+        // 旁支节点（new layout: 5=segpackClothed, 6=extraction, 7=segpackNojacket, 8=roughNojacket）
+        if (segpackClothed) next[5] = 'complete';
+        else if (tpose) next[5] = 'ready';
+        if (extraction) next[6] = 'complete';
+        else if (multiview) next[6] = 'ready';
+        if (segpackNojacket) next[7] = 'complete';
+        else if (extraction) next[7] = 'ready';
+        if (roughNojacket) next[8] = 'complete';
+        else if (extraction) next[8] = 'ready';
         return next;
       });
 
@@ -246,6 +349,9 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (multiview) loaded.push('Multi-View');
       if (rough) loaded.push('3D Model');
       if (extraction) loaded.push('Extraction');
+      if (segpackClothed) loaded.push('SegPack(Clothed)');
+      if (segpackNojacket) loaded.push('SegPack(NoJacket)');
+      if (roughNojacket) loaded.push('3D Model(NoJacket)');
       onStatusChange(
         loaded.length
           ? `已从工程加载：${loaded.join(' / ')}`
@@ -261,7 +367,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (tpose) sel[1] = tpose.version.file;
       if (multiview) sel[2] = multiview.version.file;
       if (rough) sel[3] = rough.version.file;
-      if (extraction) sel[5] = extraction.version.file;
+      if (extraction) sel[6] = extraction.version.file;
+      if (roughNojacket) sel[8] = roughNojacket.version.file;
       setSelectedFiles(sel);
     })().catch((err) => {
       if (cancelled) return;
@@ -293,6 +400,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (prev.multiviewUrl) URL.revokeObjectURL(prev.multiviewUrl);
       if (prev.roughUrl) URL.revokeObjectURL(prev.roughUrl);
       if (prev.extractionUrl) URL.revokeObjectURL(prev.extractionUrl);
+      if (prev.segpackClothedUrl) URL.revokeObjectURL(prev.segpackClothedUrl);
+      if (prev.segpackClothedMaskUrl) URL.revokeObjectURL(prev.segpackClothedMaskUrl);
       return {
         conceptFile: file,
         conceptUrl: URL.createObjectURL(file),
@@ -302,6 +411,16 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         roughFile: null,
         extractionUrl: null,
         extractionFile: null,
+        segpackClothedUrl: null,
+        segpackClothedFile: null,
+        segpackClothedMaskUrl: null,
+        segpackClothedPack: null,
+        segpackNojacketUrl: null,
+        segpackNojacketFile: null,
+        segpackNojacketMaskUrl: null,
+        segpackNojacketPack: null,
+        roughNojacketUrl: null,
+        roughNojacketFile: null,
         errors: {},
       };
     });
@@ -337,6 +456,11 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (prev.multiviewUrl) URL.revokeObjectURL(prev.multiviewUrl);
       if (prev.roughUrl) URL.revokeObjectURL(prev.roughUrl);
       if (prev.extractionUrl) URL.revokeObjectURL(prev.extractionUrl);
+      if (prev.segpackClothedUrl) URL.revokeObjectURL(prev.segpackClothedUrl);
+      if (prev.segpackClothedMaskUrl) URL.revokeObjectURL(prev.segpackClothedMaskUrl);
+      if (prev.segpackNojacketUrl) URL.revokeObjectURL(prev.segpackNojacketUrl);
+      if (prev.segpackNojacketMaskUrl) URL.revokeObjectURL(prev.segpackNojacketMaskUrl);
+      if (prev.roughNojacketUrl) URL.revokeObjectURL(prev.roughNojacketUrl);
       return {
         conceptFile: null,
         conceptUrl: null,
@@ -346,10 +470,20 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         roughFile: null,
         extractionUrl: null,
         extractionFile: null,
+        segpackClothedUrl: null,
+        segpackClothedFile: null,
+        segpackClothedMaskUrl: null,
+        segpackClothedPack: null,
+        segpackNojacketUrl: null,
+        segpackNojacketFile: null,
+        segpackNojacketMaskUrl: null,
+        segpackNojacketPack: null,
+        roughNojacketUrl: null,
+        roughNojacketFile: null,
         errors: {},
       };
     });
-    setStates(['idle', 'idle', 'idle', 'idle', 'idle', 'idle']);
+    setStates(['idle', 'idle', 'idle', 'idle', 'idle', 'idle', 'idle', 'idle', 'idle']);
     onStatusChange('已清除', 'info');
   };
 
@@ -661,6 +795,58 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     }
   }, [onStatusChange, project]);
 
+  // ---- 导出 T-Pose 图到用户选定路径 -----------------------------------
+  const exportTPose = useCallback(async () => {
+    const url = outputsRef.current.tposeUrl;
+    if (!url) {
+      onStatusChange('没有可导出的 T Pose 图', 'error');
+      return;
+    }
+    try {
+      const blob = await fetch(url).then((r) => r.blob());
+      const projectName = project?.meta.name ?? 'project';
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const defaultName = `${projectName}_tpose_${ts}.png`;
+
+      const w = window as unknown as {
+        showSaveFilePicker?: (opts?: {
+          suggestedName?: string;
+          types?: Array<{ description: string; accept: Record<string, string[]> }>;
+        }) => Promise<{
+          createWritable: () => Promise<{ write: (d: Blob) => Promise<void>; close: () => Promise<void> }>;
+        }>;
+      };
+      if (typeof w.showSaveFilePicker === 'function') {
+        try {
+          const handle = await w.showSaveFilePicker({
+            suggestedName: defaultName,
+            types: [{ description: 'PNG Image', accept: { 'image/png': ['.png'] } }],
+          });
+          const writable = await handle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+          onStatusChange(`已导出 T Pose`, 'success');
+          return;
+        } catch (e) {
+          if (e instanceof Error && e.name === 'AbortError') return;
+          console.warn('[exportTPose] showSaveFilePicker failed, fallback to <a download>:', e);
+        }
+      }
+
+      const a = document.createElement('a');
+      const objUrl = URL.createObjectURL(blob);
+      a.href = objUrl;
+      a.download = defaultName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(objUrl), 0);
+      onStatusChange(`已下载 T Pose 到默认目录`, 'success');
+    } catch (e) {
+      onStatusChange(`导出 T Pose 失败：${e instanceof Error ? e.message : String(e)}`, 'error');
+    }
+  }, [onStatusChange, project]);
+
   // ---- 3D Model node (Tripo / TRELLIS.2 image → GLB) ----------------
   const runRoughModel = useCallback(async (sourceUrl?: string): Promise<string | null> => {
     // 防御：当作为 button onClick handler 直接绑定时，会收到 SyntheticEvent 作为参数
@@ -739,14 +925,22 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         try {
           const health = await getTrellis2Health();
           if (!health.modelLoaded) {
+            setTrellisStatus('not-loaded');
             onStatusChange('TRELLIS.2 服务未加载模型，请先 warmup（点开参数面板有按钮）', 'error');
             throw new Error('TRELLIS.2 model not loaded');
           }
+          setTrellisStatus('ready');
           onStatusChange(
             `TRELLIS.2 就绪 · ${health.gpuName ?? 'GPU'} · 输入：${sourceLabel}`,
             'info',
           );
-        } catch (e) {
+        } catch (e: unknown) {
+          // 区分「模型未加载」与「服务不可达」：前者已经 setTrellisStatus('not-loaded')
+          const isNotLoaded =
+            e instanceof Error && e.message === 'TRELLIS.2 model not loaded';
+          if (!isNotLoaded) {
+            setTrellisStatus('error');
+          }
           // /health 接口本身打不通：报错 + 抛出（前端 vite proxy 失败时给清晰提示）
           throw new Error(
             `TRELLIS.2 服务不可达：${e instanceof Error ? e.message : String(e)} ` +
@@ -854,8 +1048,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       return null;
     }
 
-    setNodeState(5, 'running');
-    setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 5: '' } }));
+    setNodeState(6, 'running');
+    setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 6: '' } }));
     try {
       // 把 Multi-View blob URL 转成 File 喂给 Banana Pro
       const mvBlob = await (await fetch(mvUrl)).blob();
@@ -904,8 +1098,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                 'warning',
               );
             }
-            setSelectedFiles((prev) => ({ ...prev, 5: v.file }));
-            refreshHistory(5);
+            setSelectedFiles((prev) => ({ ...prev, 6: v.file }));
+            refreshHistory(6);
           }
         } catch (e) {
           onStatusChange(
@@ -919,18 +1113,306 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         if (prev.extractionUrl) URL.revokeObjectURL(prev.extractionUrl);
         return { ...prev, extractionUrl: url, extractionFile: savedFile };
       });
-      setNodeState(5, 'complete');
+      setNodeState(6, 'complete');
       onStatusChange('Remove Jacket 生成完成', 'success');
       return url;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[Remove Jacket] failed:', err);
-      setNodeState(5, 'error');
-      setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 5: msg } }));
+      setNodeState(6, 'error');
+      setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 6: msg } }));
       onStatusChange(`Remove Jacket 生成失败：${msg}`, 'error');
       return null;
     }
   }, [onStatusChange, setNodeState, project, saveAsset, saveSegments, refreshHistory]);
+
+  // ---- SegPack (Clothed) node — 接 SAM3 GUI 桥（/api/sam3-extract）-------
+  // 输入：T-Pose 单视图（带外套）。SAM3 GUI 弹窗里用户做多区域点选标注，
+  // 拿回 segmentation.json + grayscale mask png，按 page1.segpack.clothed
+  // 持久化到工程目录。Page3 对齐时按身体侧选 clothed 还是 nojacket。
+  const runSegpackClothed = useCallback(async (): Promise<void> => {
+    const tposeUrl = outputsRef.current.tposeUrl;
+    if (!tposeUrl) {
+      onStatusChange('请先生成 T Pose', 'error');
+      return;
+    }
+    setNodeState(5, 'running');
+    setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 5: '' } }));
+    try {
+      const result = await runSegPackBridge(
+        tposeUrl,
+        'page1.tpose',
+        (msg) => onStatusChange(`SegPack (Clothed) · ${msg}`, 'info'),
+      );
+
+      let savedDir: string | null = null;
+      if (project) {
+        try {
+          const handle = await savePage1SegPack(
+            'clothed',
+            result.jsonBlob,
+            result.maskBlob,
+            'segmentation_mask.png',
+            'page1.tpose',
+          );
+          if (handle) {
+            savedDir = handle.dirName;
+            onStatusChange(`SegPack (Clothed) 已保存到工程：${handle.dirName}/`, 'success');
+            refreshHistory(5);
+          }
+        } catch (e) {
+          onStatusChange(
+            `SegPack (Clothed) 保存失败：${e instanceof Error ? e.message : String(e)}`,
+            'error',
+          );
+        }
+      }
+
+      // 解析 SegPack JSON 供 overlay 渲染（bbox + label）
+      let parsedPack: SegmentationPack | null = null;
+      try {
+        const jsonText = await result.jsonBlob.text();
+        parsedPack = parseSegmentationJson(jsonText);
+      } catch (e) {
+        console.warn('[SegPack Clothed] parse pack failed:', e);
+      }
+
+      setOutputs((prev) => {
+        if (prev.segpackClothedUrl) URL.revokeObjectURL(prev.segpackClothedUrl);
+        if (prev.segpackClothedMaskUrl) URL.revokeObjectURL(prev.segpackClothedMaskUrl);
+        return {
+          ...prev,
+          segpackClothedUrl: result.thumbnailUrl,
+          segpackClothedFile: savedDir,
+          segpackClothedMaskUrl: result.maskUrl,
+          segpackClothedPack: parsedPack,
+        };
+      });
+      setNodeState(5, 'complete');
+      onStatusChange(`SegPack (Clothed) 完成：${result.regionCount} 个区域`, 'success');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[SegPack Clothed] failed:', err);
+      setNodeState(5, 'error');
+      setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 5: msg } }));
+      onStatusChange(`SegPack (Clothed) 失败：${msg}`, 'error');
+    }
+  }, [onStatusChange, setNodeState, project, savePage1SegPack, refreshHistory]);
+
+  // ---- SegPack (NoJacket) node — 接 SAM3 GUI 桥 --------------------------
+  // 输入：Remove Jacket 4-view 整图（去外套）。同上流程，写到 page1.segpack.nojacket。
+  const runSegpackNojacket = useCallback(async (): Promise<void> => {
+    const extractionUrl = outputsRef.current.extractionUrl;
+    if (!extractionUrl) {
+      onStatusChange('请先运行 Remove Jacket', 'error');
+      return;
+    }
+    setNodeState(7, 'running');
+    setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 7: '' } }));
+    try {
+      const result = await runSegPackBridge(
+        extractionUrl,
+        outputsRef.current.extractionFile ?? 'page1.extraction',
+        (msg) => onStatusChange(`SegPack (NoJacket) · ${msg}`, 'info'),
+      );
+
+      let savedDir: string | null = null;
+      if (project) {
+        try {
+          const handle = await savePage1SegPack(
+            'nojacket',
+            result.jsonBlob,
+            result.maskBlob,
+            'segmentation_mask.png',
+            outputsRef.current.extractionFile ?? 'page1.extraction',
+          );
+          if (handle) {
+            savedDir = handle.dirName;
+            onStatusChange(`SegPack (NoJacket) 已保存到工程：${handle.dirName}/`, 'success');
+            refreshHistory(7);
+          }
+        } catch (e) {
+          onStatusChange(
+            `SegPack (NoJacket) 保存失败：${e instanceof Error ? e.message : String(e)}`,
+            'error',
+          );
+        }
+      }
+
+      let parsedPack: SegmentationPack | null = null;
+      try {
+        const jsonText = await result.jsonBlob.text();
+        parsedPack = parseSegmentationJson(jsonText);
+      } catch (e) {
+        console.warn('[SegPack NoJacket] parse pack failed:', e);
+      }
+
+      setOutputs((prev) => {
+        if (prev.segpackNojacketUrl) URL.revokeObjectURL(prev.segpackNojacketUrl);
+        if (prev.segpackNojacketMaskUrl) URL.revokeObjectURL(prev.segpackNojacketMaskUrl);
+        return {
+          ...prev,
+          segpackNojacketUrl: result.thumbnailUrl,
+          segpackNojacketFile: savedDir,
+          segpackNojacketMaskUrl: result.maskUrl,
+          segpackNojacketPack: parsedPack,
+        };
+      });
+      setNodeState(7, 'complete');
+      onStatusChange(`SegPack (NoJacket) 完成：${result.regionCount} 个区域`, 'success');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[SegPack NoJacket] failed:', err);
+      setNodeState(7, 'error');
+      setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 7: msg } }));
+      onStatusChange(`SegPack (NoJacket) 失败：${msg}`, 'error');
+    }
+  }, [onStatusChange, setNodeState, project, savePage1SegPack, refreshHistory]);
+
+  // ---- 3D Model (NoJacket) node — Tripo multiview / Trellis2 single ----
+  // 镜像 runRoughModel：源换成 Remove Jacket 4-view（splits 来自 page1.extraction），
+  // 落盘到 page1.rough.nojacket。复用同一份 backend / trellis2Params 选择，
+  // 但走独立 abort ref，避免与主链 3D Model 互相干扰。
+  const runRoughNojacket = useCallback(async (): Promise<void> => {
+    const extractionUrl = outputsRef.current.extractionUrl;
+    if (!extractionUrl) {
+      onStatusChange('请先运行 Remove Jacket', 'error');
+      return;
+    }
+    setNodeState(8, 'running');
+    setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 8: '' } }));
+
+    const ctrl = new AbortController();
+    roughNojacketAbortRef.current = ctrl;
+
+    const backend = roughBackend;
+    onStatusChange(`3D Model (NoJacket): 使用后端 ${BACKEND_LABEL[backend]}`, 'info');
+
+    try {
+      // 读取 Remove Jacket 切分（4 视图），跟 runRoughModel 对应代码完全同构
+      let multiInputs: { front: Blob; left?: Blob | null; back?: Blob | null; right?: Blob | null } | null = null;
+      if (project) {
+        try {
+          const seg = await loadLatestSegments('page1.extraction');
+          if (seg) {
+            const pick = (view: string): Blob | null => {
+              const entry = seg.index.entries.find(
+                (e) => (e.meta as { view?: string } | undefined)?.view === view,
+              );
+              if (!entry) return null;
+              return seg.files.get(entry.file) ?? null;
+            };
+            const front = pick('front');
+            if (front) {
+              multiInputs = {
+                front,
+                left:  pick('left'),
+                back:  pick('back'),
+                right: pick('right'),
+              };
+              onStatusChange(
+                `检测到 NoJacket 切分子目录 ${seg.dirName}/`,
+                'info',
+              );
+            }
+          }
+        } catch (e) {
+          console.warn('[3D Model NoJacket] 读取切分集失败：', e);
+        }
+      }
+
+      let blob: Blob;
+      let saveLabel: string;
+
+      if (backend === 'trellis2') {
+        const inputBlob = multiInputs?.front ?? await (await fetch(extractionUrl)).blob();
+        const sourceLabel = multiInputs?.front ? 'front 视图' : 'Remove Jacket 整图';
+        onStatusChange('TRELLIS.2: 探测服务状态…', 'info');
+        try {
+          const health = await getTrellis2Health();
+          if (!health.modelLoaded) {
+            setTrellisStatus('not-loaded');
+            onStatusChange('TRELLIS.2 服务未加载模型，请先 warmup', 'error');
+            throw new Error('TRELLIS.2 model not loaded');
+          }
+          setTrellisStatus('ready');
+          onStatusChange(
+            `TRELLIS.2 就绪 · ${health.gpuName ?? 'GPU'} · 输入：${sourceLabel}`,
+            'info',
+          );
+        } catch (e: unknown) {
+          const isNotLoaded = e instanceof Error && e.message === 'TRELLIS.2 model not loaded';
+          if (!isNotLoaded) setTrellisStatus('error');
+          throw new Error(
+            `TRELLIS.2 服务不可达：${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+
+        onStatusChange('TRELLIS.2 生成 NoJacket 模型中…（典型耗时 4-5 分钟）', 'info');
+        const t2Result = await runTrellis2(inputBlob, trellis2Params);
+        blob = t2Result.blob;
+        saveLabel = `trellis2 nojacket seed=${t2Result.meta.seed} ` +
+          `gen=${t2Result.meta.elapsedGenSec}s bake=${t2Result.meta.elapsedBakeSec}s`;
+        onStatusChange(
+          `TRELLIS.2 NoJacket 完成 · 总 ${t2Result.meta.elapsedTotalSec}s · ${(t2Result.meta.glbBytes / 1024 / 1024).toFixed(1)} MB`,
+          'success',
+        );
+      } else {
+        const tripoResult = multiInputs
+          ? await runMultiViewToModel(multiInputs, {
+              onStatus: (msg) => onStatusChange(`NoJacket · ${msg}`, 'info'),
+              signal: ctrl.signal,
+            })
+          : await runImageToModel(await (await fetch(extractionUrl)).blob(), {
+              onStatus: (msg) => onStatusChange(`NoJacket · ${msg}`, 'info'),
+              signal: ctrl.signal,
+              filename: 'extraction.png',
+            });
+        blob = tripoResult.blob;
+        saveLabel = `tripo nojacket task ${tripoResult.result.task_id}`;
+      }
+
+      let savedFile: string | null = null;
+      if (project) {
+        try {
+          const v = await saveAsset('page1.rough.nojacket', blob, 'glb', saveLabel);
+          if (v) {
+            savedFile = v.file;
+            onStatusChange(`3D Model (NoJacket) 已保存到工程：${v.file}`, 'success');
+            refreshHistory(8);
+          }
+        } catch (e) {
+          onStatusChange(
+            `3D Model (NoJacket) 保存失败：${e instanceof Error ? e.message : String(e)}`,
+            'error',
+          );
+        }
+      }
+
+      const url = URL.createObjectURL(blob);
+      setOutputs((prev) => {
+        if (prev.roughNojacketUrl) URL.revokeObjectURL(prev.roughNojacketUrl);
+        return { ...prev, roughNojacketUrl: url, roughNojacketFile: savedFile };
+      });
+      setNodeState(8, 'complete');
+      onStatusChange('3D Model (NoJacket) 生成完成', 'success');
+    } catch (err) {
+      const msg =
+        err instanceof TripoServiceError
+          ? `${err.message}${err.error_code ? ` (code ${err.error_code})` : ''}${
+              err.task_id ? ` [task ${err.task_id}]` : ''
+            }`
+          : err instanceof Error
+          ? err.message
+          : String(err);
+      console.error('[3D Model NoJacket] failed:', err);
+      setNodeState(8, 'error');
+      setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 8: msg } }));
+      onStatusChange(`3D Model (NoJacket) 生成失败：${msg}`, 'error');
+    } finally {
+      roughNojacketAbortRef.current = null;
+    }
+  }, [onStatusChange, setNodeState, project, saveAsset, refreshHistory, loadLatestSegments, roughBackend, trellis2Params]);
 
   // ---- Mock runner for nodes 3..4 (3D Model / Rigging) -----------------
   const runMockNode = useCallback(
@@ -1049,6 +1531,11 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (prev.multiviewUrl) URL.revokeObjectURL(prev.multiviewUrl);
       if (prev.roughUrl) URL.revokeObjectURL(prev.roughUrl);
       if (prev.extractionUrl) URL.revokeObjectURL(prev.extractionUrl);
+      if (prev.segpackClothedUrl) URL.revokeObjectURL(prev.segpackClothedUrl);
+      if (prev.segpackClothedMaskUrl) URL.revokeObjectURL(prev.segpackClothedMaskUrl);
+      if (prev.segpackNojacketUrl) URL.revokeObjectURL(prev.segpackNojacketUrl);
+      if (prev.segpackNojacketMaskUrl) URL.revokeObjectURL(prev.segpackNojacketMaskUrl);
+      if (prev.roughNojacketUrl) URL.revokeObjectURL(prev.roughNojacketUrl);
       return {
         conceptFile: null,
         conceptUrl: null,
@@ -1058,10 +1545,20 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         roughFile: null,
         extractionUrl: null,
         extractionFile: null,
+        segpackClothedUrl: null,
+        segpackClothedFile: null,
+        segpackClothedMaskUrl: null,
+        segpackClothedPack: null,
+        segpackNojacketUrl: null,
+        segpackNojacketFile: null,
+        segpackNojacketMaskUrl: null,
+        segpackNojacketPack: null,
+        roughNojacketUrl: null,
+        roughNojacketFile: null,
         errors: {},
       };
     });
-    setStates(['idle', 'idle', 'idle', 'idle', 'idle', 'idle']);
+    setStates(['idle', 'idle', 'idle', 'idle', 'idle', 'idle', 'idle', 'idle', 'idle']);
     onStatusChange('已重置 Pipeline', 'info');
   };
 
@@ -1085,7 +1582,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           gap: 12,
         }}
       >
-        <span style={{ fontSize: 13, fontWeight: 600 }}>Pipeline · 单条流水线（5 节点固定）</span>
+        <span style={{ fontSize: 13, fontWeight: 600 }}>Pipeline · 主链 5 节点 + 2 旁支</span>
         <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
           T Pose / Multi-View 调用 ComfyUI（http://127.0.0.1:8188）
           {project ? ' · 自动保存到工程' : ' · 未打开工程（不持久化）'}
@@ -1115,6 +1612,22 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
               <>
                 {node.id === 'rough' && state === 'complete' && outputs.roughUrl ? (
                   <GLBThumbnail url={outputs.roughUrl} height={160} />
+                ) : node.id === 'roughNojacket' && state === 'complete' && outputs.roughNojacketUrl ? (
+                  <GLBThumbnail url={outputs.roughNojacketUrl} height={160} />
+                ) : node.id === 'segpackClothed' && state === 'complete' && outputs.tposeUrl ? (
+                  <SegPackOverlay
+                    sourceUrl={outputs.tposeUrl}
+                    maskUrl={outputs.segpackClothedMaskUrl}
+                    pack={outputs.segpackClothedPack}
+                    height={160}
+                  />
+                ) : node.id === 'segpackNojacket' && state === 'complete' && outputs.extractionUrl ? (
+                  <SegPackOverlay
+                    sourceUrl={outputs.extractionUrl}
+                    maskUrl={outputs.segpackNojacketMaskUrl}
+                    pack={outputs.segpackNojacketPack}
+                    height={160}
+                  />
                 ) : node.id === 'multiview' && state === 'complete' && imageUrl ? (
                   <MultiViewOverlay
                     // segmentDir 变更（重选历史 / 重新生成）时强制重挂载，
@@ -1191,18 +1704,49 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                     expanded={showTrellis2Params}
                     onToggleExpanded={() => setShowTrellis2Params((v) => !v)}
                     onWarmup={async () => {
+                      const wasError = trellisStatus === 'error' || trellisStatus === 'unknown';
+                      if (wasError) {
+                        // 服务不可达 → 先轻量探测 health，能通再 warmup
+                        setTrellisStatus('checking');
+                        onStatusChange('TRELLIS.2: 检测服务状态…', 'info');
+                        try {
+                          const health = await getTrellis2Health();
+                          if (health.modelLoaded) {
+                            setTrellisStatus('ready');
+                            onStatusChange('TRELLIS.2: 模型已就绪', 'success');
+                            return;
+                          }
+                          // 可达但模型未加载，继续走 warmup
+                          setTrellisStatus('not-loaded');
+                        } catch (e) {
+                          setTrellisStatus('error');
+                          onStatusChange(
+                            `TRELLIS.2 服务不可达：${e instanceof Error ? e.message : String(e)} ` +
+                            `（请检查 SSH 隧道是否启动：D:\\AI\\Services\\Trellis2Service\\deploy\\ssh_tunnel.ps1）`,
+                            'error',
+                          );
+                          return;
+                        }
+                      }
+                      // 模型未加载 → warmup
+                      setTrellisStatus('warming');
                       try {
                         onStatusChange('TRELLIS.2: 触发 warmup（首次约 1-3 分钟）…', 'info');
                         const { warmup } = await import('../../services/trellis2');
                         await warmup();
+                        // 确认模型已加载（防止假就绪）
+                        const health = await getTrellis2Health();
+                        setTrellisStatus(health.modelLoaded ? 'ready' : 'not-loaded');
                         onStatusChange('TRELLIS.2: warmup 完成', 'success');
                       } catch (e) {
+                        setTrellisStatus('error');
                         onStatusChange(
                           `TRELLIS.2 warmup 失败：${e instanceof Error ? e.message : String(e)}`,
                           'error',
                         );
                       }
                     }}
+                    trellisStatus={trellisStatus}
                     disabled={state === 'running'}
                   />
                 )}
@@ -1228,14 +1772,21 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
               onRunMock: runMockNode,
               onCancelMock: () => setNodeState(idx, 'idle'),
               onRunExtraction: runExtraction,
+              onRunSegpackClothed: runSegpackClothed,
+              onRunSegpackNojacket: runSegpackNojacket,
+              onRunRoughNojacket: runRoughNojacket,
               conceptReady: !!outputs.conceptFile,
               tposeReady: !!outputs.tposeUrl,
               multiviewReady: !!outputs.multiviewUrl,
               roughReady: !!outputs.roughUrl,
               extractionReady: !!outputs.extractionUrl,
+              segpackClothedReady: !!outputs.segpackClothedUrl,
+              segpackNojacketReady: !!outputs.segpackNojacketUrl,
+              roughNojacketReady: !!outputs.roughNojacketUrl,
               redetectJoints,
               redetecting,
               onExportMultiView: exportMultiView,
+              onExportTPose: exportTPose,
             });
 
             // 节点自定义功能（放在 actions 栏左侧）
@@ -1323,8 +1874,9 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                   }
                   onBodyClick={
                     // Concept (idx 0) 不支持单击运行链；
-                    // Extraction (idx 5) 是独立节点，不参与上游链式运行
-                    idx === 0 || idx === 5 ? undefined : () => { void runUpToNode(idx); }
+                    // SegPack(Clothed) (5) / Extraction (6) / SegPack(NoJacket) (7) /
+                    // 3D Model NoJacket (8) 都是独立旁支，不参与上游链式运行
+                    idx === 0 || idx >= 5 ? undefined : () => { void runUpToNode(idx); }
                   }
                   onBodyDoubleClick={(() => {
                     // 3D 节点：双击送入下方 3D Mesh Viewer
@@ -1333,6 +1885,12 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                         return () => {
                           setViewerUrl(outputs.roughUrl);
                           setViewerLabel(`${idx + 1}. ${node.title}${outputs.roughFile ? ' · ' + outputs.roughFile : ''}`);
+                        };
+                      }
+                      if (idx === 8 && outputs.roughNojacketUrl) {
+                        return () => {
+                          setViewerUrl(outputs.roughNojacketUrl);
+                          setViewerLabel(`${idx + 1}. ${node.title}${outputs.roughNojacketFile ? ' · ' + outputs.roughNojacketFile : ''}`);
                         };
                       }
                       return undefined;
@@ -1347,12 +1905,13 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                 </NodeCard>
                 {/* 不渲染连接线：
                     1) 最后一个节点之后
-                    2) Extraction 节点（idx=5）是独立节点，与上游 rigging（idx=4）之间不画箭头 */}
-                {idx < NODES.length - 1 && idx + 1 !== 5 && (
+                    2) idx 5..8 全是独立旁支节点（SegPack Clothed / Remove Jacket /
+                       SegPack NoJacket / 3D Model NoJacket），与左侧不画箭头 */}
+                {idx < NODES.length - 1 && idx + 1 !== 5 && idx + 1 !== 6 && idx + 1 !== 7 && idx + 1 !== 8 && (
                   <NodeConnector fromState={state} toState={states[idx + 1]} />
                 )}
-                {/* Extraction 之前用一个视觉间隔代替连接线 */}
-                {idx + 1 === 5 && (
+                {/* 独立旁支节点之前用一个视觉间隔代替连接线 */}
+                {(idx + 1 === 5 || idx + 1 === 6 || idx + 1 === 7 || idx + 1 === 8) && (
                   <div style={{ width: 32, flex: '0 0 auto' }} aria-hidden />
                 )}
               </div>
@@ -1392,11 +1951,71 @@ async function blobToDataUrl(blob: Blob): Promise<string> {
   return `data:${mime};base64,${btoa(bin)}`;
 }
 
+// ---------------------------------------------------------------------------
+// SegPack 桥接 helper（PR2）
+// ---------------------------------------------------------------------------
+//
+// 把一个 blob URL 喂给 SAM3 GUI 桥（/api/sam3-extract），拿回原始
+// segmentation.json + grayscale mask png，**不**像 extractWithSAM3 那样
+// 把 mask 应用到原图。SegPack 节点只需要保存 raw 数据 + 一个缩略图。
+async function runSegPackBridge(
+  sourceUrl: string,
+  sourceLabel: string,
+  onStatus: (msg: string) => void,
+): Promise<{
+  jsonBlob: Blob;
+  maskBlob: Blob;
+  thumbnailUrl: string;
+  maskUrl: string;
+  regionCount: number;
+}> {
+  void sourceLabel; // 仅供调用方日志/source 字段使用
+  onStatus('打开 SAM3 窗口…（请在新弹出的窗口中标注后点击"导出 JSON"）');
+
+  const sourceBlob = await (await fetch(sourceUrl)).blob();
+  const sourceB64 = await blobToDataUrl(sourceBlob);
+
+  const res = await fetch('/api/sam3-extract', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ imageBase64: sourceB64 }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`SAM3 桥接 HTTP ${res.status}：${await res.text()}`);
+  }
+
+  const payload = (await res.json()) as
+    | { ok: true; json: SAM3ExportJson; maskBase64: string }
+    | { ok: false; error: string; cancelled?: boolean };
+
+  if (!payload.ok) {
+    if (payload.cancelled) throw new Error('用户取消了 SAM3 标注');
+    throw new Error(payload.error);
+  }
+
+  const regionCount = payload.json.objects.length;
+  if (regionCount === 0) throw new Error('SAM3 导出的 JSON 里没有任何区域');
+  onStatus(`已导出 ${regionCount} 个区域，写入工程目录…`);
+
+  const jsonBlob = new Blob([JSON.stringify(payload.json, null, 2)], {
+    type: 'application/json',
+  });
+  const maskBlob = await (await fetch(payload.maskBase64)).blob();
+  const thumbnailUrl = URL.createObjectURL(sourceBlob);
+  const maskUrl = URL.createObjectURL(maskBlob);
+
+  return { jsonBlob, maskBlob, thumbnailUrl, maskUrl, regionCount };
+}
+
 function imageForNode(idx: number, outputs: NodeOutputs): string | undefined {
   if (idx === 0) return outputs.conceptUrl ?? undefined;
   if (idx === 1) return outputs.tposeUrl ?? undefined;
   if (idx === 2) return outputs.multiviewUrl ?? undefined;
-  if (idx === 5) return outputs.extractionUrl ?? undefined;
+  if (idx === 5) return outputs.segpackClothedUrl ?? undefined;
+  if (idx === 6) return outputs.extractionUrl ?? undefined;
+  if (idx === 7) return outputs.segpackNojacketUrl ?? undefined;
+  // idx === 8 (3D Model NoJacket) 是 3D 节点，走不同渲染路径
   return undefined;
 }
 
@@ -1411,16 +2030,24 @@ interface ActionHandlers {
   onRunMock: (idx: number) => void | Promise<boolean>;
   onCancelMock: () => void;
   onRunExtraction: () => void;
+  onRunSegpackClothed: () => void;
+  onRunSegpackNojacket: () => void;
+  onRunRoughNojacket: () => void;
   conceptReady: boolean;
   tposeReady: boolean;
   multiviewReady: boolean;
   roughReady: boolean;
   extractionReady: boolean;
+  segpackClothedReady: boolean;
+  segpackNojacketReady: boolean;
+  roughNojacketReady: boolean;
   /** 重检关节 */
   redetectJoints: () => void;
   redetecting: boolean;
   /** 导出 multi-view 4-in-1 图到用户选定路径 */
   onExportMultiView: () => void;
+  /** 导出 T Pose 图到用户选定路径 */
+  onExportTPose: () => void;
 }
 
 interface MultiViewMoreMenuProps {
@@ -1563,7 +2190,7 @@ function renderActions(
   if (node.id === 'tpose') {
     return (
       <>
-        <Button size="sm" disabled={!isComplete}>导出</Button>
+        <Button size="sm" disabled={!isComplete} onClick={h.onExportTPose}>导出</Button>
         {isError ? (
           <Button variant="primary" size="sm" onClick={h.onRunTPose}>重试</Button>
         ) : isRunning ? (
@@ -1661,6 +2288,76 @@ function renderActions(
     );
   }
 
+  if (node.id === 'segpackClothed') {
+    // PR1: UI mockup only — 按钮可点，但点击后只弹提示。
+    return (
+      <>
+        <Button size="sm" disabled={!isComplete} title="导出 SAM3 segmentation.json + mask.png">导出</Button>
+        {isError ? (
+          <Button variant="primary" size="sm" onClick={h.onRunSegpackClothed}>重试</Button>
+        ) : isRunning ? (
+          <Button variant="danger" size="sm" disabled title="SAM3 GUI 标注中…">标注中…</Button>
+        ) : (
+          <Button
+            variant="primary"
+            size="sm"
+            disabled={!h.tposeReady}
+            onClick={h.onRunSegpackClothed}
+            title="启动 SAM3 GUI 对 T-Pose 做多区域分割（PR1 mockup）"
+          >
+            {isComplete ? '重新标注' : '启动 SAM3'}
+          </Button>
+        )}
+      </>
+    );
+  }
+
+  if (node.id === 'segpackNojacket') {
+    return (
+      <>
+        <Button size="sm" disabled={!isComplete} title="导出 SAM3 segmentation.json + mask.png">导出</Button>
+        {isError ? (
+          <Button variant="primary" size="sm" onClick={h.onRunSegpackNojacket}>重试</Button>
+        ) : isRunning ? (
+          <Button variant="danger" size="sm" disabled title="SAM3 GUI 标注中…">标注中…</Button>
+        ) : (
+          <Button
+            variant="primary"
+            size="sm"
+            disabled={!h.extractionReady}
+            onClick={h.onRunSegpackNojacket}
+            title="启动 SAM3 GUI 对 Remove Jacket 做多区域分割（mockup）"
+          >
+            {isComplete ? '重新标注' : '启动 SAM3'}
+          </Button>
+        )}
+      </>
+    );
+  }
+
+  if (node.id === 'roughNojacket') {
+    return (
+      <>
+        <Button size="sm" disabled={!h.roughNojacketReady} title="下载 GLB">下载 GLB</Button>
+        {isError ? (
+          <Button variant="primary" size="sm" onClick={h.onRunRoughNojacket}>重试</Button>
+        ) : isRunning ? (
+          <Button variant="danger" size="sm" disabled>生成中…</Button>
+        ) : (
+          <Button
+            variant="primary"
+            size="sm"
+            disabled={!h.extractionReady}
+            onClick={h.onRunRoughNojacket}
+            title="以 Remove Jacket 4 视图为输入生成去外套 GLB（mockup）"
+          >
+            {isComplete ? '重新生成' : '生成'}
+          </Button>
+        )}
+      </>
+    );
+  }
+
   return (
     <>
       <Button size="sm" disabled={!isComplete}>导出</Button>
@@ -1697,6 +2394,8 @@ interface RoughBackendPanelProps {
   disabled?: boolean;
   /** 隐藏后端 select 行（select 已移入 actionsLeft 时使用） */
   hideSelect?: boolean;
+  /** TRELLIS.2 服务状态 */
+  trellisStatus: 'unknown' | 'checking' | 'not-loaded' | 'warming' | 'ready' | 'error';
 }
 
 function RoughBackendPanel({
@@ -1709,6 +2408,7 @@ function RoughBackendPanel({
   onWarmup,
   disabled,
   hideSelect,
+  trellisStatus,
 }: RoughBackendPanelProps) {
   const labelStyle: CSSProperties = {
     fontSize: 10,
@@ -1813,20 +2513,66 @@ function RoughBackendPanel({
             </button>
             <button
               type="button"
-              disabled={disabled}
+              disabled={
+                disabled ||
+                trellisStatus === 'checking' ||
+                trellisStatus === 'warming'
+              }
               onClick={onWarmup}
-              title="提前加载模型，避免首次推理慢启动"
+              title={
+                trellisStatus === 'unknown'
+                  ? '等待检测…'
+                  : trellisStatus === 'checking'
+                  ? '正在检测 TRELLIS.2 服务状态…'
+                  : trellisStatus === 'not-loaded'
+                  ? '模型未加载，点击 Warm 将模型加载到 GPU（首次约 1-3 分钟）'
+                  : trellisStatus === 'warming'
+                  ? '模型加载中…请稍候'
+                  : trellisStatus === 'ready'
+                  ? '模型已就绪，可直接生成 3D'
+                  : '服务不可达，点击检测'
+              }
               style={{
                 fontSize: 10,
                 padding: '2px 6px',
-                background: 'transparent',
-                color: 'var(--text-secondary)',
-                border: '1px solid var(--border-default)',
+                background:
+                  trellisStatus === 'ready'
+                    ? 'var(--accent-green, #2ea043)'
+                    : 'transparent',
+                color:
+                  trellisStatus === 'ready'
+                    ? '#fff'
+                    : trellisStatus === 'error'
+                    ? 'var(--accent-red)'
+                    : trellisStatus === 'warming'
+                    ? 'var(--accent-yellow)'
+                    : 'var(--text-secondary)',
+                border:
+                  trellisStatus === 'ready'
+                    ? '1px solid var(--accent-green, #2ea043)'
+                    : trellisStatus === 'error'
+                    ? '1px solid var(--accent-red)'
+                    : trellisStatus === 'warming'
+                    ? '1px solid var(--accent-yellow)'
+                    : '1px solid var(--border-default)',
                 borderRadius: 3,
-                cursor: 'pointer',
+                cursor:
+                  trellisStatus === 'not-loaded' || trellisStatus === 'error' || trellisStatus === 'unknown'
+                    ? 'pointer'
+                    : 'default',
               }}
             >
-              Warmup
+              {trellisStatus === 'unknown'
+                ? '…'
+                : trellisStatus === 'checking'
+                ? '检测中…'
+                : trellisStatus === 'warming'
+                ? '加载中…'
+                : trellisStatus === 'ready'
+                ? 'Ready ✓'
+                : trellisStatus === 'error'
+                ? '检测'
+                : 'Warm'}
             </button>
           </div>
           {expanded && (
