@@ -165,3 +165,74 @@ export async function generateModel(
     },
   };
 }
+
+/**
+ * Generate a 3D model from multiple views (2-8 images).
+ *
+ * Uses multipart/form-data to send the images + a JSON payload with generation
+ * params.  The server concatenates DINOv3 patch features from all views along
+ * the sequence dimension before the flow model's cross-attention.
+ *
+ * Image order convention (matches Tripo): `images[0]=front, images[1]=left,
+ * images[2]=back, images[3]=right`.  At least 2 images are required.
+ *
+ * Returns GLB binary with meta parsed from `x-meta-*` response headers.
+ */
+export async function generateModelMultiView(
+  images: (File | Blob)[],
+  params: Trellis2Params = {},
+): Promise<Trellis2Result> {
+  if (images.length < 2) {
+    throw new Error('generateModelMultiView requires at least 2 images');
+  }
+
+  const payload = {
+    sparse_structure_steps: params.sparseStructureSteps ?? TRELLIS2_DEFAULTS.sparseStructureSteps,
+    slat_steps: params.slatSteps ?? TRELLIS2_DEFAULTS.slatSteps,
+    cfg_strength: params.cfg ?? TRELLIS2_DEFAULTS.cfg,
+    seed: params.seed ?? null,
+    decimation_target: params.decimationTarget ?? TRELLIS2_DEFAULTS.decimationTarget,
+    texture_size: params.textureSize ?? TRELLIS2_DEFAULTS.textureSize,
+    remesh: params.remesh ?? TRELLIS2_DEFAULTS.remesh,
+    simplify_cap: params.simplifyCap ?? TRELLIS2_DEFAULTS.simplifyCap,
+  };
+
+  const form = new FormData();
+  for (const img of images) {
+    form.append('images', img);
+  }
+  form.append('payload', JSON.stringify(payload));
+
+  const res = await fetch(`${BASE}/generate_mv`, {
+    method: 'POST',
+    body: form,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`TRELLIS.2 multi-view generate failed: ${res.status} ${text}`);
+  }
+
+  const glbBytes = await res.arrayBuffer();
+  const blob = new Blob([glbBytes], { type: 'model/gltf-binary' });
+
+  // Parse meta from response headers
+  const h = (k: string) => res.headers.get(`x-meta-${k}`);
+  const meta: Trellis2Result['meta'] = {
+    seed: Number(h('seed') ?? 0),
+    sparseStructureSteps: Number(h('sparse_structure_steps') ?? 0),
+    slatSteps: Number(h('slat_steps') ?? 0),
+    cfgStrength: Number(h('cfg_strength') ?? 0),
+    decimationTarget: Number(h('decimation_target') ?? 0),
+    textureSize: Number(h('texture_size') ?? 0),
+    elapsedGenSec: Number(h('elapsed_gen_sec') ?? 0),
+    elapsedBakeSec: Number(h('elapsed_bake_sec') ?? 0),
+    elapsedTotalSec: Number(h('elapsed_total_sec') ?? 0),
+    glbBytes: glbBytes.byteLength,
+  };
+
+  return {
+    glbUrl: URL.createObjectURL(blob),
+    blob,
+    meta,
+  };
+}

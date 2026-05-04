@@ -20,6 +20,7 @@ import { runConceptToTPose, runTPoseMultiView } from '../../services/workflows';
 import { runImageToModel, runMultiViewToModel, TripoServiceError } from '../../services/tripo';
 import {
   generateModel as runTrellis2,
+  generateModelMultiView as runTrellis2MultiView,
   getHealth as getTrellis2Health,
   TRELLIS2_DEFAULTS,
   type Trellis2Params,
@@ -63,13 +64,23 @@ const NODE_KEYS = [
 // ----------------------------------------------------------------------------
 type RoughBackend = 'tripo' | 'trellis2';
 
-const BACKEND_LABEL: Record<RoughBackend, string> = {
-  tripo: 'Tripo-MultiView',
-  trellis2: 'Trellis2-Single',
+/** Trellis2 多视图模式，命名格式仿造 Tripo */
+type Trellis2Mode = 'single' | 'frontBack' | 'fourView';
+
+const TRELLIS2_MODE_LABEL: Record<Trellis2Mode, string> = {
+  single: 'Trellis2-Single',
+  frontBack: 'Trellis2-2View',
+  fourView: 'Trellis2-4View',
 };
+
+/** 动态计算 Trellis2 后端的显示标签（含当前模式） */
+function getTrellis2BackendLabel(mode: Trellis2Mode): string {
+  return TRELLIS2_MODE_LABEL[mode];
+}
 
 const ROUGH_BACKEND_LS_KEY = 'page1.rough.backend';
 const TRELLIS2_PARAMS_LS_KEY = 'page1.rough.trellis2Params';
+const TRELLIS2_MODE_LS_KEY = 'page1.rough.trellis2Mode';
 
 function loadRoughBackend(): RoughBackend {
   try {
@@ -92,6 +103,16 @@ function loadTrellis2Params(): Trellis2Params {
     /* ignore */
   }
   return { ...TRELLIS2_DEFAULTS };
+}
+
+function loadTrellis2Mode(): Trellis2Mode {
+  try {
+    const v = localStorage.getItem(TRELLIS2_MODE_LS_KEY);
+    if (v === 'single' || v === 'frontBack' || v === 'fourView') return v;
+  } catch {
+    /* ignore */
+  }
+  return 'single';
 }
 
 interface Props {
@@ -160,6 +181,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
   // 3D Model 后端选择 + 各后端参数（持久化到 localStorage）
   const [roughBackend, setRoughBackend] = useState<RoughBackend>(loadRoughBackend);
   const [trellis2Params, setTrellis2Params] = useState<Trellis2Params>(loadTrellis2Params);
+  const [trellis2Mode, setTrellis2Mode] = useState<Trellis2Mode>(loadTrellis2Mode);
   // 仅当 backend === 'trellis2' 时显示参数面板
   const [showTrellis2Params, setShowTrellis2Params] = useState(false);
 
@@ -179,6 +201,10 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
   useEffect(() => {
     try { localStorage.setItem(TRELLIS2_PARAMS_LS_KEY, JSON.stringify(trellis2Params)); } catch { /* ignore */ }
   }, [trellis2Params]);
+
+  useEffect(() => {
+    try { localStorage.setItem(TRELLIS2_MODE_LS_KEY, trellis2Mode); } catch { /* ignore */ }
+  }, [trellis2Mode]);
 
   // 当后端切换到 trellis2 时，自动探测服务状态
   useEffect(() => {
@@ -887,7 +913,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     roughAbortRef.current = ctrl;
 
     const backend = roughBackend;
-    onStatusChange(`3D Model: 使用后端 ${BACKEND_LABEL[backend]}`, 'info');
+    const backendLabel = backend === 'trellis2' ? getTrellis2BackendLabel(trellis2Mode) : 'Tripo-MultiView';
+    onStatusChange(`3D Model: 使用后端 ${backendLabel}`, 'info');
 
     try {
       // 读取多视图切分（front/left/back/right）—— Tripo 多视图模式与 trellis2 单图模式都依赖 front 视图
@@ -943,9 +970,10 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       let saveLabel: string;
 
       if (backend === 'trellis2') {
-        // TRELLIS.2 单图建模：优先使用切分的 front 视图，否则退化为 multiview 整图
-        const inputBlob = multiInputs?.front ?? await (await fetch(mvUrl)).blob();
-        const sourceLabel = multiInputs?.front ? 'front 视图' : 'Multi-View 整图';
+        // TRELLIS.2: 根据模式选择单图 / 2 视图 / 4 视图
+        const mode = trellis2Mode;
+
+        // 健康检查（所有模式共用）
         onStatusChange(`TRELLIS.2: 探测服务状态…`, 'info');
         try {
           const health = await getTrellis2Health();
@@ -955,34 +983,96 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
             throw new Error('TRELLIS.2 model not loaded');
           }
           setTrellisStatus('ready');
-          onStatusChange(
-            `TRELLIS.2 就绪 · ${health.gpuName ?? 'GPU'} · 输入：${sourceLabel}`,
-            'info',
-          );
         } catch (e: unknown) {
-          // 区分「模型未加载」与「服务不可达」：前者已经 setTrellisStatus('not-loaded')
           const isNotLoaded =
             e instanceof Error && e.message === 'TRELLIS.2 model not loaded';
           if (!isNotLoaded) {
             setTrellisStatus('error');
           }
-          // /health 接口本身打不通：报错 + 抛出（前端 vite proxy 失败时给清晰提示）
           throw new Error(
             `TRELLIS.2 服务不可达：${e instanceof Error ? e.message : String(e)} ` +
             `（请检查 SSH 隧道 D:\\AI\\Services\\Trellis2Service\\deploy\\ssh_tunnel.ps1 是否启动）`
           );
         }
 
-        onStatusChange(`TRELLIS.2 生成中…（典型耗时 4-5 分钟）`, 'info');
-        const t2Result = await runTrellis2(inputBlob, trellis2Params);
-        blob = t2Result.blob;
-        saveLabel = `trellis2 seed=${t2Result.meta.seed} ` +
-          `gen=${t2Result.meta.elapsedGenSec}s bake=${t2Result.meta.elapsedBakeSec}s`;
-        console.log('[3D Model] TRELLIS.2 meta:', t2Result.meta);
-        onStatusChange(
-          `TRELLIS.2 完成 · 总 ${t2Result.meta.elapsedTotalSec}s（生成 ${t2Result.meta.elapsedGenSec}s + 烘焙 ${t2Result.meta.elapsedBakeSec}s）· ${(t2Result.meta.glbBytes / 1024 / 1024).toFixed(1)} MB`,
-          'success',
-        );
+        if (mode === 'single') {
+          // 单图建模：优先使用切分的 front 视图，否则退化为 multiview 整图
+          const inputBlob = multiInputs?.front ?? await (await fetch(mvUrl)).blob();
+          const sourceLabel = multiInputs?.front ? 'front 视图' : 'Multi-View 整图';
+          onStatusChange(
+            `TRELLIS.2 就绪 · ${TRELLIS2_MODE_LABEL[mode]} · 输入：${sourceLabel}`,
+            'info',
+          );
+
+          onStatusChange(`TRELLIS.2 生成中…（典型耗时 4-5 分钟）`, 'info');
+          const t2Result = await runTrellis2(inputBlob, trellis2Params);
+          blob = t2Result.blob;
+          saveLabel = `trellis2 seed=${t2Result.meta.seed} ` +
+            `gen=${t2Result.meta.elapsedGenSec}s bake=${t2Result.meta.elapsedBakeSec}s`;
+          console.log('[3D Model] TRELLIS.2 meta:', t2Result.meta);
+          onStatusChange(
+            `TRELLIS.2 完成 · 总 ${t2Result.meta.elapsedTotalSec}s（生成 ${t2Result.meta.elapsedGenSec}s + 烘焙 ${t2Result.meta.elapsedBakeSec}s）· ${(t2Result.meta.glbBytes / 1024 / 1024).toFixed(1)} MB`,
+            'success',
+          );
+        } else {
+          // 多视图 → 收集前端/后端或全部 4 视图
+          let viewBlobs: (File | Blob)[] = [];
+          let viewNames: string[] = [];
+          const gather = (view: 'front' | 'left' | 'back' | 'right') => {
+            if (multiInputs?.[view]) {
+              viewBlobs.push(multiInputs[view]!);
+              viewNames.push(view);
+            }
+          };
+
+          if (mode === 'frontBack') {
+            gather('front');
+            gather('back');
+            if (viewBlobs.length < 2) {
+              throw new Error(
+                `Trellis2-2View 需要至少 front + back 视图。` +
+                `当前仅有：${viewNames.join(', ') || '(无)'}。` +
+                `请先在 Multi-View 节点运行"重检测关节"生成 4 视图，` +
+                `或切换到 Trellis2-Single 模式`
+              );
+            }
+          } else {
+            // fourView
+            gather('front');
+            gather('left');
+            gather('back');
+            gather('right');
+            if (viewBlobs.length < 2) {
+              throw new Error(
+                `Trellis2-4View 需要至少 2 个视图。` +
+                `当前仅有：${viewNames.join(', ') || '(无)'}。` +
+                `请先在 Multi-View 节点运行"重检测关节"生成 4 视图`
+              );
+            }
+          }
+
+          onStatusChange(
+            `TRELLIS.2 就绪 · ${TRELLIS2_MODE_LABEL[mode]} · ` +
+            `输入：${viewNames.join(' / ')}（${viewBlobs.length} 视图）`,
+            'info',
+          );
+
+          onStatusChange(
+            `TRELLIS.2 多视图生成中…（${viewBlobs.length} 视图，典型耗时 5-8 分钟）`,
+            'info',
+          );
+          const t2Result = await runTrellis2MultiView(viewBlobs, trellis2Params);
+          blob = t2Result.blob;
+          saveLabel = `trellis2-${mode} seed=${t2Result.meta.seed} ` +
+            `gen=${t2Result.meta.elapsedGenSec}s bake=${t2Result.meta.elapsedBakeSec}s`;
+          console.log('[3D Model] TRELLIS.2 multi-view meta:', t2Result.meta);
+          onStatusChange(
+            `TRELLIS.2 ${TRELLIS2_MODE_LABEL[mode]} 完成 · ` +
+            `总 ${t2Result.meta.elapsedTotalSec}s（生成 ${t2Result.meta.elapsedGenSec}s + 烘焙 ${t2Result.meta.elapsedBakeSec}s）· ` +
+            `${(t2Result.meta.glbBytes / 1024 / 1024).toFixed(1)} MB`,
+            'success',
+          );
+        }
       } else {
         // Tripo：优先多视图，否则单图
         const tripoResult = multiInputs
@@ -1057,7 +1147,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     } finally {
       roughAbortRef.current = null;
     }
-  }, [onStatusChange, setNodeState, project, saveAsset, refreshHistory, loadLatestSegments, roughBackend, trellis2Params]);
+  }, [onStatusChange, setNodeState, project, saveAsset, refreshHistory, loadLatestSegments, roughBackend, trellis2Mode, trellis2Params]);
 
   const cancelRoughModel = useCallback(() => {
     roughAbortRef.current?.abort();
@@ -1332,7 +1422,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     roughNojacketAbortRef.current = ctrl;
 
     const backend = roughBackend;
-    onStatusChange(`3D Model (NoJacket): 使用后端 ${BACKEND_LABEL[backend]}`, 'info');
+    const backendLabel = backend === 'trellis2' ? getTrellis2BackendLabel(trellis2Mode) : 'Tripo-MultiView';
+    onStatusChange(`3D Model (NoJacket): 使用后端 ${backendLabel}`, 'info');
 
     try {
       // 读取 Remove Jacket 切分（4 视图），跟 runRoughModel 对应代码完全同构
@@ -1371,8 +1462,9 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       let saveLabel: string;
 
       if (backend === 'trellis2') {
-        const inputBlob = multiInputs?.front ?? await (await fetch(extractionUrl)).blob();
-        const sourceLabel = multiInputs?.front ? 'front 视图' : 'Remove Jacket 整图';
+        const mode = trellis2Mode;
+
+        // 健康检查（所有模式共用）
         onStatusChange('TRELLIS.2: 探测服务状态…', 'info');
         try {
           const health = await getTrellis2Health();
@@ -1382,10 +1474,6 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
             throw new Error('TRELLIS.2 model not loaded');
           }
           setTrellisStatus('ready');
-          onStatusChange(
-            `TRELLIS.2 就绪 · ${health.gpuName ?? 'GPU'} · 输入：${sourceLabel}`,
-            'info',
-          );
         } catch (e: unknown) {
           const isNotLoaded = e instanceof Error && e.message === 'TRELLIS.2 model not loaded';
           if (!isNotLoaded) setTrellisStatus('error');
@@ -1394,15 +1482,77 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           );
         }
 
-        onStatusChange('TRELLIS.2 生成 NoJacket 模型中…（典型耗时 4-5 分钟）', 'info');
-        const t2Result = await runTrellis2(inputBlob, trellis2Params);
-        blob = t2Result.blob;
-        saveLabel = `trellis2 nojacket seed=${t2Result.meta.seed} ` +
-          `gen=${t2Result.meta.elapsedGenSec}s bake=${t2Result.meta.elapsedBakeSec}s`;
-        onStatusChange(
-          `TRELLIS.2 NoJacket 完成 · 总 ${t2Result.meta.elapsedTotalSec}s · ${(t2Result.meta.glbBytes / 1024 / 1024).toFixed(1)} MB`,
-          'success',
-        );
+        if (mode === 'single') {
+          const inputBlob = multiInputs?.front ?? await (await fetch(extractionUrl)).blob();
+          const sourceLabel = multiInputs?.front ? 'front 视图' : 'Remove Jacket 整图';
+          onStatusChange(
+            `TRELLIS.2 就绪 · ${TRELLIS2_MODE_LABEL[mode]} · 输入：${sourceLabel}`,
+            'info',
+          );
+
+          onStatusChange('TRELLIS.2 生成 NoJacket 模型中…（典型耗时 4-5 分钟）', 'info');
+          const t2Result = await runTrellis2(inputBlob, trellis2Params);
+          blob = t2Result.blob;
+          saveLabel = `trellis2 nojacket seed=${t2Result.meta.seed} ` +
+            `gen=${t2Result.meta.elapsedGenSec}s bake=${t2Result.meta.elapsedBakeSec}s`;
+          onStatusChange(
+            `TRELLIS.2 NoJacket 完成 · 总 ${t2Result.meta.elapsedTotalSec}s · ${(t2Result.meta.glbBytes / 1024 / 1024).toFixed(1)} MB`,
+            'success',
+          );
+        } else {
+          // 多视图 → 收集视图
+          let viewBlobs: (File | Blob)[] = [];
+          let viewNames: string[] = [];
+          const gather = (view: 'front' | 'left' | 'back' | 'right') => {
+            if (multiInputs?.[view]) {
+              viewBlobs.push(multiInputs[view]!);
+              viewNames.push(view);
+            }
+          };
+
+          if (mode === 'frontBack') {
+            gather('front');
+            gather('back');
+            if (viewBlobs.length < 2) {
+              throw new Error(
+                `Trellis2-2View NoJacket 需要至少 front + back 视图。` +
+                `当前仅有：${viewNames.join(', ') || '(无)'}。` +
+                `请切换到 Trellis2-Single 模式或确保 Remove Jacket 拥有多视图切分`
+              );
+            }
+          } else {
+            gather('front');
+            gather('left');
+            gather('back');
+            gather('right');
+            if (viewBlobs.length < 2) {
+              throw new Error(
+                `Trellis2-4View NoJacket 需要至少 2 个视图。` +
+                `当前仅有：${viewNames.join(', ') || '(无)'}`
+              );
+            }
+          }
+
+          onStatusChange(
+            `TRELLIS.2 就绪 · ${TRELLIS2_MODE_LABEL[mode]} · ` +
+            `NoJacket 输入：${viewNames.join(' / ')}（${viewBlobs.length} 视图）`,
+            'info',
+          );
+
+          onStatusChange(
+            `TRELLIS.2 多视图 NoJacket 生成中…（${viewBlobs.length} 视图，典型耗时 5-8 分钟）`,
+            'info',
+          );
+          const t2Result = await runTrellis2MultiView(viewBlobs, trellis2Params);
+          blob = t2Result.blob;
+          saveLabel = `trellis2-${mode} nojacket seed=${t2Result.meta.seed} ` +
+            `gen=${t2Result.meta.elapsedGenSec}s bake=${t2Result.meta.elapsedBakeSec}s`;
+          onStatusChange(
+            `TRELLIS.2 ${TRELLIS2_MODE_LABEL[mode]} NoJacket 完成 · ` +
+            `总 ${t2Result.meta.elapsedTotalSec}s · ${(t2Result.meta.glbBytes / 1024 / 1024).toFixed(1)} MB`,
+            'success',
+          );
+        }
       } else {
         const tripoResult = multiInputs
           ? await runMultiViewToModel(multiInputs, {
@@ -1458,7 +1608,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     } finally {
       roughNojacketAbortRef.current = null;
     }
-  }, [onStatusChange, setNodeState, project, saveAsset, refreshHistory, loadLatestSegments, roughBackend, trellis2Params]);
+  }, [onStatusChange, setNodeState, project, saveAsset, refreshHistory, loadLatestSegments, roughBackend, trellis2Mode, trellis2Params]);
 
   // ---- Mock runner for nodes 3..4 (3D Model / Rigging) -----------------
   const runMockNode = useCallback(
@@ -1793,6 +1943,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                       }
                     }}
                     trellisStatus={trellisStatus}
+                    trellis2Mode={trellis2Mode}
+                    onChangeTrellis2Mode={setTrellis2Mode}
                     disabled={state === 'running'}
                   />
                 )}
@@ -1869,7 +2021,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                       style={selStyle}
                     >
                       <option value="tripo">Tripo-MultiView</option>
-                      <option value="trellis2">Trellis2-Single</option>
+                      <option value="trellis2">{getTrellis2BackendLabel(trellis2Mode)}</option>
                     </select>
                   </div>
                 );
@@ -2450,6 +2602,9 @@ interface RoughBackendPanelProps {
   onChangeBackend: (b: RoughBackend) => void;
   trellis2Params: Trellis2Params;
   onChangeTrellis2Params: (p: Trellis2Params) => void;
+  /** Trellis2 多视图模式（仅在 backend === 'trellis2' 时展示选择器） */
+  trellis2Mode: Trellis2Mode;
+  onChangeTrellis2Mode: (m: Trellis2Mode) => void;
   expanded: boolean;
   onToggleExpanded: () => void;
   onWarmup: () => void;
@@ -2465,6 +2620,8 @@ function RoughBackendPanel({
   onChangeBackend,
   trellis2Params,
   onChangeTrellis2Params,
+  trellis2Mode,
+  onChangeTrellis2Mode,
   expanded,
   onToggleExpanded,
   onWarmup,
@@ -2542,7 +2699,7 @@ function RoughBackendPanel({
             style={{ ...inputStyle, padding: '2px' }}
           >
             <option value="tripo">Tripo-MultiView</option>
-            <option value="trellis2">Trellis2-Single</option>
+            <option value="trellis2">{TRELLIS2_MODE_LABEL[trellis2Mode]}</option>
           </select>
         </div>
       )}
@@ -2636,6 +2793,19 @@ function RoughBackendPanel({
                 ? '检测'
                 : 'Warm'}
             </button>
+          </div>
+          <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={labelStyle}>模式</span>
+            <select
+              disabled={disabled}
+              value={trellis2Mode}
+              onChange={(e) => onChangeTrellis2Mode(e.target.value as Trellis2Mode)}
+              style={{ ...inputStyle, padding: '2px' }}
+            >
+              <option value="single">{TRELLIS2_MODE_LABEL.single}</option>
+              <option value="frontBack">{TRELLIS2_MODE_LABEL.frontBack}</option>
+              <option value="fourView">{TRELLIS2_MODE_LABEL.fourView}</option>
+            </select>
           </div>
           {expanded && (
             <>

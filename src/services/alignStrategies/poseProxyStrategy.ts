@@ -33,9 +33,10 @@ export const poseProxyStrategy: AlignStrategy = {
   kind: 'auto',
   requirements,
   steps: [
-    { id: 'collect-joints', title: '1. 收集源/目标关节', description: 'Page1.joints.front 双侧共用' },
-    { id: 'build-proxy', title: '2. 构建骨架代理', description: 'buildSkeletonProxy()' },
-    { id: 'svd-pose', title: '3. SVD 姿态对齐', description: 'computePoseAlignment()' },
-    { id: 'icp-refine', title: '4. ICP 精修', description: '在目标区域内做最近邻精修' },
+    { id: 'collect-joints', title: '1. 收集源/目标关节', description: 'Page1.joints.front 双侧共用，按目标相机分辨率缩放 tar 关节' },
+    { id: 'render-src-ortho', title: '2. 源正交渲染', description: '渲染源 mesh 到 Page1 同尺寸画布，得到 srcCamera 供 step 3 使用' },
+    { id: 'build-proxies', title: '3. 构建骨架代理 + 锚点', description: 'buildSkeletonProxy ×2 + computePoseAlignment + 直连关节锚点' },
+    { id: 'svd-pose', title: '4. SVD 姿态对齐', description: 'alignSourceMeshByLandmarks()' },
+    { id: 'icp-refine', title: '5. ICP 精修', description: '在目标区域内做最近邻精修' },
   ],
 };

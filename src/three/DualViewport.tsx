@@ -63,6 +63,9 @@ interface DualViewportProps {
   /** Generic debug point layers per side (saliency pool, FPS, etc.) */
   srcPointLayers?: Array<{ indices: number[]; color: string; size?: number; opacity?: number }>;
   tarPointLayers?: Array<{ indices: number[]; color: string; size?: number; opacity?: number }>;
+  /** Free-position 3D marker spheres (anchors / PCA centroids) per side */
+  srcMarkers?: Array<{ position: Vec3; color: string; size?: number; label?: string; opacity?: number }>;
+  tarMarkers?: Array<{ position: Vec3; color: string; size?: number; label?: string; opacity?: number }>;
 }
 
 export function DualViewport({
@@ -103,6 +106,8 @@ export function DualViewport({
   tarCandidateColor,
   srcPointLayers,
   tarPointLayers,
+  srcMarkers,
+  tarMarkers,
 }: DualViewportProps) {
   const cameraSyncEnabled = useCameraSyncStore((s) => s.syncEnabled);
   const setCameraSyncEnabled = useCameraSyncStore((s) => s.setSyncEnabled);
@@ -170,6 +175,7 @@ export function DualViewport({
             candidateVertices={srcCandidateVertices}
             candidateColor={srcCandidateColor}
             pointLayers={srcPointLayers}
+            markers={srcMarkers}
           />
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
@@ -197,6 +203,7 @@ export function DualViewport({
             candidateVertices={tarCandidateVertices}
             candidateColor={tarCandidateColor}
             pointLayers={tarPointLayers}
+            markers={tarMarkers}
           />
         </div>
       </div>

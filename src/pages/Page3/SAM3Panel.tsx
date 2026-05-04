@@ -245,6 +245,37 @@ export function SAM3Panel(props: SAM3PanelProps) {
         onStatus?.('SAM3：mask 解码失败', 'error');
         return;
       }
+      // ── DIAG: 反投影前后的 region/mask/camera/命中数据 ──
+      // 用于排查"jacket 案例下 region 错位"的问题。
+      // 关注：
+      //   1. pack.regions 的 mask_value 与 label 是否一一对应（顺序）
+      //   2. mask 实际像素值的分布（值直方图）是否匹配 mask_value
+      //   3. camera fit 后的画布尺寸 vs mask 原图尺寸
+      //   4. 每个 region 的 pixelHits 与 vertex 命中数
+      const histo = new Map<number, number>();
+      for (let i = 0; i < mask.data.length; i++) {
+        const v = mask.data[i];
+        histo.set(v, (histo.get(v) ?? 0) + 1);
+      }
+      const histoTop = Array.from(histo.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10);
+      // eslint-disable-next-line no-console
+      console.group('[SAM3 reproject diag]');
+      // eslint-disable-next-line no-console
+      console.log('regions(pack):', loaded.pack.regions.map((r, i) => ({
+        idx: i, label: r.label, mask_value: r.mask_value, bbox: r.bbox,
+      })));
+      // eslint-disable-next-line no-console
+      console.log('mask:', { w: mask.width, h: mask.height, refImg: maskDims });
+      // eslint-disable-next-line no-console
+      console.log('camera:', {
+        w: cam.width, h: cam.height,
+        camY: cam.camY, camZ: cam.camZ,
+        worldPerPx: cam.worldPerPx, meshFrontX: cam.meshFrontX,
+      });
+      // eslint-disable-next-line no-console
+      console.log('mask pixel value top10:', histoTop);
       const result = reprojectMaskToVertices(
         tarMesh.vertices,
         mask,
@@ -252,6 +283,156 @@ export function SAM3Panel(props: SAM3PanelProps) {
         cam,
         { projectionMode: 'through', splatRadiusPx: 1, maskDilatePx: 2 },
       );
+      // eslint-disable-next-line no-console
+      console.log('result:', {
+        perRegionPixelHits: Array.from(result.perRegionPixelHits.entries()),
+        regionVertexCounts: Array.from(result.regions.entries()).map(([l, s]) => [l, s.size]),
+        unassignedPixels: result.unassignedPixels,
+      });
+      // ── 3D bbox per region：用 World 坐标定位每个 region 顶点的实际位置
+      // 如果 leg region 的顶点 worldY 范围不在 mesh 下半部分，那么相机/坐标轴
+      // 有问题；如果 worldY 正确但 worldX/Z 散布异常大，说明 through mode 把
+      // 背面/内部顶点也吃了。
+      // 同时输出 mesh 整体 bbox 作参考。
+      let meshMnX=Infinity,meshMnY=Infinity,meshMnZ=Infinity;
+      let meshMxX=-Infinity,meshMxY=-Infinity,meshMxZ=-Infinity;
+      for (const v of tarMesh.vertices) {
+        if (v[0]<meshMnX)meshMnX=v[0]; if (v[0]>meshMxX)meshMxX=v[0];
+        if (v[1]<meshMnY)meshMnY=v[1]; if (v[1]>meshMxY)meshMxY=v[1];
+        if (v[2]<meshMnZ)meshMnZ=v[2]; if (v[2]>meshMxZ)meshMxZ=v[2];
+      }
+      const regionBBox3D = Array.from(result.regions.entries()).map(([label, set]) => {
+        let mnx=Infinity,mny=Infinity,mnz=Infinity,mxx=-Infinity,mxy=-Infinity,mxz=-Infinity;
+        let cx=0,cy=0,cz=0,n=0;
+        for (const i of set) {
+          const v = tarMesh.vertices[i];
+          if (v[0]<mnx)mnx=v[0]; if (v[0]>mxx)mxx=v[0];
+          if (v[1]<mny)mny=v[1]; if (v[1]>mxy)mxy=v[1];
+          if (v[2]<mnz)mnz=v[2]; if (v[2]>mxz)mxz=v[2];
+          cx+=v[0]; cy+=v[1]; cz+=v[2]; n++;
+        }
+        if (n === 0) return { label, count: 0 };
+        return {
+          label,
+          count: n,
+          centerY: (cy/n).toFixed(3),
+          rangeY: `[${mny.toFixed(3)}, ${mxy.toFixed(3)}]`,
+          rangeX: `[${mnx.toFixed(3)}, ${mxx.toFixed(3)}]`,
+          rangeZ: `[${mnz.toFixed(3)}, ${mxz.toFixed(3)}]`,
+        };
+      });
+      // eslint-disable-next-line no-console
+      console.log('mesh bbox:', {
+        x: `[${meshMnX.toFixed(3)}, ${meshMxX.toFixed(3)}]`,
+        y: `[${meshMnY.toFixed(3)}, ${meshMxY.toFixed(3)}]  (top→bottom = high→low?)`,
+        z: `[${meshMnZ.toFixed(3)}, ${meshMxZ.toFixed(3)}]`,
+      });
+      // eslint-disable-next-line no-console
+      console.log('regionBBox3D:', regionBBox3D);
+      // ── 按 worldY 分箱：每箱内统计「总顶点数 / 各 region 命中数 / 未命中数」
+      // 用于定位"缺失的小腿顶点"具体去哪了。如果最低的 bin 里 R2(jacket)
+      // 命中很多，那是 first-win bug；如果 unassigned 多，那是 mask 在该
+      // 像素区无标签（mask 与 mesh 在 Y 方向没对齐）；如果 total=0 即 mesh
+      // 那段Y本来就无几何。
+      const NUM_BINS = 10;
+      const yMin = meshMnY, yMax = meshMxY;
+      const binW = (yMax - yMin) / NUM_BINS;
+      const bins: Array<{ yLo: number; yHi: number; total: number; perRegion: Record<string, number>; unassigned: number }> = [];
+      for (let b = 0; b < NUM_BINS; b++) {
+        bins.push({
+          yLo: yMin + b * binW,
+          yHi: yMin + (b + 1) * binW,
+          total: 0,
+          perRegion: {},
+          unassigned: 0,
+        });
+      }
+      // build vertex→label lookup
+      const vertLabel = new Map<number, string>();
+      for (const [label, set] of result.regions.entries()) {
+        for (const i of set) vertLabel.set(i, label);
+      }
+      for (let i = 0; i < tarMesh.vertices.length; i++) {
+        const wy = tarMesh.vertices[i][1];
+        let bIdx = Math.floor((wy - yMin) / binW);
+        if (bIdx < 0) bIdx = 0; if (bIdx >= NUM_BINS) bIdx = NUM_BINS - 1;
+        bins[bIdx].total++;
+        const lab = vertLabel.get(i);
+        if (lab) bins[bIdx].perRegion[lab] = (bins[bIdx].perRegion[lab] ?? 0) + 1;
+        else bins[bIdx].unassigned++;
+      }
+      // eslint-disable-next-line no-console
+      console.log('vertexY bins (low→high):', bins.map((b, k) => ({
+        bin: k,
+        yRange: `[${b.yLo.toFixed(3)}, ${b.yHi.toFixed(3)}]`,
+        total: b.total,
+        ...b.perRegion,
+        unassigned: b.unassigned,
+      })));
+      // ── Unassigned 顶点投影分析:
+      // 把所有 unassigned 顶点按当前相机投到像素,记录:
+      //   - 落在画布内/外的比例
+      //   - 落在画布内时,mask 值直方图(以确认是 mask=0 还是命中了某 region 但被代码丢弃)
+      //   - pixelX/pixelY 范围
+      // 同时单独跑底部 3 个 bin (legs 区域),报它们的 pixel 范围 — 与 R3 mask
+      // bbox 比对就能定位 X 轴是否错位。
+      const unassignedSet = new Set<number>();
+      for (let i = 0; i < tarMesh.vertices.length; i++) {
+        if (!vertLabel.has(i)) unassignedSet.add(i);
+      }
+      const W = cam.width, H = cam.height;
+      const projectVert = (v: [number, number, number]) => {
+        const px = Math.round(W / 2 + (cam.camZ - v[2]) / cam.worldPerPx);
+        const py = Math.round(H / 2 - (v[1] - cam.camY) / cam.worldPerPx);
+        return { px, py };
+      };
+      let inFrame = 0, outFrame = 0;
+      const maskHisto = new Map<number, number>();
+      let pxMin = Infinity, pxMax = -Infinity, pyMin = Infinity, pyMax = -Infinity;
+      // legs subset: Y < -0.2 (≈ bin 0..2)
+      let legsPxMin = Infinity, legsPxMax = -Infinity, legsPyMin = Infinity, legsPyMax = -Infinity;
+      let legsCount = 0, legsInFrame = 0;
+      const legsMaskHisto = new Map<number, number>();
+      for (const i of unassignedSet) {
+        const v = tarMesh.vertices[i];
+        const { px, py } = projectVert(v);
+        const isLegs = v[1] < -0.2;
+        if (isLegs) legsCount++;
+        if (px < 0 || px >= W || py < 0 || py >= H) {
+          outFrame++;
+          continue;
+        }
+        inFrame++;
+        if (px < pxMin) pxMin = px; if (px > pxMax) pxMax = px;
+        if (py < pyMin) pyMin = py; if (py > pyMax) pyMax = py;
+        const mv = mask.data[py * W + px];
+        maskHisto.set(mv, (maskHisto.get(mv) ?? 0) + 1);
+        if (isLegs) {
+          legsInFrame++;
+          if (px < legsPxMin) legsPxMin = px; if (px > legsPxMax) legsPxMax = px;
+          if (py < legsPyMin) legsPyMin = py; if (py > legsPyMax) legsPyMax = py;
+          legsMaskHisto.set(mv, (legsMaskHisto.get(mv) ?? 0) + 1);
+        }
+      }
+      // eslint-disable-next-line no-console
+      console.log('unassigned vertices projection:', {
+        total: unassignedSet.size,
+        inFrame, outFrame,
+        pixelXRange: `[${pxMin}, ${pxMax}]`,
+        pixelYRange: `[${pyMin}, ${pyMax}]`,
+        maskValueHisto: Array.from(maskHisto.entries()).sort((a, b) => b[1] - a[1]).slice(0, 8),
+      });
+      // eslint-disable-next-line no-console
+      console.log('LEGS (Y<-0.2) unassigned projection:', {
+        total: legsCount,
+        inFrame: legsInFrame,
+        outFrame: legsCount - legsInFrame,
+        pixelXRange: `[${legsPxMin}, ${legsPxMax}]`,
+        pixelYRange: `[${legsPyMin}, ${legsPyMax}]`,
+        maskValueHisto: Array.from(legsMaskHisto.entries()).sort((a, b) => b[1] - a[1]),
+      });
+      // eslint-disable-next-line no-console
+      console.groupEnd();
       setReprojRegions(result.regions);
       // 按 loaded.pack.regions 原顺序发出，带 regionIndex。这里保证了序号
       // 与 Page1 SegPack 预览里的颜色序号一致，便于诊断反投影结果。

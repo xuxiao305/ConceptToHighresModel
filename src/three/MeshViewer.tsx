@@ -25,7 +25,7 @@ import {
   type ReactNode,
 } from 'react';
 import { Canvas, useFrame, type ThreeEvent } from '@react-three/fiber';
-import { OrbitControls } from '@react-three/drei';
+import { OrbitControls, Html } from '@react-three/drei';
 import * as THREE from 'three';
 import type { Vec3, Face3, ViewMode, MeshRole } from './types';
 import type { LandmarkPoint } from './landmarkStore';
@@ -247,6 +247,56 @@ function HighlightPoints({
 }
 
 // ---------------------------------------------------------------------------
+// Free-position marker spheres (anchors, PCA centroids, etc.)
+// ---------------------------------------------------------------------------
+
+function MarkerSpheres({
+  markers,
+}: {
+  markers: NonNullable<MeshViewerProps['markers']>;
+}) {
+  return (
+    <group>
+      {markers.map((m, i) => {
+        const radius = m.size ?? 0.02;
+        const opacity = m.opacity ?? 1;
+        return (
+          <group key={`marker-${i}-${m.color}`} position={[m.position[0], m.position[1], m.position[2]]}>
+            <mesh renderOrder={999}>
+              <sphereGeometry args={[radius, 16, 12]} />
+              <meshBasicMaterial
+                color={m.color}
+                transparent={opacity < 1}
+                opacity={opacity}
+                depthTest={false}
+              />
+            </mesh>
+            {m.label && (
+              <Html
+                center
+                style={{
+                  pointerEvents: 'none',
+                  userSelect: 'none',
+                  fontSize: 10,
+                  color: '#fff',
+                  background: 'rgba(0,0,0,0.55)',
+                  padding: '1px 4px',
+                  borderRadius: 3,
+                  whiteSpace: 'nowrap',
+                  transform: `translate(0, -${radius * 60 + 8}px)`,
+                }}
+              >
+                {m.label}
+              </Html>
+            )}
+          </group>
+        );
+      })}
+    </group>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Auto-fit camera + sync
 // ---------------------------------------------------------------------------
 
@@ -405,6 +455,22 @@ export interface MeshViewerProps {
     size?: number;
     opacity?: number;
   }>;
+  /**
+   * Free-position 3D markers — render small spheres at arbitrary world
+   * positions (not tied to mesh vertex indices). Used for visualizing
+   * algorithm-derived points like skeleton-proxy anchors, PCA centroids,
+   * joint seeds, etc. Sphere radius is in world units (same coordinate
+   * space as `vertices`); default 0.02.
+   */
+  markers?: Array<{
+    position: Vec3;
+    color: string;
+    /** Sphere radius in world units (default 0.02) */
+    size?: number;
+    /** Optional text label rendered above the sphere */
+    label?: string;
+    opacity?: number;
+  }>;
 }
 
 export function MeshViewer({
@@ -443,6 +509,7 @@ export function MeshViewer({
   candidateVertices,
   candidateColor = '#ffffff',
   pointLayers,
+  markers,
 }: MeshViewerProps) {
   const [meshGeometry, setMeshGeometry] = useState<THREE.BufferGeometry | null>(null);
   const handleGeometryReady = useCallback((geo: THREE.BufferGeometry) => {
@@ -579,6 +646,10 @@ export function MeshViewer({
                 opacity={layer.opacity ?? 0.9}
               />
             ) : null,
+          )}
+
+          {markers && markers.length > 0 && (
+            <MarkerSpheres markers={markers} />
           )}
 
           {landmarks.map((pt) => (

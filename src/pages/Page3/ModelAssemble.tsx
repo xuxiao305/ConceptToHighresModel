@@ -116,31 +116,22 @@ import {
   type StrategyReadiness,
   type StrategyStep,
 } from '../../services/alignStrategies';
+import {
+  collectJoints,
+  renderSrcOrtho,
+  buildProxies,
+  solveSvd,
+  solveIcp,
+  type CollectJointsOutput,
+  type RenderSrcOrthoOutput,
+  type BuildProxiesOutput,
+  type SolveSvdOutput,
+  type SolveIcpOutput,
+} from '../../services/alignStrategies/poseProxySteps';
 
 interface ModelAssembleProps {
   onStatusChange?: (msg: string, type?: 'info' | 'success' | 'warning' | 'error') => void;
 }
-
-/**
- * Stage 7/6）：STUB_FALLBACK 已清空，所有 9 字段都从真实数据推导。
- */
-const STUB_FALLBACK = {} as const;
-
-/** Stage 7/1、7/2、7/3c、7/4、7/5、7/6: 实时接通的字段名单（9/9）。 */
-const REAL_FIELDS: ReadonlyArray<keyof AlignStrategyContext> = [
-  'hasPoseProxyJoints',
-  'hasSource',
-  'hasTarget',
-  'hasSegPack',
-  'hasBodyTorsoRegion',
-  'hasAdjacency',
-  'srcLandmarkCount',
-  'tarLandmarkCount',
-  'hasOrthoCamera',
-  'hasMaskReprojection',
-  'hasTargetRegion',
-];
-const TOTAL_FIELDS = 11;
 
 /** 与生产 ModelAssemble.findMaskRegion 同一组词汇（line 431-432）。 */
 const BODY_TORSO_LABELS = ['body', 'torso', 'jacket', 'coat'];
@@ -195,25 +186,51 @@ export function ModelAssemble(props: ModelAssembleProps) {
   const [aligning, setAligning] = useState(false);
   const [alignResult, setAlignResult] = useState<AlignmentResult | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
+  // Phase A2: pose-proxy 真分步状态 — 每步缓存结果，null = 未跑 / 待跑。
+  type PoseProxyStepState = {
+    joints: CollectJointsOutput | null;
+    srcRender: RenderSrcOrthoOutput | null;
+    proxies: BuildProxiesOutput | null;
+    svd: SolveSvdOutput | null;
+    icp: SolveIcpOutput | null;
+  };
+  const [poseProxyState, setPoseProxyState] = useState<PoseProxyStepState>({
+    joints: null,
+    srcRender: null,
+    proxies: null,
+    svd: null,
+    icp: null,
+  });
   // Stage 8/4: 中央视图模式 与 结果预览子模式。
   type CenterView = 'landmark' | 'result';
   type ResultView = 'overlay' | 'aligned' | 'target' | 'original';
   const [centerView, setCenterView] = useState<CenterView>('landmark');
   const [resultView, setResultView] = useState<ResultView>('overlay');
-  // Stage 9: SAM3 target region + ortho camera (V2-native, replaces V1 panel).
-  const [tarRegion, setTarRegion] = useState<MeshRegion | null>(null);
-  const [tarRegionLabel, setTarRegionLabel] = useState<string | null>(null);
-  const [tarOrthoCamera, setTarOrthoCamera] = useState<OrthoFrontCamera | null>(null);
-  // 反投影后的每区域顶点集（可选）——用于在中央 3D 视口高亮全部 SegPack 区域。
-  // 使用有序数组，保留 regionIndex 以与 Page1 SegPack 预览色彩对齐。
-  const [tarReprojRegions, setTarReprojRegions] = useState<
-    Array<{ regionIndex: number; label: string; vertices: number[] }> | null
-  >(null);
+  // Stage 9 + Phase C: SAM3 目标分割状态汇总为单个状态对象，
+  // 避免多个独立 useState 不同步。下游代码依然通过解构别名访问。
+  type TarSegmentationState = {
+    region: MeshRegion | null;
+    label: string | null;
+    orthoCamera: OrthoFrontCamera | null;
+    /** 反投影后的每区域顶点集（可选）——用于在中央 3D 视口高亮全部 SegPack 区域。 */
+    reprojRegions: Array<{ regionIndex: number; label: string; vertices: number[] }> | null;
+  };
+  const [tarSegmentationState, setTarSegmentationState] = useState<TarSegmentationState>({
+    region: null, label: null, orthoCamera: null, reprojRegions: null,
+  });
+  const tarRegion = tarSegmentationState.region;
+  const tarRegionLabel = tarSegmentationState.label;
+  const tarOrthoCamera = tarSegmentationState.orthoCamera;
+  const tarReprojRegions = tarSegmentationState.reprojRegions;
   const handleAdoptRegion = useCallback(
     (region: MeshRegion | null, label: string | null, camera: OrthoFrontCamera | null) => {
-      setTarRegion(region);
-      setTarRegionLabel(label);
-      setTarOrthoCamera(camera);
+      setTarSegmentationState((prev) => ({ ...prev, region, label, orthoCamera: camera }));
+    },
+    [],
+  );
+  const setTarReprojRegions = useCallback(
+    (r: Array<{ regionIndex: number; label: string; vertices: number[] }> | null) => {
+      setTarSegmentationState((prev) => ({ ...prev, reprojRegions: r }));
     },
     [],
   );
@@ -366,7 +383,6 @@ export function ModelAssemble(props: ModelAssembleProps) {
     const hasSource = sourceFileCount > 0;
     const hasTarget = targetFileCount > 0;
     return {
-      ...STUB_FALLBACK,
       hasPoseProxyJoints: !!(front && front.length > 0),
       hasSource,
       hasTarget,
@@ -560,6 +576,17 @@ export function ModelAssemble(props: ModelAssembleProps) {
     [project, savePage3SegPack, onStatusChange, refreshAssets],
   );
 
+  // Phase A3: 上游状态变化 → 清空 poseProxyState。
+  // joints / SAM3 region / mesh 变化 → 清空全部（所有步骤依赖这些输入）。
+  useEffect(() => {
+    setPoseProxyState({ joints: null, srcRender: null, proxies: null, svd: null, icp: null });
+  }, [project?.meta.page1?.joints, tarRegion, srcMesh, tarMesh]);
+
+  // ICP 参数变化 → 只清 icp 槽（下游可以重跑 ICP 而无需重算 SVD/proxies）。
+  useEffect(() => {
+    setPoseProxyState((prev) => (prev.icp ? { ...prev, icp: null } : prev));
+  }, [icpMaxIter, icpRejectMul, icpSampleCount]);
+
   // Stage 8/3: Manual 策略 Run。其余 3 套 auto 策略运行仍在 V1。
   // 语义与 V1 handleRunAlign (line 2436-2484) 一致：
   //   - srcLandmark.length === tarLandmark.length
@@ -659,22 +686,37 @@ export function ModelAssemble(props: ModelAssembleProps) {
           m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2] + m[2][3],
         ];
       });
+      // Phase C: 真实计算 ICP 后的 landmark mean/max error（不再 alias rmse）。
+      let lmSum = 0;
+      let lmMax = 0;
+      const n = Math.min(alignedSrcLm.length, tarLandmarks.length);
+      for (let i = 0; i < n; i++) {
+        const a = alignedSrcLm[i];
+        const b = tarLandmarks[i].position;
+        const dx = a[0] - b[0];
+        const dy = a[1] - b[1];
+        const dz = a[2] - b[2];
+        const e = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        lmSum += e;
+        if (e > lmMax) lmMax = e;
+      }
+      const lmMean = n > 0 ? lmSum / n : 0;
+
       const refined: AlignmentResult = {
         ...alignResult,
         matrix4x4: icp.matrix4x4,
         transformedVertices: transformed,
         alignedSrcLandmarks: alignedSrcLm,
         rmse: icp.rmse,
-        // ICP doesn't recompute mean/max in our wrapper; reuse rmse as a coarse proxy.
-        meanError: icp.rmse,
-        maxError: icp.rmse,
+        meanError: lmMean,
+        maxError: lmMax,
       };
       setAlignResult(refined);
       const lastIter = icp.iterations[icp.iterations.length - 1];
       pushTrace({
         method: 'icp-refine',
         rmse: icp.rmse,
-        meanError: icp.rmse,
+        meanError: lmMean,
         pairsKept: lastIter?.pairsKept,
         iterations: icp.iterations.length,
         ok: true,
@@ -689,7 +731,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
     } finally {
       setAligning(false);
     }
-  }, [alignResult, srcMesh, tarMesh, tarRegion, srcLandmarks, icpMaxIter, icpRejectMul, icpSampleCount, onStatusChange, pushTrace]);
+  }, [alignResult, srcMesh, tarMesh, tarRegion, srcLandmarks, tarLandmarks, icpMaxIter, icpRejectMul, icpSampleCount, onStatusChange, pushTrace]);
 
   // Stage 10: export aligned source mesh as GLB into project (page3.aligned).
   const handleExportAligned = useCallback(async () => {
@@ -743,6 +785,89 @@ export function ModelAssemble(props: ModelAssembleProps) {
       }));
     return layers.length > 0 ? layers : undefined;
   }, [tarReprojRegions]);
+
+  // ── Pose-proxy step 3 可视化：anchor / shoulder_line / torso_axis ─────
+  // 把 PCA 算出的代理 anchor 作为彩色小球叠加在 src/tar mesh 上，方便
+  // 直观验证骨架代理是否落在合理位置。颜色按 kind 分组（torso=青，
+  // 上臂=绿，前臂=黄，shoulder_line=红，torso_axis=紫），sphere
+  // 直径 ≈ mesh 对角线 × 0.012。
+  const anchorMarkers = useMemo(() => {
+    const proxies = poseProxyState.proxies;
+    if (!proxies || !srcMesh || !tarMesh) return { src: undefined, tar: undefined };
+
+    const colorForKind = (kind: string): string => {
+      if (kind.includes('shoulder_line')) return '#ff4d4f';
+      if (kind.includes('torso_axis')) return '#b37feb';
+      if (kind.includes('torso')) return '#13c2c2';
+      if (kind.includes('forearm')) return '#fadb14';
+      if (kind.includes('upper_arm') || kind.includes('arm')) return '#52c41a';
+      return '#ffffff';
+    };
+
+    const meshDiag = (mesh: { vertices: Vec3[] }): number => {
+      let minX = Infinity, minY = Infinity, minZ = Infinity;
+      let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+      for (const v of mesh.vertices) {
+        if (v[0] < minX) minX = v[0]; if (v[0] > maxX) maxX = v[0];
+        if (v[1] < minY) minY = v[1]; if (v[1] > maxY) maxY = v[1];
+        if (v[2] < minZ) minZ = v[2]; if (v[2] > maxZ) maxZ = v[2];
+      }
+      const dx = maxX - minX, dy = maxY - minY, dz = maxZ - minZ;
+      return Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+    };
+
+    const buildSide = (proxy: typeof proxies.srcProxy, mesh: { vertices: Vec3[] }) => {
+      const radius = meshDiag(mesh) * 0.012;
+      const list: Array<{ position: Vec3; color: string; size: number; label?: string; opacity?: number }> = [];
+
+      // 灰色小球：jointSeeds（2D joint → 最近 mesh 顶点平均位置）
+      // 显示原始反投影位置，便于判断"塌缩"是发生在 seeds 阶段还是 PCA 阶段。
+      // 不带 label 避免 13 个标签遮挡。
+      for (const [name, pos] of proxy.jointSeeds) {
+        list.push({
+          position: pos,
+          color: '#888888',
+          size: radius * 0.55,
+          label: undefined,
+          opacity: 0.85,
+        });
+        // 占位变量名引用以避免 lint
+        void name;
+      }
+
+      // 主层：PCA capsule anchors（彩色 + 标签）
+      for (const a of proxy.anchors) {
+        list.push({
+          position: a.position,
+          color: colorForKind(a.kind),
+          size: radius,
+          label: a.kind,
+        });
+      }
+      if (proxy.shoulderLine) {
+        list.push({
+          position: proxy.shoulderLine.position,
+          color: colorForKind('shoulder_line'),
+          size: radius * 1.2,
+          label: 'shoulder_line',
+        });
+      }
+      if (proxy.torsoAxis) {
+        list.push({
+          position: proxy.torsoAxis.position,
+          color: colorForKind('torso_axis'),
+          size: radius * 1.2,
+          label: 'torso_axis',
+        });
+      }
+      return list;
+    };
+
+    return {
+      src: buildSide(proxies.srcProxy, srcMesh),
+      tar: buildSide(proxies.tarProxy, tarMesh),
+    };
+  }, [poseProxyState.proxies, srcMesh, tarMesh]);
 
   // Stage 8/8 + 9: limb-structure + surface + pose-proxy auto runners.
   // tarConstraintVertices comes from SAM3Panel (Stage 9). When the user
@@ -830,6 +955,407 @@ export function ModelAssemble(props: ModelAssembleProps) {
       setAligning(false);
     }
   }, [srcMesh, tarMesh, srcAdjacency, tarAdjacency, tarRegion, tarOrthoCamera, project, onStatusChange, pushTrace]);
+
+  // Phase A5: pose-proxy 真分步一键运行 — 顺序跑 5 步，每步结果写入 poseProxyState。
+  // 仅当 selectedId === 'pose-proxy' 时被调用。
+  // ── Step 自检（结果都进诊断日志）──────────────────────────────────
+  // 失败只警告（pushTrace ok=false），不抛异常 — 是诊断不是阻塞。
+  const validateCollectJoints = useCallback((
+    joints: CollectJointsOutput,
+    front: { joints: Joint2D[]; imageSize: { width: number; height: number } },
+    tarCamera: OrthoFrontCamera,
+  ) => {
+    const issues: string[] = [];
+    const expected = front.joints.length;
+    // 1. 数量一致
+    if (joints.srcJoints.length !== expected || joints.tarJoints.length !== expected) {
+      issues.push(`数量不一致: src=${joints.srcJoints.length} tar=${joints.tarJoints.length} expected=${expected}`);
+    }
+    // 2. 坐标在画布内（只检查 confidence>0 的关节，DWPose 没检出的 joint 可能为 0/0）
+    let outOfBounds = 0;
+    for (const j of joints.tarJoints) {
+      if (j.confidence <= 0) continue;
+      if (j.x < 0 || j.x >= tarCamera.width || j.y < 0 || j.y >= tarCamera.height) {
+        outOfBounds++;
+      }
+    }
+    if (outOfBounds > 0) {
+      issues.push(`${outOfBounds} 个 tar joint 越界 (画布 ${tarCamera.width}×${tarCamera.height})`);
+    }
+    // 3. 缩放比例：挑第一个 confidence>0 的 joint 验证
+    const sx = tarCamera.width / Math.max(1, front.imageSize.width);
+    const sy = tarCamera.height / Math.max(1, front.imageSize.height);
+    let sampleNote = '';
+    for (let i = 0; i < joints.srcJoints.length; i++) {
+      const s = joints.srcJoints[i];
+      const t = joints.tarJoints[i];
+      if (s.confidence <= 0) continue;
+      const expectX = Math.round(s.x * sx);
+      const expectY = Math.round(s.y * sy);
+      const dx = Math.abs(t.x - expectX);
+      const dy = Math.abs(t.y - expectY);
+      sampleNote = `sample[${i}=${s.name}] src=(${s.x},${s.y}) tar=(${t.x},${t.y}) expect=(${expectX},${expectY})`;
+      if (dx > 1 || dy > 1) {
+        issues.push(`缩放偏差: ${sampleNote} dx=${dx} dy=${dy}`);
+      }
+      break;
+    }
+    const ok = issues.length === 0;
+    const summary = ok
+      ? `step1 自检通过 · ${expected} joints · 缩放(${sx.toFixed(3)},${sy.toFixed(3)}) · ${sampleNote}`
+      : `step1 自检失败 · ${issues.join(' | ')}`;
+    pushTrace({
+      method: 'pose-proxy/step1-check',
+      rmse: 0,
+      meanError: 0,
+      ok,
+      note: summary,
+    });
+    onStatusChange?.(summary, ok ? 'info' : 'warning');
+    return ok;
+  }, [pushTrace, onStatusChange]);
+
+  // ── Step 2 (renderSrcOrtho) 自检 ────────────────────────────────
+  const validateRenderSrcOrtho = useCallback((
+    srcRender: RenderSrcOrthoOutput,
+    page1Size: { width: number; height: number },
+  ) => {
+    const issues: string[] = [];
+    const cam = srcRender.srcCamera;
+    // 1. 画布尺寸 = page1Size
+    if (cam.width !== page1Size.width || cam.height !== page1Size.height) {
+      issues.push(`画布尺寸不匹配: cam=${cam.width}×${cam.height} expect=${page1Size.width}×${page1Size.height}`);
+    }
+    // 2. 数值有限性
+    const finiteFields: Array<[string, number]> = [
+      ['camY', cam.camY], ['camZ', cam.camZ],
+      ['worldPerPx', cam.worldPerPx], ['meshFrontX', cam.meshFrontX],
+    ];
+    for (const [name, v] of finiteFields) {
+      if (!Number.isFinite(v)) issues.push(`${name} 非有限值 (=${v})`);
+    }
+    // 3. worldPerPx 必须为正
+    if (cam.worldPerPx <= 0) {
+      issues.push(`worldPerPx 非正 (=${cam.worldPerPx}) — mesh 退化或 fit 失败`);
+    }
+    // 4. dataUrl 健康度
+    let dataUrlNote = '';
+    if (srcRender.srcOrthoDataUrl == null) {
+      dataUrlNote = 'dataUrl=null (调试用，不影响下游)';
+    } else if (!srcRender.srcOrthoDataUrl.startsWith('data:image/')) {
+      issues.push(`dataUrl 非 image (前缀=${srcRender.srcOrthoDataUrl.slice(0, 24)})`);
+    } else {
+      const bytes = srcRender.srcOrthoDataUrl.length;
+      dataUrlNote = `dataUrl ${bytes}B`;
+      // 极小 dataUrl 通常是空白图（base64 PNG 至少几百字节）
+      if (bytes < 200) issues.push(`dataUrl 过短 (=${bytes}B) — 可能是空白图`);
+    }
+    const ok = issues.length === 0;
+    const summary = ok
+      ? `step2 自检通过 · ${cam.width}×${cam.height} · worldPerPx=${cam.worldPerPx.toFixed(4)} · camY=${cam.camY.toFixed(2)} camZ=${cam.camZ.toFixed(2)} meshFrontX=${cam.meshFrontX.toFixed(2)} · ${dataUrlNote}`
+      : `step2 自检失败 · ${issues.join(' | ')}`;
+    pushTrace({
+      method: 'pose-proxy/step2-check',
+      rmse: 0,
+      meanError: 0,
+      ok,
+      note: summary,
+    });
+    onStatusChange?.(summary, ok ? 'info' : 'warning');
+    return ok;
+  }, [pushTrace, onStatusChange]);
+
+  // ── Step 3 (buildProxies) 自检 ──────────────────────────────────
+  // 关注：
+  //   1. anchor 数量（src/tar 各应有 6-8 个 capsule anchors）
+  //   2. 空间散布 = 最远两 anchor 距离 / mesh 对角线
+  //      若 < 0.15 → 所有 anchor 几乎重叠，高度可疑（mesh 缺失肢体或
+  //      tarConstraintVertices 限制过严，导致 jointsToSeeds3D 全部塌缩）
+  //   3. shoulderLine / torsoAxis 是否生成
+  //   4. pairs 数量 + 平均 confidence
+  const validateBuildProxies = useCallback((
+    out: BuildProxiesOutput,
+    srcVerts: Vec3[],
+    tarVerts: Vec3[],
+  ) => {
+    const issues: string[] = [];
+
+    const meshDiag = (verts: Vec3[]): number => {
+      let mnx=Infinity,mny=Infinity,mnz=Infinity,mxx=-Infinity,mxy=-Infinity,mxz=-Infinity;
+      for (const v of verts) {
+        if (v[0]<mnx)mnx=v[0]; if (v[0]>mxx)mxx=v[0];
+        if (v[1]<mny)mny=v[1]; if (v[1]>mxy)mxy=v[1];
+        if (v[2]<mnz)mnz=v[2]; if (v[2]>mxz)mxz=v[2];
+      }
+      const dx=mxx-mnx,dy=mxy-mny,dz=mxz-mnz;
+      return Math.sqrt(dx*dx+dy*dy+dz*dz) || 1;
+    };
+    const maxPairwise = (pts: Vec3[]): number => {
+      let m = 0;
+      for (let i=0;i<pts.length;i++) for (let j=i+1;j<pts.length;j++) {
+        const a=pts[i],b=pts[j];
+        const d=Math.hypot(a[0]-b[0],a[1]-b[1],a[2]-b[2]);
+        if (d>m) m=d;
+      }
+      return m;
+    };
+
+    const sideStats = (label: string, proxy: typeof out.srcProxy, verts: Vec3[]) => {
+      const diag = meshDiag(verts);
+      const positions = proxy.anchors.map((a) => a.position);
+      const spread = maxPairwise(positions);
+      const ratio = spread / diag;
+      const lowConf = proxy.anchors.filter((a) => a.confidence < 0.3).length;
+      const note = `${label}:${proxy.anchors.length}个anchor 散布${spread.toFixed(3)}/${diag.toFixed(3)}=${(ratio*100).toFixed(1)}% lowConf=${lowConf} shoulderLine=${proxy.shoulderLine?'✓':'✗'} torsoAxis=${proxy.torsoAxis?'✓':'✗'}`;
+      if (proxy.anchors.length < 4) {
+        issues.push(`${label}: anchor 数量过少 (${proxy.anchors.length})`);
+      }
+      if (ratio < 0.15 && proxy.anchors.length >= 2) {
+        issues.push(`${label}: anchor 空间塌缩 (散布${(ratio*100).toFixed(1)}% < 15%) — 可能是 mesh 缺失肢体几何或约束区域过窄`);
+      }
+      if (proxy.warnings.length > 0) {
+        issues.push(`${label} warnings: ${proxy.warnings.slice(0,2).join('; ')}`);
+      }
+      return note;
+    };
+
+    const srcNote = sideStats('src', out.srcProxy, srcVerts);
+    const tarNote = sideStats('tar', out.tarProxy, tarVerts);
+
+    const avgConf = out.pairs.length > 0
+      ? out.pairs.reduce((s, p) => s + p.confidence, 0) / out.pairs.length
+      : 0;
+    const pairsNote = `pairs=${out.pairs.length} avgConf=${avgConf.toFixed(2)}`;
+    if (out.pairs.length < 3) {
+      issues.push(`pairs 数量过少 (${out.pairs.length}) — SVD 可能不稳定`);
+    }
+
+    const ok = issues.length === 0;
+    const summary = ok
+      ? `step3 自检通过 · ${srcNote} · ${tarNote} · ${pairsNote}`
+      : `step3 自检告警 · ${srcNote} · ${tarNote} · ${pairsNote} · ${issues.join(' | ')}`;
+    pushTrace({
+      method: 'pose-proxy/step3-check',
+      rmse: 0,
+      meanError: 0,
+      ok,
+      note: summary,
+    });
+    onStatusChange?.(summary, ok ? 'info' : 'warning');
+    return ok;
+  }, [pushTrace, onStatusChange]);
+
+
+  const handleRunPoseProxyStepwise = useCallback(async () => {
+    if (!srcMesh || !tarMesh) {
+      setRunError('Source / target mesh 未加载');
+      return;
+    }
+    const front = project?.meta.page1?.joints?.views.front;
+    if (!front || front.joints.length === 0) {
+      setRunError('pose-proxy 需 Page1 joints：请先在 Page1 完成 DWPose 检测');
+      return;
+    }
+    if (!tarOrthoCamera) {
+      setRunError('pose-proxy 需 Target SAM3 正交相机：请先在 SAM3 面板点 "渲染 + 反投影"');
+      return;
+    }
+    setRunError(null);
+    setAligning(true);
+    try {
+      // Step 1: collectJoints
+      const joints = collectJoints({
+        srcJointsRaw: front.joints,
+        tarJointsRaw: front.joints,
+        tarCamera: tarOrthoCamera,
+        page1Size: front.imageSize,
+      });
+      setPoseProxyState((prev) => ({ ...prev, joints }));
+      validateCollectJoints(joints, front, tarOrthoCamera);
+
+      // Step 2: renderSrcOrtho
+      const srcRender = renderSrcOrtho({
+        srcVertices: srcMesh.vertices,
+        srcFaces: srcMesh.faces,
+        page1Size: front.imageSize,
+      });
+      setPoseProxyState((prev) => ({ ...prev, srcRender }));
+      validateRenderSrcOrtho(srcRender, front.imageSize);
+
+      // Step 3: buildProxies
+      const proxies = buildProxies({
+        srcVertices: srcMesh.vertices,
+        tarVertices: tarMesh.vertices,
+        srcJoints: joints.srcJoints,
+        tarJoints: joints.tarJoints,
+        srcCamera: srcRender.srcCamera,
+        tarCamera: tarOrthoCamera,
+        tarConstraintVertices: tarRegion?.vertices,
+      });
+      setPoseProxyState((prev) => ({ ...prev, proxies }));
+      validateBuildProxies(proxies, srcMesh.vertices, tarMesh.vertices);
+
+      // Step 4: solveSvd
+      const svd = solveSvd({
+        srcVertices: srcMesh.vertices,
+        tarVertices: tarMesh.vertices,
+        pairs: proxies.pairs,
+      });
+      setPoseProxyState((prev) => ({ ...prev, svd }));
+
+      // Step 5: solveIcp
+      const icp = solveIcp({
+        srcVertices: srcMesh.vertices,
+        tarVertices: tarMesh.vertices,
+        lmFitMatrix: svd.lmFitMatrix,
+        pairs: proxies.pairs,
+        icpCfg: { maxIterations: icpMaxIter, sampleCount: icpSampleCount, rejectMultiplier: icpRejectMul, convergenceImprovement: 0.005 },
+        tarConstraintVertices: tarRegion?.vertices,
+      });
+      setPoseProxyState((prev) => ({ ...prev, icp }));
+
+      // 最终结果 → alignResult（与旧 handleRunAuto 行为一致）
+      setAlignResult(icp.result);
+      setCenterView('result');
+      setResultView('overlay');
+      pushTrace({ method: icp.method, rmse: icp.result.rmse, meanError: icp.result.meanError, ok: true });
+      onStatusChange?.(
+        `pose-proxy 对齐完成 RMSE=${icp.result.rmse.toFixed(4)} (${icp.method})`,
+        'success',
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setRunError(msg);
+      pushTrace({ method: 'pose-proxy', rmse: 0, meanError: 0, ok: false, note: msg });
+      onStatusChange?.(`pose-proxy 对齐失败：${msg}`, 'error');
+    } finally {
+      setAligning(false);
+    }
+  }, [srcMesh, tarMesh, tarOrthoCamera, tarRegion, project, icpMaxIter, icpRejectMul, icpSampleCount, onStatusChange, pushTrace, validateCollectJoints, validateRenderSrcOrtho, validateBuildProxies]);
+
+  // Phase A4: pose-proxy 单步重跑 — **只跑这一步**，清空下游槽位。
+  // 重要：除非 stepIndex === 4 (ICP)，否则不会触碰 alignResult。
+  // 这样点 step1（collectJoints）只会刷新 joints 槽，绝不会让 source 贴到 target。
+  const handleRerunPoseProxyStep = useCallback(async (stepIndex: number) => {
+    if (!srcMesh || !tarMesh) {
+      setRunError('Source / target mesh 未加载');
+      return;
+    }
+    const front = project?.meta.page1?.joints?.views.front;
+    if (!front || front.joints.length === 0) {
+      setRunError('pose-proxy 需 Page1 joints');
+      return;
+    }
+    if (!tarOrthoCamera) {
+      setRunError('pose-proxy 需 Target SAM3 正交相机');
+      return;
+    }
+    // 上游槽位检查：第 i 步必须有 0..i-1 的所有上游结果。
+    const slotMap = ['joints', 'srcRender', 'proxies', 'svd', 'icp'] as const;
+    for (let k = 0; k < stepIndex; k++) {
+      if (poseProxyState[slotMap[k]] === null) {
+        setRunError(`step${stepIndex + 1} 重跑需先完成 step${k + 1}（${slotMap[k]}）`);
+        return;
+      }
+    }
+    setRunError(null);
+    setAligning(true);
+    // 立即清空当前步及所有下游槽位（让 UI 显示 running / pending）。
+    setPoseProxyState((prev) => {
+      const next = { ...prev };
+      for (let k = stepIndex; k < slotMap.length; k++) next[slotMap[k]] = null as never;
+      return next;
+    });
+    // 同时清掉旧的 alignResult（旧结果跟当前步链已经不一致了）。
+    setAlignResult(null);
+    try {
+      switch (stepIndex) {
+        case 0: {
+          const joints = collectJoints({
+            srcJointsRaw: front.joints,
+            tarJointsRaw: front.joints,
+            tarCamera: tarOrthoCamera,
+            page1Size: front.imageSize,
+          });
+          setPoseProxyState((prev) => ({ ...prev, joints }));
+          validateCollectJoints(joints, front, tarOrthoCamera);
+          onStatusChange?.(`pose-proxy step1 重跑完成 · ${joints.srcJoints.length} joints`, 'success');
+          break;
+        }
+        case 1: {
+          const srcRender = renderSrcOrtho({
+            srcVertices: srcMesh.vertices,
+            srcFaces: srcMesh.faces,
+            page1Size: front.imageSize,
+          });
+          setPoseProxyState((prev) => ({ ...prev, srcRender }));
+          validateRenderSrcOrtho(srcRender, front.imageSize);
+          onStatusChange?.(`pose-proxy step2 重跑完成 · srcCamera ${srcRender.srcCamera.width}×${srcRender.srcCamera.height}`, 'success');
+          break;
+        }
+        case 2: {
+          const joints = poseProxyState.joints!;
+          const srcRender = poseProxyState.srcRender!;
+          const proxies = buildProxies({
+            srcVertices: srcMesh.vertices,
+            tarVertices: tarMesh.vertices,
+            srcJoints: joints.srcJoints,
+            tarJoints: joints.tarJoints,
+            srcCamera: srcRender.srcCamera,
+            tarCamera: tarOrthoCamera,
+            tarConstraintVertices: tarRegion?.vertices,
+          });
+          setPoseProxyState((prev) => ({ ...prev, proxies }));
+          validateBuildProxies(proxies, srcMesh.vertices, tarMesh.vertices);
+          onStatusChange?.(`pose-proxy step3 重跑完成 · ${proxies.pairs.length} pairs`, 'success');
+          break;
+        }
+        case 3: {
+          const proxies = poseProxyState.proxies!;
+          const svd = solveSvd({
+            srcVertices: srcMesh.vertices,
+            tarVertices: tarMesh.vertices,
+            pairs: proxies.pairs,
+          });
+          setPoseProxyState((prev) => ({ ...prev, svd }));
+          onStatusChange?.(`pose-proxy step4 重跑完成 · landmark RMSE=${svd.lmFitRmse.toFixed(4)}`, 'success');
+          break;
+        }
+        case 4: {
+          const proxies = poseProxyState.proxies!;
+          const svd = poseProxyState.svd!;
+          const icp = solveIcp({
+            srcVertices: srcMesh.vertices,
+            tarVertices: tarMesh.vertices,
+            lmFitMatrix: svd.lmFitMatrix,
+            pairs: proxies.pairs,
+            icpCfg: { maxIterations: icpMaxIter, sampleCount: icpSampleCount, rejectMultiplier: icpRejectMul, convergenceImprovement: 0.005 },
+            tarConstraintVertices: tarRegion?.vertices,
+          });
+          setPoseProxyState((prev) => ({ ...prev, icp }));
+          // 仅 ICP 步会写 alignResult，因为它是产出最终对齐矩阵的那一步。
+          setAlignResult(icp.result);
+          setCenterView('result');
+          setResultView('overlay');
+          pushTrace({ method: icp.method, rmse: icp.result.rmse, meanError: icp.result.meanError, ok: true });
+          onStatusChange?.(
+            `pose-proxy step5 重跑完成 RMSE=${icp.result.rmse.toFixed(4)} (${icp.method})`,
+            'success',
+          );
+          break;
+        }
+        default:
+          throw new Error(`unknown stepIndex=${stepIndex}`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setRunError(msg);
+      pushTrace({ method: 'pose-proxy', rmse: 0, meanError: 0, ok: false, note: msg });
+      onStatusChange?.(`pose-proxy step${stepIndex + 1} 重跑失败：${msg}`, 'error');
+    } finally {
+      setAligning(false);
+    }
+  }, [srcMesh, tarMesh, tarOrthoCamera, tarRegion, project, poseProxyState, icpMaxIter, icpRejectMul, icpSampleCount, onStatusChange, pushTrace, validateCollectJoints, validateRenderSrcOrtho, validateBuildProxies]);
 
   return (
     <div
@@ -1007,7 +1533,26 @@ export function ModelAssemble(props: ModelAssembleProps) {
           ) : (
             <Hint>page3_session.json 未生成</Hint>
           )}
-          <div style={{ marginTop: 8, fontSize: 11, fontWeight: 600, color: 'var(--text-primary)' }}>对齐运行记录</div>
+          <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-primary)' }}>对齐运行记录</div>
+            {traceLog.length > 0 && (
+              <button
+                onClick={() => setTraceLog([])}
+                style={{
+                  fontSize: 10,
+                  padding: '2px 8px',
+                  background: 'transparent',
+                  color: 'var(--text-muted)',
+                  border: '1px solid var(--border-default)',
+                  borderRadius: 3,
+                  cursor: 'pointer',
+                }}
+                title="清空诊断日志"
+              >
+                清空
+              </button>
+            )}
+          </div>
           {traceLog.length === 0 ? (
             <Hint>还未运行任何对齐</Hint>
           ) : (
@@ -1103,6 +1648,8 @@ export function ModelAssemble(props: ModelAssembleProps) {
               onMoveSrcLandmark={handleMoveSrc}
               onMoveTarLandmark={handleMoveTar}
               tarPointLayers={tarSegpackLayers}
+              srcMarkers={anchorMarkers.src}
+              tarMarkers={anchorMarkers.tar}
               srcLabel="Source (page2.highres)"
               tarLabel="Target (page1.rough)"
               showCameraSync
@@ -1193,39 +1740,19 @@ export function ModelAssemble(props: ModelAssembleProps) {
                 size="sm"
                 variant="primary"
                 style={{ flex: 1, justifyContent: 'center' }}
-                onClick={handleRunManual}
-                disabled={!canRunManual || aligning}
-                loading={aligning}
-                title={canRunManual ? '' : `需 srcMesh + 至少 3 对 landmark（当前 src=${srcLandmarkCount} tar=${tarLandmarkCount}）`}
+                onClick={handleAcceptAlign}
+                disabled={!alignResult}
+                title={alignResult ? '接受并应用变换到 src mesh' : '先运行对齐后可接受'}
               >
-                ▶ Manual SVD
+                ✓ 接受对齐
               </Button>
               <Button
                 size="sm"
                 style={{ flex: 1, justifyContent: 'center' }}
-                onClick={handleRefineIcp}
-                disabled={!alignResult || !tarMesh || aligning}
-                loading={aligning}
-                title={alignResult ? 'ICP 精化当前变换' : '先跑一次 SVD'}
-              >
-                🔄 ICP
-              </Button>
-              <Button
-                size="sm"
-                style={{ justifyContent: 'center' }}
-                onClick={handleAcceptAlign}
-                disabled={!alignResult}
-                title="接受并应用变换到 src mesh"
-              >
-                ✓
-              </Button>
-              <Button
-                size="sm"
-                style={{ justifyContent: 'center' }}
                 onClick={handleResetAlign}
                 disabled={!alignResult && !runError}
               >
-                ↶
+                ↶ 撤销
               </Button>
             </div>
           ) : selectedId === 'limb-structure' || selectedId === 'surface' || selectedId === 'pose-proxy' ? (
@@ -1234,38 +1761,19 @@ export function ModelAssemble(props: ModelAssembleProps) {
                 size="sm"
                 variant="primary"
                 style={{ flex: 1, justifyContent: 'center' }}
-                onClick={() => handleRunAuto(selectedId)}
-                disabled={!canRunAuto || aligning}
-                loading={aligning}
-                title={canRunAuto ? '' : '需两份 mesh 均已加载'}
+                onClick={handleAcceptAlign}
+                disabled={!alignResult}
+                title={alignResult ? '接受并应用变换到 src mesh' : '先运行对齐后可接受'}
               >
-                ▶ 运行 {selectedStrategy.label}
+                ✓ 接受对齐
               </Button>
               <Button
                 size="sm"
                 style={{ flex: 1, justifyContent: 'center' }}
-                onClick={handleRefineIcp}
-                disabled={!alignResult || !tarMesh || aligning}
-                loading={aligning}
-                title={alignResult ? 'ICP 精化' : '先跑一次一键对齐'}
-              >
-                🔄 ICP
-              </Button>
-              <Button
-                size="sm"
-                style={{ justifyContent: 'center' }}
-                onClick={handleAcceptAlign}
-                disabled={!alignResult}
-              >
-                ✓
-              </Button>
-              <Button
-                size="sm"
-                style={{ justifyContent: 'center' }}
                 onClick={handleResetAlign}
                 disabled={!alignResult && !runError}
               >
-                ↶
+                ↶ 撤销
               </Button>
             </div>
           ) : (
@@ -1326,16 +1834,90 @@ export function ModelAssemble(props: ModelAssembleProps) {
               ctx={ctx}
               selected={selectedId === s.id}
               expanded={expandedReqs.has(s.id)}
+              aligning={aligning}
+              canRunManual={canRunManual}
+              canRunAuto={canRunAuto}
+              srcLandmarkCount={srcLandmarkCount}
+              tarLandmarkCount={tarLandmarkCount}
               onSelect={() => setSelectedId(s.id)}
               onToggleReqs={() => toggleReqs(s.id)}
+              onRunAuto={s.id === 'pose-proxy' ? handleRunPoseProxyStepwise : () => handleRunAuto(s.id as 'limb-structure' | 'surface')}
+              onRunManualSvd={handleRunManual}
+              onRunIcp={handleRefineIcp}
+              hasAlignResult={alignResult !== null}
             />
           ))}
         </PanelSection>
 
         <PanelSection title={`📋 流程步骤 · ${selectedStrategy.label}`}>
-          {selectedStrategy.steps.map((step) => (
-            <StepCardV2 key={step.id} step={step} />
-          ))}
+          {selectedStrategy.steps.map((step, i) => {
+            // Phase A4: 为 pose-proxy 策略计算真分步状态。
+            // 其他策略保持旧行为（done/pending 二态）。
+            const isPoseProxy = selectedStrategy.id === 'pose-proxy';
+            const isIcpStep = /icp/i.test(step.id) || /icp/i.test(step.title);
+
+            let stepStatus: 'pending' | 'ready' | 'running' | 'done' | 'stale';
+            let stepResultHint: string | undefined;
+
+            if (isPoseProxy) {
+              // pose-proxy 5 步 → poseProxyState 槽位映射
+              const slotMap = ['joints', 'srcRender', 'proxies', 'svd', 'icp'] as const;
+              const slot = slotMap[i] as keyof typeof poseProxyState;
+              const hasSlot = poseProxyState[slot] !== null;
+              // 前一步是否已完成（第一步永远 ready，后续步依赖前一步）
+              const prevDone = i === 0 || poseProxyState[slotMap[i - 1] as keyof typeof poseProxyState] !== null;
+
+              if (aligning) {
+                // 判断当前步是否正在运行：前一步 done + 当前步 null
+                stepStatus = prevDone && !hasSlot ? 'running' : hasSlot ? 'done' : 'pending';
+              } else if (hasSlot) {
+                stepStatus = 'done';
+                // 结果摘要
+                if (slot === 'joints') stepResultHint = `src=${poseProxyState.joints!.srcJoints.length} tar=${poseProxyState.joints!.tarJoints.length} joints`;
+                if (slot === 'svd') stepResultHint = `RMSE=${poseProxyState.svd!.lmFitRmse.toFixed(4)}`;
+                if (slot === 'icp') stepResultHint = `RMSE=${poseProxyState.icp!.icpRmse.toFixed(4)} (${poseProxyState.icp!.method})`;
+              } else if (prevDone) {
+                stepStatus = 'ready';
+              } else {
+                stepStatus = 'pending';
+              }
+            } else {
+              // 非 pose-proxy：沿用旧逻辑
+              stepStatus = aligning ? 'running' : alignResult !== null ? 'done' : 'pending';
+            }
+
+            return (
+              <StepCardV2
+                key={step.id}
+                step={step}
+                index={i}
+                status={stepStatus}
+                onRerun={
+                  isPoseProxy
+                    ? () => handleRerunPoseProxyStep(i)
+                    : isIcpStep
+                      ? handleRefineIcp
+                      : undefined
+                }
+                rerunLabel={isPoseProxy ? '重跑此步' : isIcpStep ? 'ICP 重跑' : '重跑此步'}
+                rerunDisabledHint={
+                  isPoseProxy
+                    ? '需先完成上游步（或在 SAM3 面板渲染目标正交相机）'
+                    : isIcpStep
+                      ? '需先有一次对齐结果'
+                      : '当前 runner 未拆分该步独立执行；请用卡片「一键」运行整管线'
+                }
+                rerunDisabled={
+                  isPoseProxy
+                    ? aligning || stepStatus === 'pending'
+                    : isIcpStep
+                      ? !alignResult || aligning
+                      : true
+                }
+                resultHint={stepResultHint}
+              />
+            );
+          })}
         </PanelSection>
 
         <DataSourceStatusBar project={project} />
@@ -1416,15 +1998,33 @@ function StrategyCardV2({
   ctx,
   selected,
   expanded,
+  aligning,
+  canRunManual,
+  canRunAuto,
+  srcLandmarkCount,
+  tarLandmarkCount,
+  hasAlignResult,
   onSelect,
   onToggleReqs,
+  onRunAuto,
+  onRunManualSvd,
+  onRunIcp,
 }: {
   strategy: AlignStrategy;
   ctx: AlignStrategyContext;
   selected: boolean;
   expanded: boolean;
+  aligning: boolean;
+  canRunManual: boolean;
+  canRunAuto: boolean;
+  srcLandmarkCount: number;
+  tarLandmarkCount: number;
+  hasAlignResult: boolean;
   onSelect: () => void;
   onToggleReqs: () => void;
+  onRunAuto: () => void;
+  onRunManualSvd: () => void;
+  onRunIcp: () => void;
 }) {
   const checks = useMemo(() => strategy.requirements(ctx), [strategy, ctx]);
   const readiness = summarizeReadiness(checks);
@@ -1479,20 +2079,51 @@ function StrategyCardV2({
       {expanded && <RequirementsList checks={checks} />}
 
       {strategy.kind === 'manual' ? (
-        <Row>
-          <Button size="sm" variant="primary" style={{ flex: 1, justifyContent: 'center' }}>
-            SVD 对齐
-          </Button>
-          <Button size="sm" style={{ flex: 1, justifyContent: 'center' }}>
-            ICP 精化
-          </Button>
-        </Row>
+        <>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 6 }}>
+            Source landmarks: <b style={{ color: 'var(--text-primary)' }}>{srcLandmarkCount}</b>
+            {' · '}
+            Target landmarks: <b style={{ color: 'var(--text-primary)' }}>{tarLandmarkCount}</b>
+          </div>
+          <Row>
+            <Button
+              size="sm"
+              variant="primary"
+              style={{ flex: 1, justifyContent: 'center' }}
+              onClick={onRunManualSvd}
+              disabled={!canRunManual || aligning}
+              loading={aligning}
+              title={canRunManual ? '' : `需 srcMesh + ≥3 对 landmark`}
+            >
+              SVD 对齐
+            </Button>
+            <Button
+              size="sm"
+              style={{ flex: 1, justifyContent: 'center' }}
+              onClick={onRunIcp}
+              disabled={!hasAlignResult || aligning}
+              loading={aligning}
+              title={hasAlignResult ? 'ICP 精化当前变换' : '先跑一次 SVD'}
+            >
+              ICP 精化
+            </Button>
+          </Row>
+        </>
       ) : (
         <Button
           size="sm"
           variant={selected ? 'primary' : 'secondary'}
           style={{ width: '100%', justifyContent: 'center' }}
-          disabled={readiness === 'blocked'}
+          onClick={() => { onSelect(); onRunAuto(); }}
+          disabled={readiness === 'blocked' || aligning || !canRunAuto}
+          loading={aligning && selected}
+          title={
+            !canRunAuto
+              ? '需两份 mesh 均已加载'
+              : readiness === 'blocked'
+                ? '前置条件不足'
+                : `一键运行 ${strategy.label} 全管线（SVD + ICP）`
+          }
         >
           一键 · {strategy.label} 对齐
         </Button>
@@ -1527,7 +2158,48 @@ function RequirementsList({ checks }: { checks: RequirementCheck[] }) {
   );
 }
 
-function StepCardV2({ step }: { step: StrategyStep }) {
+function StepCardV2({
+  step,
+  index,
+  status,
+  onRerun,
+  rerunLabel,
+  rerunDisabled,
+  rerunDisabledHint,
+  resultHint,
+}: {
+  step: StrategyStep;
+  index: number;
+  /** Phase A4: 真分步状态 — pending(上游缺) / ready(可跑) / running / done(有结果) / stale(上游变了) */
+  status: 'pending' | 'ready' | 'running' | 'done' | 'stale';
+  onRerun?: () => void;
+  rerunLabel: string;
+  rerunDisabled?: boolean;
+  rerunDisabledHint?: string;
+  /** 可选：显示该步结果摘要（如 RMSE 值） */
+  resultHint?: string;
+}) {
+  const icon: Record<typeof status, string> = {
+    pending: '⏸️',
+    ready: '▶️',
+    running: '⏳',
+    done: '✅',
+    stale: '⚠️',
+  };
+  const color: Record<typeof status, string> = {
+    pending: 'var(--text-muted)',
+    ready: '#5cb85c',
+    running: 'var(--accent-blue)',
+    done: 'var(--text-primary)',
+    stale: '#e8b740',
+  };
+  const statusLabel: Record<typeof status, string> = {
+    pending: '等待上游',
+    ready: '可执行',
+    running: '运行中',
+    done: '已完成',
+    stale: '需重跑',
+  };
   return (
     <div
       style={{
@@ -1535,14 +2207,17 @@ function StepCardV2({ step }: { step: StrategyStep }) {
         padding: '8px 10px',
         borderRadius: 4,
         border: '1px solid var(--border-default)',
-        background: 'var(--bg-app)',
-        borderLeft: '3px solid var(--border-default)',
+        background: status === 'running' ? 'rgba(74,144,226,0.08)' : 'var(--bg-app)',
+        borderLeft: `3px solid ${status === 'pending' ? 'var(--border-default)' : color[status]}`,
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <span style={{ fontSize: 12 }}>{step.manual ? '✋' : '⏸️'}</span>
-        <span style={{ fontSize: 11, color: 'var(--text-primary)', fontWeight: 600 }}>
-          {step.title}
+        <span style={{ fontSize: 12 }}>{icon[status]}</span>
+        <span style={{ fontSize: 11, color: color[status], fontWeight: 600 }}>
+          Step {index + 1} · {step.title}
+        </span>
+        <span style={{ fontSize: 9, color: 'var(--text-muted)', marginLeft: 'auto' }}>
+          {statusLabel[status]}
         </span>
       </div>
       {step.description && (
@@ -1550,6 +2225,22 @@ function StepCardV2({ step }: { step: StrategyStep }) {
           {step.description}
         </div>
       )}
+      {resultHint && status === 'done' && (
+        <div style={{ fontSize: 10, color: '#5cb85c', marginTop: 2, marginLeft: 18 }}>
+          {resultHint}
+        </div>
+      )}
+      <div style={{ marginTop: 6, marginLeft: 18 }}>
+        <Button
+          size="sm"
+          style={{ padding: '2px 8px', fontSize: 10 }}
+          onClick={onRerun}
+          disabled={rerunDisabled || !onRerun || status === 'running' || status === 'pending'}
+          title={(rerunDisabled || !onRerun || status === 'pending') ? (rerunDisabledHint ?? '') : ''}
+        >
+          {rerunLabel}
+        </Button>
+      </div>
     </div>
   );
 }
@@ -1878,11 +2569,10 @@ function asideStyle(side: 'left' | 'right'): CSSProperties {
 }
 
 /**
- * Stage 7/1 切片：实时显示 V2 ctx 字段接通进度。
- * 后续切片每接通一个字段，就把 REAL_FIELDS 数组扩一个，UI 自动反映。
+ * 底部状态栏：显示当前工程名 + Page1 关节命中情况，便于诊断 ctx 上游数据。
+ * （原 Stage 7 接通进度计数已废除——所有 ctx 字段已全部接通。）
  */
 function DataSourceStatusBar({ project }: { project: ReturnType<typeof useProject>['project'] }) {
-  const realCount = REAL_FIELDS.length;
   const projectName = project?.meta.name ?? '(未打开工程)';
   const front = project?.meta.page1?.joints?.views.front?.joints;
   const jointsHint = front
@@ -1900,18 +2590,8 @@ function DataSourceStatusBar({ project }: { project: ReturnType<typeof useProjec
         lineHeight: 1.5,
       }}
     >
-      <div>
-        <strong style={{ color: realCount === TOTAL_FIELDS ? '#5cb85c' : '#e8b740' }}>
-          Stage 7
-        </strong>{' '}
-        · 真实数据接通 {realCount}/{TOTAL_FIELDS} · 工程：{projectName}
-      </div>
+      <div>工程：{projectName}</div>
       <div>{jointsHint}</div>
-      {realCount < TOTAL_FIELDS && (
-        <div style={{ marginTop: 4, opacity: 0.8 }}>
-          剩余字段未接通（该提示不应出现）
-        </div>
-      )}
     </div>
   );
 }

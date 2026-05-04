@@ -30,10 +30,9 @@ export const surfaceStrategy: AlignStrategy = {
   kind: 'auto',
   requirements,
   steps: [
-    { id: 'sample', title: '1. 采样源/目标点' },
-    { id: 'descriptor', title: '2. 计算 FPFH/曲率描述子' },
-    { id: 'ransac', title: '3. RANSAC 投票' },
-    { id: 'svd', title: '4. SVD 拟合' },
-    { id: 'icp-refine', title: '5. ICP 精修' },
+    { id: 'sample-fpfh', title: '1. 采样 + FPFH/曲率描述子', description: '与 RANSAC 同一次 matchPartialToWhole 调用完成' },
+    { id: 'ransac', title: '2. RANSAC 投票', description: '在 sample-fpfh 步内原子执行（底层不可拆）' },
+    { id: 'svd', title: '3. SVD 拟合', description: 'alignSourceMeshByLandmarks(pairs)' },
+    { id: 'icp-refine', title: '4. ICP 精修' },
   ],
 };

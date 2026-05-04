@@ -29,8 +29,8 @@ export const limbStructureStrategy: AlignStrategy = {
   kind: 'auto',
   requirements,
   steps: [
-    { id: 'detect-anchors', title: '1. 检测结构锚点', description: 'root/bend/end 三层' },
-    { id: 'svd-anchors', title: '2. SVD 锚点对齐' },
-    { id: 'icp-refine', title: '3. ICP 精修' },
+    { id: 'detect-anchors', title: '1. 检测结构锚点', description: 'matchLimbStructureToWhole → root/bend/end 三层' },
+    { id: 'svd-anchors', title: '2. SVD 锚点对齐', description: 'alignSourceMeshByLandmarks(pairs)' },
+    { id: 'icp-refine', title: '3. ICP 精修', description: '在目标区域内做最近邻精修' },
   ],
 };

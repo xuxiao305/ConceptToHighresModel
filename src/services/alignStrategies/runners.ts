@@ -11,6 +11,11 @@
  *   finalMatrix via the `useIcp` predicate) is exactly the V1 pipeline at
  *   ModelAssemble.tsx L3060–3175. ICP defaults match V1 exactly.
  *
+ * Phase A6:
+ *   runPoseProxy 现在是 thin wrapper，委托给 poseProxySteps 的步骤函数。
+ *   算法等价性由步骤函数实现保证（同一份 buildSkeletonProxy / computePoseAlignment
+ *   / finalizeWithIcp 调用链）。
+ *
  * V1 stays untouched until Stage 9; these are net-new functions.
  */
 
@@ -18,17 +23,16 @@ import type { Vec3, LandmarkCandidate, MeshAdjacency } from '../../three';
 import type { AlignmentMode, AlignmentResult } from '../../three/alignment';
 import type { IcpOptions, OrthoFrontCamera } from '../../three';
 import type { Joint2D } from '../../types/joints';
+import { buildProxies as ppBuildProxies } from './poseProxySteps';
+import { detectLimbAnchors } from './limbStructureSteps';
+import { surfaceMatch } from './surfaceSteps';
 import {
   alignSourceMeshByLandmarks,
   applyTransform,
 } from '../../three/alignment';
 import {
   icpRefine,
-  buildSkeletonProxy,
-  matchLimbStructureToWhole,
-  matchPartialToWhole,
 } from '../../three';
-import { computePoseAlignment } from '../../three/poseAlignment';
 
 // ── Defaults (mirror V1 ModelAssemble) ──────────────────────────────────
 
@@ -43,18 +47,6 @@ export const DEFAULT_ICP: Required<Pick<IcpOptions,
   rejectMultiplier: 2.5,
   convergenceImprovement: 0.005,
 };
-
-/**
- * Direct anatomical anchors used in addition to PCA capsule anchors for
- * the pose-proxy strategy. Matches POSE_PROXY_DIRECT_JOINTS in V1
- * (ModelAssemble.tsx L200).
- */
-const POSE_PROXY_DIRECT_JOINTS = [
-  'left_shoulder',
-  'right_shoulder',
-  'left_elbow',
-  'right_elbow',
-] as const;
 
 // ── Public types ────────────────────────────────────────────────────────
 
@@ -104,45 +96,6 @@ function evalRmseOnLandmarks(pairs: LandmarkCandidate[], m: number[][]): number 
     s += dx * dx + dy * dy + dz * dz;
   }
   return Math.sqrt(s / pairs.length);
-}
-
-function findJointConfidence(joints: Joint2D[], name: string): number {
-  return joints.find((j) => j.name === name)?.confidence ?? 0;
-}
-
-/**
- * Build direct shoulder/elbow anchor pairs from skeleton-proxy joint seeds.
- * Mirrors buildDirectJointCandidates in V1 (ModelAssemble.tsx L314).
- */
-function buildDirectJointCandidates(
-  srcSeeds: Map<string, Vec3>,
-  tarSeeds: Map<string, Vec3>,
-  srcJoints: Joint2D[],
-  tarJoints: Joint2D[],
-): LandmarkCandidate[] {
-  const pairs: LandmarkCandidate[] = [];
-  for (const name of POSE_PROXY_DIRECT_JOINTS) {
-    const srcPosition = srcSeeds.get(name);
-    const tarPosition = tarSeeds.get(name);
-    if (!srcPosition || !tarPosition) continue;
-    const confidence = Math.min(
-      findJointConfidence(srcJoints, name),
-      findJointConfidence(tarJoints, name),
-    );
-    if (confidence <= 0) continue;
-    pairs.push({
-      srcVertex: -1,
-      srcPosition,
-      tarVertex: -1,
-      tarPosition,
-      // Direct anatomical anchors prevent sleeve/shoulder skew when PCA
-      // capsule anchors are sparse.
-      confidence: Math.min(1, Math.max(0.45, confidence)),
-      descriptorDist: 0,
-      suggestAccept: confidence >= 0.35,
-    });
-  }
-  return pairs;
 }
 
 /**
@@ -263,60 +216,31 @@ export class PoseProxyAnchorError extends Error {
  * Pose-proxy strategy: build skeleton proxies on src + tar, run SVD pose
  * alignment, append direct shoulder/elbow joint pairs, then finalize with
  * ICP. Mirrors the 'pose-proxy' branch of V1 handleAutoAlign (L2880–2980).
+ *
+ * Phase A6: 现在是 thin wrapper，内部调用 poseProxySteps 的 5 个步骤函数。
+ * 行为与原实现完全一致（算法等价）。
  */
 export function runPoseProxy(input: RunPoseProxyInput, opts: RunnerOptions = {}): RunnerOutcome {
-  const srcProxy = buildSkeletonProxy(
-    input.src.vertices,
-    input.srcJoints,
-    input.srcCamera,
-    { capsuleRadiusFraction: 0.08 },
-  );
-  const tarProxy = buildSkeletonProxy(
-    input.tar.vertices,
-    input.tarJoints,
-    input.tarCamera,
-    { capsuleRadiusFraction: 0.08 },
-    input.tarConstraintVertices,
-  );
-
-  const poseAlign = computePoseAlignment(srcProxy, tarProxy, {
-    svdMode: opts.alignmentMode ?? DEFAULT_ALIGNMENT_MODE,
+  // Phase A6: 委托给 poseProxySteps.buildProxies（步骤 3 的核心逻辑）。
+  const proxies = ppBuildProxies({
+    srcVertices: input.src.vertices,
+    tarVertices: input.tar.vertices,
+    srcJoints: input.srcJoints,
+    tarJoints: input.tarJoints,
+    srcCamera: input.srcCamera,
+    tarCamera: input.tarCamera,
+    tarConstraintVertices: input.tarConstraintVertices,
   });
 
-  // Anchor pairs from PCA capsule anchors.
-  const anchorPairs: LandmarkCandidate[] = [];
-  for (const e of poseAlign.anchorErrors) {
-    const srcA = srcProxy.anchors.find((a) => a.kind === e.kind);
-    const tarA = tarProxy.anchors.find((a) => a.kind === e.kind);
-    if (!srcA || !tarA) continue;
-    anchorPairs.push({
-      srcVertex: -1,
-      srcPosition: srcA.position,
-      tarVertex: -1,
-      tarPosition: tarA.position,
-      confidence: e.confidence,
-      descriptorDist: 0,
-      suggestAccept: e.confidence > 0.5,
-    });
+  if (proxies.pairs.length < 3) {
+    throw new PoseProxyAnchorError(proxies.pairs.length);
   }
 
-  // Plus direct shoulder/elbow anchors.
-  const directJointPairs = buildDirectJointCandidates(
-    srcProxy.jointSeeds,
-    tarProxy.jointSeeds,
-    input.srcJoints,
-    input.tarJoints,
-  );
-
-  const posePairs = [...anchorPairs, ...directJointPairs];
-  if (posePairs.length < 3) {
-    throw new PoseProxyAnchorError(posePairs.length);
-  }
-
+  // Step 4 + 5: finalizeWithIcp (SVD + ICP)
   return finalizeWithIcp(
     input.src.vertices,
     input.tar.vertices,
-    posePairs,
+    proxies.pairs,
     opts,
     input.tarConstraintVertices,
   );
@@ -344,30 +268,35 @@ export class LimbStructureMatchError extends Error {
  * Limb-structure strategy: detect 3 raw limb anchors (root/bend/end) on both
  * meshes via PCA + slice histogram, then finalize with ICP. Mirrors the
  * 'limb-structure' branch of V1 handleAutoAlign (L2992–3003).
+ *
+ * Phase B: thin wrapper → limbStructureSteps.detectLimbAnchors + finalizeWithIcp.
  */
 export function runLimbStructure(
   input: RunLimbStructureInput,
   opts: RunnerOptions = {},
 ): RunnerOutcome {
-  const pm = matchLimbStructureToWhole(
-    { vertices: input.src.vertices },
-    { vertices: input.tar.vertices },
-    {
+  let detect;
+  try {
+    detect = detectLimbAnchors({
+      srcVertices: input.src.vertices,
+      tarVertices: input.tar.vertices,
       tarConstraintVertices: input.tarConstraintVertices,
       tarBodyVertices: input.tarBodyVertices,
-      mode: opts.alignmentMode ?? DEFAULT_ALIGNMENT_MODE,
-    },
-  );
-
-  if (!pm.matrix4x4 || pm.pairs.length < 3) {
-    const reason = typeof pm.diagnostics?.reason === 'string' ? pm.diagnostics.reason : 'unknown';
-    throw new LimbStructureMatchError(reason, pm.pairs.length);
+      alignmentMode: opts.alignmentMode ?? DEFAULT_ALIGNMENT_MODE,
+    });
+  } catch (e) {
+    // 保持原错误类型 LimbStructureMatchError 以免上游 catch 逻辑变化
+    if (e instanceof Error && e.name === 'LimbAnchorDetectError') {
+      const detectErr = e as Error & { reason?: string; pairs?: number };
+      throw new LimbStructureMatchError(detectErr.reason ?? 'unknown', detectErr.pairs ?? 0);
+    }
+    throw e;
   }
 
   return finalizeWithIcp(
     input.src.vertices,
     input.tar.vertices,
-    pm.pairs,
+    detect.pairs,
     opts,
     input.tarConstraintVertices,
   );
@@ -398,9 +327,6 @@ export const DEFAULT_SURFACE: {
   macroSaliencyRings: 6,
 };
 
-const PARTIAL_SAMPLE_POOL_MODE = 'robust' as const;
-const PARTIAL_RADIUS_FRACTIONS = [0.08, 0.16, 0.32];
-
 export interface RunSurfaceInput {
   src: { vertices: Vec3[]; adjacency: MeshAdjacency };
   tar: { vertices: Vec3[]; adjacency: MeshAdjacency };
@@ -428,39 +354,32 @@ export class SurfaceMatchError extends Error {
  * Surface strategy: FPFH/curvature descriptor matching + RANSAC, then
  * finalize with ICP. Mirrors the surface (else) branch of V1
  * handleAutoAlign (L3004–3029).
+ *
+ * Phase B: thin wrapper → surfaceSteps.surfaceMatch + finalizeWithIcp.
  */
 export function runSurface(
   input: RunSurfaceInput,
   opts: RunSurfaceOptions = {},
 ): RunnerOutcome {
-  const cfg = { ...DEFAULT_SURFACE, ...(opts.surface ?? {}) };
-  const hasRegion = !!input.tarConstraintVertices && input.tarConstraintVertices.size > 0;
-
-  const pm = matchPartialToWhole(
-    { vertices: input.src.vertices, adjacency: input.src.adjacency },
-    { vertices: input.tar.vertices, adjacency: input.tar.adjacency },
-    {
-      numSrcSamples: cfg.numSrcSamples,
-      numTarSamples: cfg.numTarSamples,
-      topK: cfg.topK,
-      iterations: cfg.iterations,
-      inlierThreshold: cfg.inlierThresholdPct / 100,
-      descriptor: cfg.descriptor,
-      samplePoolMode: PARTIAL_SAMPLE_POOL_MODE,
-      radiusFractions: PARTIAL_RADIUS_FRACTIONS,
-      macroSaliencyRings: cfg.macroSaliencyRings,
+  let pm;
+  try {
+    pm = surfaceMatch({
+      srcVertices: input.src.vertices,
+      srcAdjacency: input.src.adjacency,
+      tarVertices: input.tar.vertices,
+      tarAdjacency: input.tar.adjacency,
+      tarConstraintVertices: input.tarConstraintVertices,
       tarSeedCentroid: input.tarSeedCentroid,
       tarSeedRadius: input.tarSeedRadius,
-      tarSeedWeight: hasRegion ? cfg.seedWeight : 0,
-      tarConstraintVertices: input.tarConstraintVertices,
-      tarConstraintUseSaliency: hasRegion,
-      axialWeight: cfg.axialWeight,
+      surface: opts.surface,
       seed: opts.seed,
-    },
-  );
-
-  if (!pm.matrix4x4 || pm.pairs.length < 3) {
-    throw new SurfaceMatchError(pm.bestInlierCount, pm.pairs.length);
+    });
+  } catch (e) {
+    if (e instanceof Error && e.name === 'SurfaceMatchError') {
+      const sErr = e as Error & { bestInlierCount?: number; pairs?: number };
+      throw new SurfaceMatchError(sErr.bestInlierCount ?? 0, sErr.pairs ?? 0);
+    }
+    throw e;
   }
 
   return finalizeWithIcp(
