@@ -102,6 +102,7 @@ import {
 import { alignSourceMeshByLandmarks, type AlignmentResult } from '../../three/alignment';
 import { runLimbStructure, runSurface, runPoseProxy } from '../../services/alignStrategies/runners';
 import { SAM3Panel } from './SAM3Panel';
+import { HighresGallery, type HighresGalleryItem } from './HighresGallery';
 import type { Joint2D } from '../../types/joints';
 import {
   ALIGN_STRATEGIES,
@@ -1306,6 +1307,37 @@ export function ModelAssemble(props: ModelAssembleProps) {
 
         <DataSourceStatusBar project={project} />
       </aside>
+      </div>
+
+      {/* 底部：Mesh Gallery (Page2 高模缩略图横向滚动) */}
+      <div
+        style={{
+          borderTop: '1px solid var(--border-default)',
+          background: 'var(--bg-surface)',
+          padding: '8px 12px',
+          flex: '0 0 auto',
+        }}
+      >
+        <div
+          style={{
+            fontSize: 11,
+            fontWeight: 600,
+            color: 'var(--text-primary)',
+            marginBottom: 6,
+            textTransform: 'uppercase',
+            letterSpacing: 0.5,
+          }}
+        >
+          🖼️ Mesh Gallery · Page2 highres
+        </div>
+        <HighresGallery
+          currentSrcFile={srcChosenName ?? srcHistory[0]?.file ?? null}
+          onPickSource={(item: HighresGalleryItem) => {
+            setSrcChosenName(item.file);
+            onStatusChange?.(`Mesh Gallery → Source: ${item.pipelineName} · ${item.file}`, 'info');
+            refreshAssets();
+          }}
+        />
       </div>
     </div>
   );
