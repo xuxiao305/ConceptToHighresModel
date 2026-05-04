@@ -43,15 +43,31 @@
  *   - hasTargetRegion = !!session.targetRegionLabel
  *   - 不存购重 payload（per-vertex map）—— V2 进度条只需事实。
  *
+ * Stage 8/1 切片（2026-05-04）：中央视口接通。
+ *   - refreshAssets 在确认 page2.highres / page1.rough 存在后，立刻 loadLatest()
+ *     + loadGlbAsMesh() 把 GLB 解析成 vertices/faces（解析后立刻 revoke URL，
+ *     不持有 ObjectURL，避免内存泄漏）。
+ *   - 中央占位 div 替换为 <DualViewport>，订阅 useLandmarkStore 显示 V1 已添加
+ *     的 landmark。
+ *   - 仍保持只读：picking/click/move/delete 全 disabled；landmark 编辑入口
+ *     仍在 V1。后续切片会逐步把交互搬过来。
+ *
  * 边界：
  *   - 不重新实现任何对齐算法；策略 run 仍由现存 ModelAssemble 持有。
  */
-import { useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { Button } from '../../components/Button';
 import { useProject } from '../../contexts/ProjectContext';
 import type { Page3Session } from '../../services/projectStore';
 import { parseSegmentationJson } from '../../services/segmentationPack';
-import { useLandmarkStore } from '../../three';
+import {
+  DualViewport,
+  loadGlbAsMesh,
+  useLandmarkStore,
+  type Face3,
+  type Vec3,
+  type ViewMode,
+} from '../../three';
 import {
   ALIGN_STRATEGIES,
   summarizeReadiness,
@@ -114,11 +130,25 @@ const READINESS_LABEL: Record<StrategyReadiness, string> = {
   blocked: '依赖缺失',
 };
 
+interface MeshData {
+  vertices: Vec3[];
+  faces: Face3[];
+}
+
 export function ModelAssembleV2(_props: ModelAssembleV2Props) {
-  const { project, listHistory, loadPage3SegPack, loadPage3Session } = useProject();
+  const { project, listHistory, loadLatest, loadPage3SegPack, loadPage3Session } = useProject();
   // Stage 7/4: 订阅全局 landmark store（V1/V2 共享）。
-  const srcLandmarkCount = useLandmarkStore((s) => s.srcLandmarks.length);
-  const tarLandmarkCount = useLandmarkStore((s) => s.tarLandmarks.length);
+  const srcLandmarks = useLandmarkStore((s) => s.srcLandmarks);
+  const tarLandmarks = useLandmarkStore((s) => s.tarLandmarks);
+  const srcLandmarkCount = srcLandmarks.length;
+  const tarLandmarkCount = tarLandmarks.length;
+  // Stage 8/1: 中央视口需要的 mesh 数据。null = 尚未加载/工程内无文件。
+  const [srcMesh, setSrcMesh] = useState<MeshData | null>(null);
+  const [tarMesh, setTarMesh] = useState<MeshData | null>(null);
+  const [viewMode, setViewMode] = useState<ViewMode>('solid');
+  const [meshLoadError, setMeshLoadError] = useState<string | null>(null);
+  // 跟踪当前活跃的 refresh 序号，防止 race condition（旧请求晚于新请求返回）。
+  const refreshSeqRef = useRef(0);
   const [selectedId, setSelectedId] = useState<AlignStrategyId>('pose-proxy');
   const [expandedReqs, setExpandedReqs] = useState<Set<AlignStrategyId>>(new Set());
   const [showLogs, setShowLogs] = useState(false);
@@ -143,14 +173,19 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
       setSegPackDirName(null);
       setSegPackRegionLabels([]);
       setSession(null);
+      setSrcMesh(null);
+      setTarMesh(null);
+      setMeshLoadError(null);
       return;
     }
+    const seq = ++refreshSeqRef.current;
     void Promise.all([
       listHistory('page2.highres'),
       listHistory('page1.rough'),
       loadPage3SegPack(),
       loadPage3Session(),
     ]).then(async ([src, tar, segpack, sess]) => {
+      if (seq !== refreshSeqRef.current) return;
       setSourceFileCount(src.length);
       setTargetFileCount(tar.length);
       setSegPackDirName(segpack?.dirName ?? null);
@@ -168,8 +203,35 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
       } else {
         setSegPackRegionLabels([]);
       }
+      // Stage 8/1: 加载实际 mesh 数据。失败不阻塞 readiness 面板。
+      setMeshLoadError(null);
+      const loadSide = async (nodeKey: string): Promise<MeshData | null> => {
+        try {
+          const latest = await loadLatest(nodeKey);
+          if (!latest) return null;
+          const loaded = await loadGlbAsMesh(latest.url);
+          // 解析完成立刻 revoke，避免 ObjectURL 泄漏（与 V1 line 2366 同模式）。
+          URL.revokeObjectURL(latest.url);
+          return { vertices: loaded.vertices, faces: loaded.faces };
+        } catch (err) {
+          console.warn(`[V2] mesh 加载失败 (${nodeKey}):`, err);
+          throw err;
+        }
+      };
+      try {
+        const [s, t] = await Promise.all([
+          src.length > 0 ? loadSide('page2.highres') : Promise.resolve(null),
+          tar.length > 0 ? loadSide('page1.rough') : Promise.resolve(null),
+        ]);
+        if (seq !== refreshSeqRef.current) return;
+        setSrcMesh(s);
+        setTarMesh(t);
+      } catch (err) {
+        if (seq !== refreshSeqRef.current) return;
+        setMeshLoadError(err instanceof Error ? err.message : String(err));
+      }
     });
-  }, [project, listHistory, loadPage3SegPack, loadPage3Session]);
+  }, [project, listHistory, loadLatest, loadPage3SegPack, loadPage3Session]);
   // Effect 只在 project 变化时跑；在其他页面落盘后的新资产需手动 ↻ 按钮。
   useEffect(() => {
     refreshAssets();
@@ -256,7 +318,7 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
           BETA
         </span>
         <span>
-          这是 Page3 V2 脚手架（重构计划 Stage 7）。生产对齐流程请使用默认路由（43D 视口 / SAM3 面板均在 V1）。
+          Page3 V2（Stage 8/1）：DualViewport 已接通，picking/SAM3/run 仍在 V1。生产路径请使用默认路由。
         </span>
       </div>
       <div
@@ -341,24 +403,52 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
           </span>
         </div>
 
-        <div
-          style={{
-            flex: 1,
-            background: 'var(--bg-app)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            color: 'var(--text-muted)',
-            fontSize: 14,
-          }}
-        >
-          <div style={{ textAlign: 'center' }}>
-            <div style={{ fontSize: 32, marginBottom: 8 }}>🎬</div>
-            <div>3D Viewport (待挂接 DualViewport)</div>
-            <div style={{ fontSize: 11, marginTop: 4 }}>
-              Stage 6 scaffold · ?v2
+        <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
+          {srcMesh && tarMesh ? (
+            <DualViewport
+              srcVertices={srcMesh.vertices}
+              srcFaces={srcMesh.faces}
+              tarVertices={tarMesh.vertices}
+              tarFaces={tarMesh.faces}
+              viewMode={viewMode}
+              onViewModeChange={setViewMode}
+              srcLandmarks={srcLandmarks}
+              tarLandmarks={tarLandmarks}
+              pickingEnabled={false}
+              srcLabel="Source (page2.highres)"
+              tarLabel="Target (page1.rough)"
+              showCameraSync
+              height="100%"
+            />
+          ) : (
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                color: 'var(--text-muted)',
+                fontSize: 14,
+              }}
+            >
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: 32, marginBottom: 8 }}>🎬</div>
+                <div>
+                  {!project
+                    ? '未打开工程'
+                    : meshLoadError
+                      ? `Mesh 加载失败：${meshLoadError}`
+                      : sourceFileCount === 0 || targetFileCount === 0
+                        ? `工程内 mesh 不全（src=${sourceFileCount}, tar=${targetFileCount}）`
+                        : '正在加载 mesh…'}
+                </div>
+                <div style={{ fontSize: 11, marginTop: 4 }}>
+                  Stage 8/1 · DualViewport 已接通（只读，picking 仍在 V1）
+                </div>
+              </div>
             </div>
-          </div>
+          )}
         </div>
       </main>
 
