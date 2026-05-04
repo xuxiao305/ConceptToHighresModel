@@ -52,6 +52,13 @@
  *   - 仍保持只读：picking/click/move/delete 全 disabled；landmark 编辑入口
  *     仍在 V1。后续切片会逐步把交互搬过来。
  *
+ * Stage 8/2 切片（2026-05-04）：V2 入口可编辑 landmark。
+ *   - Ctrl+Click 添加、点击选中、Drag 移动、Delete 删除 —— 全部直接 dispatch 到
+ *     useLandmarkStore。V1 仍能同时读到同一份 state（全局 zustand）。
+ *   - resetPreview 还未接入（V1 里是清 alignResult+resultPreview），等 Stage 8/3
+ *     run 接通后一起处理。
+ *   - status callback 走 _props.onStatusChange（V2 先前必须响应以便调试）。
+ *
  * 边界：
  *   - 不重新实现任何对齐算法；策略 run 仍由现存 ModelAssemble 持有。
  */
@@ -135,13 +142,23 @@ interface MeshData {
   faces: Face3[];
 }
 
-export function ModelAssembleV2(_props: ModelAssembleV2Props) {
+export function ModelAssembleV2(props: ModelAssembleV2Props) {
+  const { onStatusChange } = props;
   const { project, listHistory, loadLatest, loadPage3SegPack, loadPage3Session } = useProject();
   // Stage 7/4: 订阅全局 landmark store（V1/V2 共享）。
   const srcLandmarks = useLandmarkStore((s) => s.srcLandmarks);
   const tarLandmarks = useLandmarkStore((s) => s.tarLandmarks);
+  const addSrcLandmark = useLandmarkStore((s) => s.addSrcLandmark);
+  const addTarLandmark = useLandmarkStore((s) => s.addTarLandmark);
+  const updateSrcLandmark = useLandmarkStore((s) => s.updateSrcLandmark);
+  const updateTarLandmark = useLandmarkStore((s) => s.updateTarLandmark);
+  const removeSrcLandmark = useLandmarkStore((s) => s.removeSrcLandmark);
+  const removeTarLandmark = useLandmarkStore((s) => s.removeTarLandmark);
   const srcLandmarkCount = srcLandmarks.length;
   const tarLandmarkCount = tarLandmarks.length;
+  // Stage 8/2: V2 内部选中状态（V1 有同名 state，不共享 — 两个面板独立选中可接受）。
+  const [selectedSrcIndex, setSelectedSrcIndex] = useState<number | null>(null);
+  const [selectedTarIndex, setSelectedTarIndex] = useState<number | null>(null);
   // Stage 8/1: 中央视口需要的 mesh 数据。null = 尚未加载/工程内无文件。
   const [srcMesh, setSrcMesh] = useState<MeshData | null>(null);
   const [tarMesh, setTarMesh] = useState<MeshData | null>(null);
@@ -282,6 +299,57 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
     });
   };
 
+  // Stage 8/2: 看 V1 line 2384-2434。Ctrl+Click 添加、Drag 移动、Delete 删除。
+  // 与 V1 语义一致：index 以 原最后一个 + 1 生成 —— 但这里同一 store，
+  // V1/V2 同时点击也不会冲突（store 内部是自增 counter，addSrcLandmark 返回后
+  // 获得的 index 需从 next state 读）。此处只需负责调用 add，选中交给下次 effect。
+  const handleSrcClick = useCallback(
+    (idx: number, pos: Vec3, modifiers: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean }) => {
+      if (!modifiers.ctrlKey) return;
+      addSrcLandmark(idx, pos);
+      onStatusChange?.('Source Landmark 已添加 (Ctrl+Click)', 'info');
+    },
+    [addSrcLandmark, onStatusChange],
+  );
+  const handleTarClick = useCallback(
+    (idx: number, pos: Vec3, modifiers: { ctrlKey: boolean; shiftKey: boolean; altKey: boolean }) => {
+      if (!modifiers.ctrlKey) return;
+      addTarLandmark(idx, pos);
+      onStatusChange?.('Target Landmark 已添加 (Ctrl+Click)', 'info');
+    },
+    [addTarLandmark, onStatusChange],
+  );
+  const handleDeleteSrc = useCallback(
+    (index: number) => {
+      removeSrcLandmark(index);
+      if (selectedSrcIndex === index) setSelectedSrcIndex(null);
+      onStatusChange?.(`已删除 Source Landmark #${index}`, 'warning');
+    },
+    [removeSrcLandmark, selectedSrcIndex, onStatusChange],
+  );
+  const handleDeleteTar = useCallback(
+    (index: number) => {
+      removeTarLandmark(index);
+      if (selectedTarIndex === index) setSelectedTarIndex(null);
+      onStatusChange?.(`已删除 Target Landmark #${index}`, 'warning');
+    },
+    [removeTarLandmark, selectedTarIndex, onStatusChange],
+  );
+  const handleMoveSrc = useCallback(
+    (index: number, position: Vec3) => {
+      updateSrcLandmark(index, position, -1);
+      setSelectedSrcIndex(index);
+    },
+    [updateSrcLandmark],
+  );
+  const handleMoveTar = useCallback(
+    (index: number, position: Vec3) => {
+      updateTarLandmark(index, position, -1);
+      setSelectedTarIndex(index);
+    },
+    [updateTarLandmark],
+  );
+
   return (
     <div
       style={{
@@ -414,7 +482,16 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
               onViewModeChange={setViewMode}
               srcLandmarks={srcLandmarks}
               tarLandmarks={tarLandmarks}
-              pickingEnabled={false}
+              onSrcClick={handleSrcClick}
+              onTarClick={handleTarClick}
+              selectedSrcLandmarkIndex={selectedSrcIndex}
+              selectedTarLandmarkIndex={selectedTarIndex}
+              onSelectSrcLandmark={setSelectedSrcIndex}
+              onSelectTarLandmark={setSelectedTarIndex}
+              onDeleteSrcLandmark={handleDeleteSrc}
+              onDeleteTarLandmark={handleDeleteTar}
+              onMoveSrcLandmark={handleMoveSrc}
+              onMoveTarLandmark={handleMoveTar}
               srcLabel="Source (page2.highres)"
               tarLabel="Target (page1.rough)"
               showCameraSync
