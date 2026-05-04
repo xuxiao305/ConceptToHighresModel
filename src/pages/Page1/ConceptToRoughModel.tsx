@@ -55,8 +55,8 @@ const NODE_KEYS = [
 type RoughBackend = 'tripo' | 'trellis2';
 
 const BACKEND_LABEL: Record<RoughBackend, string> = {
-  tripo: 'Tripo (multi-view)',
-  trellis2: 'TRELLIS.2 (single-view, 自部署)',
+  tripo: 'Tripo-MultiView',
+  trellis2: 'Trellis2-Single',
 };
 
 const ROUGH_BACKEND_LS_KEY = 'page1.rough.backend';
@@ -1261,8 +1261,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                       onChange={(e) => setRoughBackend(e.target.value as RoughBackend)}
                       style={selStyle}
                     >
-                      <option value="tripo">Tripo (multi-view)</option>
-                      <option value="trellis2">TRELLIS.2 (single-view)</option>
+                      <option value="tripo">Tripo-MultiView</option>
+                      <option value="trellis2">Trellis2-Single</option>
                     </select>
                   </div>
                 );
@@ -1779,8 +1779,8 @@ function RoughBackendPanel({
             onChange={(e) => onChangeBackend(e.target.value as RoughBackend)}
             style={{ ...inputStyle, padding: '2px' }}
           >
-            <option value="tripo">Tripo (multi-view)</option>
-            <option value="trellis2">TRELLIS.2 (single-view)</option>
+            <option value="tripo">Tripo-MultiView</option>
+            <option value="trellis2">Trellis2-Single</option>
           </select>
         </div>
       )}
