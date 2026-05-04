@@ -23,11 +23,13 @@
  *
  * Stage 7/4 切片（2026-05-04）：
  *   - srcLandmarkCount / tarLandmarkCount：订阅全局 useLandmarkStore（V1/V2 共享）。
- *   - hasAdjacency：逻辑上等价于 hasSource && hasTarget（只要两份 mesh 能 load，
- *     buildMeshAdjacency 就能跑），避免在 V2 重走 GLB 加载。
- *   - 进度：7/9。剩下 2/9 是与交互强绑定的 transient state：
- *     hasTargetRegion / hasMaskReprojection / hasOrthoCamera → 需用户在 V1
- *     跳走 2D 定位流程后产生，本阶段保留 stub。
+ *   - hasAdjacency：逻辑上等价于 hasSource && hasTarget。
+ *
+ * Stage 7/5 切片（2026-05-04）：
+ *   - hasBodyTorsoRegion：加载 SegPack 后解析 segmentation.json，
+ *     检测 regions 里是否含 body/torso/jacket/coat 标签。
+ *   - 进度：8/9。剩下 1/9 （3 字段为组）是 2D 定位交互产生的
+ *     transient state：hasTargetRegion / hasMaskReprojection / hasOrthoCamera。
  *   - 这里只判存在性，不实际 load blob（避免 URL.createObjectURL 泄漏，且接
  *     通 mesh 视口是更后面的切片）。
  *   - 进度：3/9。
@@ -38,6 +40,7 @@
 import { useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react';
 import { Button } from '../../components/Button';
 import { useProject } from '../../contexts/ProjectContext';
+import { parseSegmentationJson } from '../../services/segmentationPack';
 import { useLandmarkStore } from '../../three';
 import {
   ALIGN_STRATEGIES,
@@ -55,37 +58,43 @@ interface ModelAssembleV2Props {
 }
 
 /**
- * Stub 定义：记录哪些字段还不是真实数据。后续切片逐个拿掉。
+ * Stub 定义：仅剩 3 个真 transient 字段。
  *
- * TODO 未接入字段 (2/9 需用户交互产生)：
- *   - hasTargetRegion               : 需 SAM3 region selector state（transient）
- *   - hasMaskReprojection           : 需 反投影计算 state（transient）
- *   - hasOrthoCamera                : 需 正交相机装载 state（transient）
- *
- * 1/9 可推导但未作（避免 V2 重走全量 SegPack 解析）：
- *   - hasBodyTorsoRegion            : 需 SegPack regions 中 findMaskRegion(['body','torso'])
+ * TODO 为与交互强绑定的 state，需用户在 V1 跳走 2D 定位流程后产生：
+ *   - hasTargetRegion               : SAM3 region selector 点选后产生
+ *   - hasMaskReprojection           : 反投影结果
+ *   - hasOrthoCamera                : 正交相机装载后产生
  */
 const STUB_FALLBACK: Pick<
   AlignStrategyContext,
-  'hasTargetRegion' | 'hasMaskReprojection' | 'hasOrthoCamera' | 'hasBodyTorsoRegion'
+  'hasTargetRegion' | 'hasMaskReprojection' | 'hasOrthoCamera'
 > = {
   hasTargetRegion: true,
   hasMaskReprojection: true,
   hasOrthoCamera: true,
-  hasBodyTorsoRegion: false, // 故意 missing → limb-structure 显示 partial
 };
 
-/** Stage 7/1、7/2、7/3c、7/4: 实时接通的字段名单。 */
+/** Stage 7/1、7/2、7/3c、7/4、7/5: 实时接通的字段名单。 */
 const REAL_FIELDS: ReadonlyArray<keyof AlignStrategyContext> = [
   'hasPoseProxyJoints',
   'hasSource',
   'hasTarget',
   'hasSegPack',
+  'hasBodyTorsoRegion',
   'hasAdjacency',
   'srcLandmarkCount',
   'tarLandmarkCount',
 ];
 const TOTAL_FIELDS = 9;
+
+/** 与生产 ModelAssemble.findMaskRegion 同一组词汇（line 431-432）。 */
+const BODY_TORSO_LABELS = ['body', 'torso', 'jacket', 'coat'];
+function segPackHasBodyTorso(regionLabels: string[]): boolean {
+  return regionLabels.some((label) => {
+    const lower = label.toLowerCase();
+    return BODY_TORSO_LABELS.some((kw) => lower.includes(kw));
+  });
+}
 
 
 const READINESS_COLOR: Record<StrategyReadiness, string> = {
@@ -120,24 +129,39 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
   // 命名沿用生产 ModelAssemble 的语义（src→tar 表示对齐方向）。
   const [sourceFileCount, setSourceFileCount] = useState(0);
   const [targetFileCount, setTargetFileCount] = useState(0);
-  // Stage 7/3c: SegPack 检测。仅记录“存在 + dirName”，不解析 / 不加载 mask，
-  // 避免为了一个 bool 乘载两块二进制。真正要用 segPack 的面板后续切片再 load。
+  // Stage 7/3c: SegPack 检测。
   const [segPackDirName, setSegPackDirName] = useState<string | null>(null);
+  // Stage 7/5: SegPack 里是否有 body/torso 标签。
+  const [segPackRegionLabels, setSegPackRegionLabels] = useState<string[]>([]);
   const refreshAssets = useCallback(() => {
     if (!project) {
       setSourceFileCount(0);
       setTargetFileCount(0);
       setSegPackDirName(null);
+      setSegPackRegionLabels([]);
       return;
     }
     void Promise.all([
       listHistory('page2.highres'),
       listHistory('page1.rough'),
       loadPage3SegPack(),
-    ]).then(([src, tar, segpack]) => {
+    ]).then(async ([src, tar, segpack]) => {
       setSourceFileCount(src.length);
       setTargetFileCount(tar.length);
       setSegPackDirName(segpack?.dirName ?? null);
+      // Stage 7/5: 只解析 json（快），不加载 mask。
+      if (segpack?.jsonBlob) {
+        try {
+          const text = await segpack.jsonBlob.text();
+          const pack = parseSegmentationJson(text);
+          setSegPackRegionLabels(pack.regions.map((r) => r.label));
+        } catch (err) {
+          console.warn('[V2] SegPack json 解析失败:', err);
+          setSegPackRegionLabels([]);
+        }
+      } else {
+        setSegPackRegionLabels([]);
+      }
     });
   }, [project, listHistory, loadPage3SegPack]);
   // Effect 只在 project 变化时跑；在其他页面落盘后的新资产需手动 ↻ 按钮。
@@ -145,7 +169,7 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
     refreshAssets();
   }, [refreshAssets]);
 
-  // Stage 7/1+7/2+7/3c+7/4: 逐个接通。
+  // Stage 7/1+7/2+7/3c+7/4+7/5: 逐个接通。
   const ctx: AlignStrategyContext = useMemo(() => {
     const front = project?.meta.page1?.joints?.views.front?.joints;
     const hasSource = sourceFileCount > 0;
@@ -156,7 +180,8 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
       hasSource,
       hasTarget,
       hasSegPack: !!segPackDirName,
-      // hasAdjacency 逻辑等价于 两份 mesh 都能 load（buildMeshAdjacency 是纯函数）。
+      hasBodyTorsoRegion: segPackHasBodyTorso(segPackRegionLabels),
+      // hasAdjacency 逻辑等价于 两份 mesh 都能 load。
       hasAdjacency: hasSource && hasTarget,
       srcLandmarkCount,
       tarLandmarkCount,
@@ -166,6 +191,7 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
     sourceFileCount,
     targetFileCount,
     segPackDirName,
+    segPackRegionLabels,
     srcLandmarkCount,
     tarLandmarkCount,
   ]);
@@ -187,12 +213,50 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
     <div
       style={{
         flex: 1,
-        display: 'grid',
-        gridTemplateColumns: '360px 1fr 360px',
+        display: 'flex',
+        flexDirection: 'column',
         overflow: 'hidden',
-        background: 'var(--bg-app)',
       }}
     >
+      {/* Stage 7/Final-α: Beta 标识，V1 仍是默认路由 */}
+      <div
+        style={{
+          padding: '6px 12px',
+          background: 'linear-gradient(90deg, rgba(232,183,64,0.15), rgba(232,183,64,0.05))',
+          borderBottom: '1px solid rgba(232,183,64,0.4)',
+          fontSize: 11,
+          color: 'var(--text-primary)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+        }}
+      >
+        <span
+          style={{
+            background: '#e8b740',
+            color: '#000',
+            fontSize: 10,
+            fontWeight: 700,
+            padding: '2px 6px',
+            borderRadius: 3,
+            letterSpacing: 0.5,
+          }}
+        >
+          BETA
+        </span>
+        <span>
+          这是 Page3 V2 脚手架（重构计划 Stage 7）。生产对齐流程请使用默认路由（43D 视口 / SAM3 面板均在 V1）。
+        </span>
+      </div>
+      <div
+        style={{
+          flex: 1,
+          display: 'grid',
+          gridTemplateColumns: '360px 1fr 360px',
+          overflow: 'hidden',
+          background: 'var(--bg-app)',
+        }}
+      >
       {/* 左侧：数据 / 区域 / 日志 */}
       <aside style={asideStyle('left')}>
         <PanelSection title="📦 模型输入">
@@ -213,7 +277,10 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
             SegPack: {segPackDirName ?? '未保存'}
             {segPackDirName && '（V1 加载后自动持久化）'}
           </Hint>
-          <Hint>SAM3 区域选择器待挂接（当前仅检测 SegPack 存在性）</Hint>
+          {segPackRegionLabels.length > 0 && (
+            <Hint>区域: {segPackRegionLabels.join(', ')}</Hint>
+          )}
+          <Hint>SAM3 区域选择器待挂接（当前仅检测 SegPack 存在性 + body/torso 标签）</Hint>
         </PanelSection>
 
         <PanelSection
@@ -332,6 +399,7 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
 
         <DataSourceStatusBar project={project} />
       </aside>
+      </div>
     </div>
   );
 }
@@ -635,10 +703,17 @@ function DataSourceStatusBar({ project }: { project: ReturnType<typeof useProjec
       }}
     >
       <div>
-        <strong style={{ color: '#5cb85c' }}>Stage 7/1</strong> · 真实数据接通{' '}
-        {realCount}/{TOTAL_FIELDS} · 工程：{projectName}
+        <strong style={{ color: realCount === TOTAL_FIELDS ? '#5cb85c' : '#e8b740' }}>
+          Stage 7
+        </strong>{' '}
+        · 真实数据接通 {realCount}/{TOTAL_FIELDS} · 工程：{projectName}
       </div>
       <div>{jointsHint}</div>
+      {realCount < TOTAL_FIELDS && (
+        <div style={{ marginTop: 4, opacity: 0.8 }}>
+          剩余 stub：hasTargetRegion / hasMaskReprojection / hasOrthoCamera（需 V1 完成 2D 定位后产生）
+        </div>
+      )}
     </div>
   );
 }
