@@ -68,7 +68,8 @@ export const NODE_DIRS: Record<string, NodeDir> = {
   'page2.extraction': { pageDir: 'page2_highres', nodeDir: '01_extraction' },
   'page2.modify':     { pageDir: 'page2_highres', nodeDir: '02_modify' },
   'page2.highres':   { pageDir: 'page2_highres', nodeDir: '02_highres' },
-  // Page 3 占位（后续节点接入时按需追加）
+  // Page 3
+  'page3.segpack':   { pageDir: 'page3_assemble', nodeDir: '01_segpack' },
 };
 
 /** File System Access API 类型补丁（TS lib 暂未完整覆盖） */
@@ -558,6 +559,74 @@ export async function loadLatestSegmentSet(
     }
   }
   return { dirName: latest, index: idx, files };
+}
+
+
+// ---------------------------------------------------------------------------
+// Page3 SegPack 持久化（Stage 7/3a）
+// ---------------------------------------------------------------------------
+//
+// SAM3 多区域分割包（SegmentationPack）以前只是 Page3 运行时状态，
+// 每次重进页面都需手动 load。这里复用 saveSegmentSet 的多文件子
+// 目录机制，把 JSON + mask PNG 这一对存为一个版本，允许在重进
+// 工程后自动恢复。
+//
+// 设计要点：
+//   - 不序列化运行时结构体，只存原始 json + png，避免 schema 漂移。
+//   - mask 文件名保留原名（例如 segmentation_mask.png / segformer_label_mask.png）
+//     以便 parseSegmentationJson 后 maskName 字段能对上。
+//   - source 记录为生成这份 SegPack 的参考图名（通常是正交渲染输出）。
+
+/**
+ * 保存一对 SegPack 文件。
+ * - jsonBlob：segmentation.json 内容。
+ * - maskBlob：mask png 内容。
+ * - maskName：mask 文件原始名（必须与 jsonBlob 里的 mask_png 字段一致）。
+ * - source：生成这份分割的参考图文件名（仅诊断用）。
+ */
+export async function savePage3SegPack(
+  handle: ProjectHandle,
+  jsonBlob: Blob,
+  maskBlob: Blob,
+  maskName: string,
+  source: string,
+): Promise<SegmentSetHandle> {
+  const baseName = `segpack_${makeTimestamp()}`;
+  return await saveSegmentSet(handle, 'page3.segpack', baseName, source, [
+    { name: 'segmentation.json', blob: jsonBlob },
+    { name: maskName, blob: maskBlob },
+  ]);
+}
+
+/**
+ * 读取工程内最新保存的 SegPack。返回 原始 json blob + mask blob + mask
+ * 文件名，供调用方重走 parseSegmentationJson + URL.createObjectURL 流程。
+ */
+export async function loadLatestPage3SegPack(
+  handle: ProjectHandle,
+): Promise<{
+  jsonBlob: Blob;
+  maskBlob: Blob;
+  maskName: string;
+  source: string;
+  dirName: string;
+} | null> {
+  const result = await loadLatestSegmentSet(handle, 'page3.segpack');
+  if (!result) return null;
+  const jsonBlob = result.files.get('segmentation.json');
+  if (!jsonBlob) return null;
+  // mask = entries 里除 segmentation.json 之外的唯一 entry
+  const maskEntry = result.index.entries.find((e) => e.file !== 'segmentation.json');
+  if (!maskEntry) return null;
+  const maskBlob = result.files.get(maskEntry.file);
+  if (!maskBlob) return null;
+  return {
+    jsonBlob,
+    maskBlob,
+    maskName: maskEntry.file,
+    source: result.index.source,
+    dirName: result.dirName,
+  };
 }
 
 

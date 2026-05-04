@@ -14,11 +14,13 @@ import {
   listNodeHistory,
   loadLatestNodeAsset,
   loadLatestSegmentSet,
+  loadLatestPage3SegPack,
   loadNodeAssetByName,
   loadPipelines,
   pickAndOpenOrCreateProject,
   renameProject as renameProjectApi,
   saveNodeAsset,
+  savePage3SegPack,
   savePage1Joints,
   savePage1Splits,
   savePipelines,
@@ -95,6 +97,20 @@ interface ProjectContextValue {
   savePage1Splits: (splits: Page1SplitsMeta) => Promise<void>;
   /** Stage 1: Page1 joints 元信息持久化（写入 project.json.page1.joints） */
   savePage1Joints: (joints: Page1JointsMeta) => Promise<void>;
+
+  /** Stage 7/3a: Page3 SAM3 SegPack 持久化到工程目录（page3_assemble/01_segpack/）。 */
+  savePage3SegPack: (
+    jsonBlob: Blob,
+    maskBlob: Blob,
+    maskName: string,
+    source: string,
+  ) => Promise<SegmentSetHandle | null>;
+
+  /** Stage 7/3a: 读取工程内最新一份 SegPack（原始 json + mask png）。 */
+  loadPage3SegPack: () => Promise<
+    | { jsonBlob: Blob; maskBlob: Blob; maskName: string; source: string; dirName: string }
+    | null
+  >;
 }
 
 const ProjectContext = createContext<ProjectContextValue | null>(null);
@@ -241,6 +257,19 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     [project],
   );
 
+  const savePage3SegPackCb = useCallback(
+    async (jsonBlob: Blob, maskBlob: Blob, maskName: string, source: string) => {
+      if (!project) return null;
+      return await savePage3SegPack(project, jsonBlob, maskBlob, maskName, source);
+    },
+    [project],
+  );
+
+  const loadPage3SegPackCb = useCallback(async () => {
+    if (!project) return null;
+    return await loadLatestPage3SegPack(project);
+  }, [project]);
+
   const value = useMemo<ProjectContextValue>(
     () => ({
       project,
@@ -260,8 +289,10 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       loadPipelines: loadPipelinesCb,
       savePage1Splits: savePage1SplitsCb,
       savePage1Joints: savePage1JointsCb,
+      savePage3SegPack: savePage3SegPackCb,
+      loadPage3SegPack: loadPage3SegPackCb,
     }),
-    [project, supported, newOrOpenProject, closeProject, tryReopenLast, rename, setAbsolutePath, saveAsset, loadLatest, listHistory, loadByName, saveSegments, loadLatestSegments, savePipelinesCb, loadPipelinesCb, savePage1SplitsCb, savePage1JointsCb]
+    [project, supported, newOrOpenProject, closeProject, tryReopenLast, rename, setAbsolutePath, saveAsset, loadLatest, listHistory, loadByName, saveSegments, loadLatestSegments, savePipelinesCb, loadPipelinesCb, savePage1SplitsCb, savePage1JointsCb, savePage3SegPackCb, loadPage3SegPackCb]
   );
 
   return <ProjectContext.Provider value={value}>{children}</ProjectContext.Provider>;
