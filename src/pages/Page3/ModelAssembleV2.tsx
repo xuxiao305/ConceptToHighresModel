@@ -23,7 +23,7 @@
  * 边界：
  *   - 不重新实现任何对齐算法；策略 run 仍由现存 ModelAssemble 持有。
  */
-import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react';
 import { Button } from '../../components/Button';
 import { useProject } from '../../contexts/ProjectContext';
 import {
@@ -103,8 +103,7 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
   // 命名沿用生产 ModelAssemble 的语义（src→tar 表示对齐方向）。
   const [sourceFileCount, setSourceFileCount] = useState(0);
   const [targetFileCount, setTargetFileCount] = useState(0);
-  useEffect(() => {
-    let cancelled = false;
+  const refreshAssets = useCallback(() => {
     if (!project) {
       setSourceFileCount(0);
       setTargetFileCount(0);
@@ -114,14 +113,14 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
       listHistory('page2.highres'),
       listHistory('page1.rough'),
     ]).then(([src, tar]) => {
-      if (cancelled) return;
       setSourceFileCount(src.length);
       setTargetFileCount(tar.length);
     });
-    return () => {
-      cancelled = true;
-    };
   }, [project, listHistory]);
+  // Effect 只在 project 变化时跑；在其他页面落盘后的新资产需手动 ↻ 按钮。
+  useEffect(() => {
+    refreshAssets();
+  }, [refreshAssets]);
 
   // Stage 7/1+7/2: hasPoseProxyJoints / hasSource / hasTarget 走真实数据，其余仍 stub。
   const ctx: AlignStrategyContext = useMemo(() => {
@@ -163,6 +162,7 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
           <Row>
             <Button size="sm">Source GLB</Button>
             <Button size="sm">Target GLB</Button>
+            <Button size="sm" onClick={refreshAssets} title="重新扫描工程内 GLB">↻</Button>
           </Row>
           <Hint>
             page2.highres: {sourceFileCount} 个 · page1.rough: {targetFileCount} 个
