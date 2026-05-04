@@ -59,8 +59,17 @@
  *     run 接通后一起处理。
  *   - status callback 走 _props.onStatusChange（V2 先前必须响应以便调试）。
  *
+ * Stage 8/3 切片（2026-05-04）：Manual 策略 Run 接通。
+ *   - 仅 manual 策略在 V2 可运行（它是纯函数 alignSourceMeshByLandmarks，
+ *     不依赖 V1 那些 500 行闭包）。其他 3 套 auto 策略的 run 仍在 V1
+ *     handleAutoAlign 里，本切片不动，只在 V2 上显示提示。
+ *   - Run 入口为右侧面板顶部的 [▶ 运行对齐] 按钮（与选中策略联动）。
+ *   - 运行后展示 RMSE / scale；接受。应用 transform 到实际 srcMesh + landmarks
+ *     使用与 V1 同名的 store action transformSrcLandmarks。
+ *   - QualityDrawer 接入真实 RMSE / meanError / maxError / scale。
+ *
  * 边界：
- *   - 不重新实现任何对齐算法；策略 run 仍由现存 ModelAssemble 持有。
+ *   - 不重新实现任何对齐算法；auto 策略仍由现存 ModelAssemble 持有。
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { Button } from '../../components/Button';
@@ -75,6 +84,7 @@ import {
   type Vec3,
   type ViewMode,
 } from '../../three';
+import { alignSourceMeshByLandmarks, type AlignmentResult } from '../../three/alignment';
 import {
   ALIGN_STRATEGIES,
   summarizeReadiness,
@@ -154,11 +164,16 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
   const updateTarLandmark = useLandmarkStore((s) => s.updateTarLandmark);
   const removeSrcLandmark = useLandmarkStore((s) => s.removeSrcLandmark);
   const removeTarLandmark = useLandmarkStore((s) => s.removeTarLandmark);
+  const transformSrcLandmarks = useLandmarkStore((s) => s.transformSrcLandmarks);
   const srcLandmarkCount = srcLandmarks.length;
   const tarLandmarkCount = tarLandmarks.length;
   // Stage 8/2: V2 内部选中状态（V1 有同名 state，不共享 — 两个面板独立选中可接受）。
   const [selectedSrcIndex, setSelectedSrcIndex] = useState<number | null>(null);
   const [selectedTarIndex, setSelectedTarIndex] = useState<number | null>(null);
+  // Stage 8/3: Run 状态 + 对齐结果。
+  const [aligning, setAligning] = useState(false);
+  const [alignResult, setAlignResult] = useState<AlignmentResult | null>(null);
+  const [runError, setRunError] = useState<string | null>(null);
   // Stage 8/1: 中央视口需要的 mesh 数据。null = 尚未加载/工程内无文件。
   const [srcMesh, setSrcMesh] = useState<MeshData | null>(null);
   const [tarMesh, setTarMesh] = useState<MeshData | null>(null);
@@ -350,6 +365,65 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
     [updateTarLandmark],
   );
 
+  // Stage 8/3: Manual 策略 Run。其余 3 套 auto 策略运行仍在 V1。
+  // 语义与 V1 handleRunAlign (line 2436-2484) 一致：
+  //   - srcLandmark.length === tarLandmark.length
+  //   - 至少 3 对才能 SVD
+  //   - 使用 similarity 模式（V1 ALIGNMENT_MODE 常量）
+  const canRunManual = srcMesh !== null
+    && srcLandmarkCount === tarLandmarkCount
+    && srcLandmarkCount >= 3;
+  const handleRunManual = useCallback(() => {
+    if (!srcMesh) {
+      setRunError('Source mesh 未加载');
+      return;
+    }
+    if (srcLandmarkCount !== tarLandmarkCount) {
+      setRunError(`Landmark 数量不一致：src=${srcLandmarkCount} tar=${tarLandmarkCount}`);
+      return;
+    }
+    if (srcLandmarkCount < 3) {
+      setRunError('至少需 3 对 landmark');
+      return;
+    }
+    setRunError(null);
+    setAligning(true);
+    try {
+      const result = alignSourceMeshByLandmarks(
+        srcMesh.vertices,
+        srcLandmarks.map((l) => l.position),
+        tarLandmarks.map((l) => l.position),
+        'similarity',
+      );
+      setAlignResult(result);
+      onStatusChange?.(`Manual SVD 对齐完成 RMSE=${result.rmse.toFixed(4)}`, 'success');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setRunError(msg);
+      onStatusChange?.(`Manual 对齐失败：${msg}`, 'error');
+    } finally {
+      setAligning(false);
+    }
+  }, [srcMesh, srcLandmarks, tarLandmarks, srcLandmarkCount, tarLandmarkCount, onStatusChange]);
+
+  // 接受对齐：把 alignResult.matrix4x4 应用到 srcMesh + srcLandmarks。
+  // 与 V1 handleApplyAlignedTransform (line 3273-3296) 同语义。
+  const handleAcceptAlign = useCallback(() => {
+    if (!alignResult || !srcMesh) return;
+    setSrcMesh({
+      vertices: alignResult.transformedVertices,
+      faces: srcMesh.faces,
+    });
+    transformSrcLandmarks(alignResult.matrix4x4);
+    setAlignResult(null);
+    onStatusChange?.('已应用对齐变换到 Source mesh + landmarks', 'success');
+  }, [alignResult, srcMesh, transformSrcLandmarks, onStatusChange]);
+
+  const handleResetAlign = useCallback(() => {
+    setAlignResult(null);
+    setRunError(null);
+  }, []);
+
   return (
     <div
       style={{
@@ -531,7 +605,7 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
 
       {/* 右侧：策略 / 步骤 */}
       <aside style={{ ...asideStyle('right'), position: 'relative' }}>
-        <QualityDrawer open={showQuality} onToggle={() => setShowQuality((v) => !v)} />
+        <QualityDrawer open={showQuality} onToggle={() => setShowQuality((v) => !v)} result={alignResult} />
 
         <div
           style={{
@@ -544,7 +618,13 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11 }}>
-            <span style={{ color: 'var(--text-muted)' }}>RMSE 待接入</span>
+            <span style={{ color: alignResult ? '#5cb85c' : 'var(--text-muted)' }}>
+              {alignResult
+                ? `RMSE=${alignResult.rmse.toFixed(4)} · scale=${alignResult.scale.toFixed(3)}`
+                : runError
+                  ? `⚠ ${runError}`
+                  : 'RMSE 未运行'}
+            </span>
             <span style={{ flex: 1 }} />
             <button
               onClick={() => setShowQuality((v) => !v)}
@@ -560,14 +640,50 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
               详情 ◀
             </button>
           </div>
-          <div style={{ display: 'flex', gap: 6 }}>
-            <Button size="sm" variant="primary" style={{ flex: 1, justifyContent: 'center' }}>
-              ✓ 接受对齐
-            </Button>
-            <Button size="sm" style={{ flex: 1, justifyContent: 'center' }}>
-              ↶ 撤销
-            </Button>
-          </div>
+          {selectedId === 'manual' ? (
+            <div style={{ display: 'flex', gap: 6 }}>
+              <Button
+                size="sm"
+                variant="primary"
+                style={{ flex: 1, justifyContent: 'center' }}
+                onClick={handleRunManual}
+                disabled={!canRunManual || aligning}
+                loading={aligning}
+                title={canRunManual ? '' : `需 srcMesh + 至少 3 对 landmark（当前 src=${srcLandmarkCount} tar=${tarLandmarkCount}）`}
+              >
+                ▶ 运行 Manual SVD
+              </Button>
+              <Button
+                size="sm"
+                style={{ flex: 1, justifyContent: 'center' }}
+                onClick={handleAcceptAlign}
+                disabled={!alignResult}
+              >
+                ✓ 接受
+              </Button>
+              <Button
+                size="sm"
+                style={{ justifyContent: 'center' }}
+                onClick={handleResetAlign}
+                disabled={!alignResult && !runError}
+              >
+                ↶
+              </Button>
+            </div>
+          ) : (
+            <div
+              style={{
+                fontSize: 11,
+                color: 'var(--text-muted)',
+                background: 'rgba(232,183,64,0.10)',
+                border: '1px solid rgba(232,183,64,0.4)',
+                borderRadius: 4,
+                padding: 6,
+              }}
+            >
+              auto 策略运行仍在 V1：请在默认路由使用「{selectedStrategy.label}」。Manual 策略可在 V2 运行。
+            </div>
+          )}
         </div>
 
         <PanelSection title="🎯 对齐模式">
@@ -742,7 +858,15 @@ function StepCardV2({ step }: { step: StrategyStep }) {
   );
 }
 
-function QualityDrawer({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+function QualityDrawer({
+  open,
+  onToggle,
+  result,
+}: {
+  open: boolean;
+  onToggle: () => void;
+  result: AlignmentResult | null;
+}) {
   const drawerWidth = 280;
   const asideWidth = 360;
   return (
@@ -791,9 +915,20 @@ function QualityDrawer({ open, onToggle }: { open: boolean; onToggle: () => void
         }}
       >
         <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 10 }}>📊 结果质量</div>
-        <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-          待挂接 alignResult.rmse / scale / iterationCount
-        </div>
+        {result ? (
+          <div style={{ fontSize: 11, color: 'var(--text-primary)', display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div>mode: <code>{result.mode}</code></div>
+            <div>RMSE: <strong>{result.rmse.toFixed(4)}</strong></div>
+            <div>mean error: {result.meanError.toFixed(4)}</div>
+            <div>max error: {result.maxError.toFixed(4)}</div>
+            <div>scale: {result.scale.toFixed(4)}</div>
+            <div style={{ marginTop: 6, fontSize: 10, color: 'var(--text-muted)' }}>
+              点击 [✓ 接受] 应用变换。
+            </div>
+          </div>
+        ) : (
+          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>尚未运行对齐</div>
+        )}
       </div>
     </>
   );
