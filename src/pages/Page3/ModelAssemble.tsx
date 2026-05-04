@@ -102,7 +102,9 @@ import {
 import { alignSourceMeshByLandmarks, type AlignmentResult } from '../../three/alignment';
 import { runLimbStructure, runSurface, runPoseProxy } from '../../services/alignStrategies/runners';
 import { SAM3Panel } from './SAM3Panel';
+import { TargetGallery, type TargetGalleryItem, type TargetKind } from './TargetGallery';
 import { HighresGallery, type HighresGalleryItem } from './HighresGallery';
+import { regionHslCss } from '../../components/SegPackOverlay';
 import type { Joint2D } from '../../types/joints';
 import {
   ALIGN_STRATEGIES,
@@ -173,7 +175,7 @@ interface MeshData {
 
 export function ModelAssemble(props: ModelAssembleProps) {
   const { onStatusChange } = props;
-  const { project, listHistory, loadLatest, loadByName, loadPage3SegPack, loadPage3Session, saveAsset, savePage3SegPack } = useProject();
+  const { project, listHistory, loadLatest, loadByName, loadPage1SegPack, loadPage3Session, saveAsset, savePage3SegPack } = useProject();
   // Stage 7/4: 订阅全局 landmark store（V1/V2 共享）。
   const srcLandmarks = useLandmarkStore((s) => s.srcLandmarks);
   const tarLandmarks = useLandmarkStore((s) => s.tarLandmarks);
@@ -202,6 +204,11 @@ export function ModelAssemble(props: ModelAssembleProps) {
   const [tarRegion, setTarRegion] = useState<MeshRegion | null>(null);
   const [tarRegionLabel, setTarRegionLabel] = useState<string | null>(null);
   const [tarOrthoCamera, setTarOrthoCamera] = useState<OrthoFrontCamera | null>(null);
+  // 反投影后的每区域顶点集（可选）——用于在中央 3D 视口高亮全部 SegPack 区域。
+  // 使用有序数组，保留 regionIndex 以与 Page1 SegPack 预览色彩对齐。
+  const [tarReprojRegions, setTarReprojRegions] = useState<
+    Array<{ regionIndex: number; label: string; vertices: number[] }> | null
+  >(null);
   const handleAdoptRegion = useCallback(
     (region: MeshRegion | null, label: string | null, camera: OrthoFrontCamera | null) => {
       setTarRegion(region);
@@ -257,6 +264,11 @@ export function ModelAssemble(props: ModelAssembleProps) {
   const [tarHistory, setTarHistory] = useState<AssetVersion[]>([]);
   const [srcChosenName, setSrcChosenName] = useState<string | null>(null);
   const [tarChosenName, setTarChosenName] = useState<string | null>(null);
+  // PR-B/C: which Page1 3D output is currently bound to Target.
+  //   'clothed'  → page1.rough           + page1.segpack.clothed
+  //   'nojacket' → page1.rough.nojacket  + page1.segpack.nojacket
+  // SegPack 数据源完全跟随 tarKind，不再回退到 page3.segpack。
+  const [tarKind, setTarKind] = useState<TargetKind>('clothed');
   // Stage 7/3c: SegPack 检测。
   const [segPackDirName, setSegPackDirName] = useState<string | null>(null);
   // Stage 7/5: SegPack 里是否有 body/torso 标签。
@@ -276,10 +288,13 @@ export function ModelAssemble(props: ModelAssembleProps) {
       return;
     }
     const seq = ++refreshSeqRef.current;
+    // PR-C: target 侧 NODE_KEY 由 tarKind 决定；SegPack 同步取对应 slot。
+    const tarNodeKey: 'page1.rough' | 'page1.rough.nojacket' =
+      tarKind === 'nojacket' ? 'page1.rough.nojacket' : 'page1.rough';
     void Promise.all([
       listHistory('page2.highres'),
-      listHistory('page1.rough'),
-      loadPage3SegPack(),
+      listHistory(tarNodeKey),
+      loadPage1SegPack(tarKind),
       loadPage3Session(),
     ]).then(async ([src, tar, segpack, sess]) => {
       if (seq !== refreshSeqRef.current) return;
@@ -329,7 +344,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
       try {
         const [s, t] = await Promise.all([
           src.length > 0 ? loadSide('page2.highres', srcChosenName, src) : Promise.resolve(null),
-          tar.length > 0 ? loadSide('page1.rough', tarChosenName, tar) : Promise.resolve(null),
+          tar.length > 0 ? loadSide(tarNodeKey, tarChosenName, tar) : Promise.resolve(null),
         ]);
         if (seq !== refreshSeqRef.current) return;
         setSrcMesh(s);
@@ -339,7 +354,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
         setMeshLoadError(err instanceof Error ? err.message : String(err));
       }
     });
-  }, [project, listHistory, loadLatest, loadByName, loadPage3SegPack, loadPage3Session, srcChosenName, tarChosenName]);
+  }, [project, listHistory, loadLatest, loadByName, loadPage1SegPack, loadPage3Session, srcChosenName, tarChosenName, tarKind]);
   // Effect 只在 project 变化时跑；在其他页面落盘后的新资产需手动 ↻ 按钮。
   useEffect(() => {
     refreshAssets();
@@ -714,6 +729,21 @@ export function ModelAssemble(props: ModelAssembleProps) {
     return buildMeshAdjacency(tarMesh.vertices, tarMesh.faces);
   }, [tarMesh]);
 
+  // SegPack 反投影区域 → DualViewport tar 分层点云，调用 Page1 SegPackOverlay 同一个
+  // 调色板函数 regionHslCss，保证与 Page1 预览颜色逐个对应。
+  const tarSegpackLayers = useMemo(() => {
+    if (!tarReprojRegions || tarReprojRegions.length === 0) return undefined;
+    const layers = tarReprojRegions
+      .filter((r) => r.vertices.length > 0)
+      .map((r) => ({
+        indices: r.vertices,
+        color: regionHslCss(r.regionIndex),
+        size: 9,
+        opacity: 0.95,
+      }));
+    return layers.length > 0 ? layers : undefined;
+  }, [tarReprojRegions]);
+
   // Stage 8/8 + 9: limb-structure + surface + pose-proxy auto runners.
   // tarConstraintVertices comes from SAM3Panel (Stage 9). When the user
   // hasn’t adopted a region, runners execute unconstrained (whole mesh).
@@ -1072,6 +1102,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
               onDeleteTarLandmark={handleDeleteTar}
               onMoveSrcLandmark={handleMoveSrc}
               onMoveTarLandmark={handleMoveTar}
+              tarPointLayers={tarSegpackLayers}
               srcLabel="Source (page2.highres)"
               tarLabel="Target (page1.rough)"
               showCameraSync
@@ -1255,9 +1286,11 @@ export function ModelAssemble(props: ModelAssembleProps) {
 
         <PanelSection title="🧩 SAM3 区域">
           <SAM3Panel
+            slot={tarKind}
             tarMesh={tarMesh}
             adoptedLabel={tarRegionLabel}
             onAdoptRegion={handleAdoptRegion}
+            onReprojRegions={setTarReprojRegions}
             onStatus={onStatusChange}
           />
         </PanelSection>
@@ -1318,26 +1351,59 @@ export function ModelAssemble(props: ModelAssembleProps) {
           flex: '0 0 auto',
         }}
       >
-        <div
-          style={{
-            fontSize: 11,
-            fontWeight: 600,
-            color: 'var(--text-primary)',
-            marginBottom: 6,
-            textTransform: 'uppercase',
-            letterSpacing: 0.5,
-          }}
-        >
-          🖼️ Mesh Gallery · Page2 highres
+        <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+          {/* Source 侧：Page2 高模 */}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div
+              style={{
+                fontSize: 11,
+                fontWeight: 600,
+                color: 'var(--text-primary)',
+                marginBottom: 6,
+                textTransform: 'uppercase',
+                letterSpacing: 0.5,
+              }}
+            >
+              🖼️ Source Mesh · Page2 highres
+            </div>
+            <HighresGallery
+              currentSrcFile={srcChosenName ?? srcHistory[0]?.file ?? null}
+              onPickSource={(item: HighresGalleryItem) => {
+                setSrcChosenName(item.file);
+                onStatusChange?.(`Mesh Gallery → Source: ${item.pipelineName} · ${item.file}`, 'info');
+                refreshAssets();
+              }}
+            />
+          </div>
+          {/* Target 侧：Page1 Clothed / NoJacket。双击切换 tarKind + 联动 SegPack。 */}
+          <div style={{ flex: 1, minWidth: 0, borderLeft: '1px solid var(--border-default)', paddingLeft: 12 }}>
+            <div
+              style={{
+                fontSize: 11,
+                fontWeight: 600,
+                color: 'var(--text-primary)',
+                marginBottom: 6,
+                textTransform: 'uppercase',
+                letterSpacing: 0.5,
+              }}
+            >
+              🎯 Target Mesh · Page1 3D Model
+            </div>
+            <TargetGallery
+              currentTargetKind={tarKind}
+              currentTargetFile={tarChosenName}
+              onPickTarget={(item: TargetGalleryItem) => {
+                setTarKind(item.kind);
+                setTarChosenName(item.file);
+                onStatusChange?.(
+                  `Mesh Gallery → Target: ${item.kind === 'clothed' ? 'Clothed' : 'NoJacket'} · ${item.file}`,
+                  'info',
+                );
+                // refreshAssets 通过 tarKind/tarChosenName 依赖自动重跑。
+              }}
+            />
+          </div>
         </div>
-        <HighresGallery
-          currentSrcFile={srcChosenName ?? srcHistory[0]?.file ?? null}
-          onPickSource={(item: HighresGalleryItem) => {
-            setSrcChosenName(item.file);
-            onStatusChange?.(`Mesh Gallery → Source: ${item.pipelineName} · ${item.file}`, 'info');
-            refreshAssets();
-          }}
-        />
       </div>
     </div>
   );

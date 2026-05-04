@@ -45,6 +45,13 @@ interface MeshLike {
 }
 
 interface SAM3PanelProps {
+  /**
+   * PR-C: which Page1 SegPack slot to bind to.
+   *   'clothed'  → page1.segpack.clothed
+   *   'nojacket' → page1.segpack.nojacket
+   * 由 ModelAssemble 根据 Target 当前的 tarKind 传入，同步展示。
+   */
+  slot: 'clothed' | 'nojacket';
   tarMesh: MeshLike | null;
   /** Currently-adopted region label (so the picker can highlight it). */
   adoptedLabel: string | null;
@@ -58,6 +65,17 @@ interface SAM3PanelProps {
     label: string | null,
     camera: OrthoFrontCamera | null,
   ) => void;
+  /**
+   * Emit the per-region vertex sets (after reprojection) so the parent
+   * can color the 3D viewport. 与 Page1 SegPack overlay 色彩对齐：
+   * 传回原 regions 顺序上的 index，由父组件用同一 regionRgb(idx) 公式查色。
+   * null = cleared.
+   */
+  onReprojRegions?: (
+    regions:
+      | Array<{ regionIndex: number; label: string; vertices: number[] }>
+      | null,
+  ) => void;
   onStatus?: (msg: string, type?: 'info' | 'success' | 'warning' | 'error') => void;
 }
 
@@ -69,30 +87,35 @@ interface LoadedPack {
 }
 
 export function SAM3Panel(props: SAM3PanelProps) {
-  const { tarMesh, adoptedLabel, onAdoptRegion, onStatus } = props;
-  const { project, loadPage3SegPack, updatePage3Session } = useProject();
+  const { slot, tarMesh, adoptedLabel, onAdoptRegion, onReprojRegions, onStatus } = props;
+  const { project, loadPage1SegPack, updatePage3Session } = useProject();
 
   const [loaded, setLoaded] = useState<LoadedPack | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadingPack, setLoadingPack] = useState(false);
   const [orthoUrl, setOrthoUrl] = useState<string | null>(null);
   const [camera, setCamera] = useState<OrthoFrontCamera | null>(null);
   const [reprojRegions, setReprojRegions] = useState<Map<string, Set<number>> | null>(null);
   const [running, setRunning] = useState(false);
   const refreshSeqRef = useRef(0);
+  // 保证同一个 (slot, dirName, tarMesh) 组合只 auto-render 一次，避免与用户手动动作冲突。
+  const autoRenderedKeyRef = useRef<string | null>(null);
 
   // Auto-load project SegPack when the project changes.
   const refreshPack = useCallback(async () => {
     const seq = ++refreshSeqRef.current;
     setLoadError(null);
     if (!project) {
+      setLoadingPack(false);
       setLoaded((prev) => {
         if (prev) URL.revokeObjectURL(prev.maskUrl);
         return null;
       });
       return;
     }
+    setLoadingPack(true);
     try {
-      const result = await loadPage3SegPack();
+      const result = await loadPage1SegPack(slot);
       if (seq !== refreshSeqRef.current) return;
       if (!result) {
         setLoaded((prev) => {
@@ -108,11 +131,17 @@ export function SAM3Panel(props: SAM3PanelProps) {
         if (prev) URL.revokeObjectURL(prev.maskUrl);
         return { pack, maskUrl, source: result.source, dirName: result.dirName };
       });
+      onStatus?.(
+        `SAM3：已加载 SegPack(${slot === 'clothed' ? 'Clothed' : 'NoJacket'}) · ${pack.regions.length} 个区域`,
+        'success',
+      );
     } catch (err) {
       if (seq !== refreshSeqRef.current) return;
       setLoadError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (seq === refreshSeqRef.current) setLoadingPack(false);
     }
-  }, [project, loadPage3SegPack]);
+  }, [project, loadPage1SegPack, slot, onStatus]);
 
   useEffect(() => {
     void refreshPack();
@@ -131,22 +160,45 @@ export function SAM3Panel(props: SAM3PanelProps) {
     });
     setCamera(null);
     setReprojRegions(null);
+    onReprojRegions?.(null);
     onAdoptRegion(null, null, null);
+    // Reset auto-render guard so the new pack will auto-render once.
+    autoRenderedKeyRef.current = null;
     // We deliberately omit `onAdoptRegion` from the dep array: parent
     // callbacks change on every render, and we only want to clear when
     // the loaded pack itself changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
 
+  // Mask PNG 原始尺寸作为 "reference image" 帧。SegPack 里的 bbox 是在
+  // 这个全帧坐标系下。V1 segpack 是从 tight 的 ortho mesh-render 上跑出来
+  // 的，区域并集刚好填满画布，所以 union-bbox.far-edge 偶然接近画布尺寸；
+  // Page1 segpack 是从 T-Pose 原图上跑，区域不会延伸到边缘，必须读 mask
+  // 本身的 naturalWidth/Height。
+  const [maskDims, setMaskDims] = useState<{ width: number; height: number } | null>(null);
+  useEffect(() => {
+    if (!loaded) {
+      setMaskDims(null);
+      return;
+    }
+    let cancelled = false;
+    const img = new Image();
+    img.onload = () => {
+      if (!cancelled) setMaskDims({ width: img.naturalWidth, height: img.naturalHeight });
+    };
+    img.onerror = () => {
+      if (!cancelled) setMaskDims(null);
+    };
+    img.src = loaded.maskUrl;
+    return () => { cancelled = true; };
+  }, [loaded]);
+
   const renderSize = useMemo(() => {
-    if (!loaded) return null;
+    if (!loaded || !maskDims) return null;
     const bbox = regionsUnionBBox(loaded.pack.regions);
     if (!bbox) return null;
-    // Use the union bbox as the source "image" size for normalization.
-    // V1 used the original ref image size; we don't have a ref image in
-    // V2 (no upload UI), so the bbox itself is our reference frame.
-    const refW = Math.max(1, Math.round(bbox.x + bbox.w));
-    const refH = Math.max(1, Math.round(bbox.y + bbox.h));
+    const refW = maskDims.width;
+    const refH = maskDims.height;
     const scale = LOCALIZATION_LONG_EDGE / Math.max(refW, refH);
     const w = Math.max(1, Math.round(refW * scale));
     const h = Math.max(1, Math.round(refH * scale));
@@ -157,7 +209,7 @@ export function SAM3Panel(props: SAM3PanelProps) {
       h: Math.max(1, Math.round(bbox.h * scale)),
     };
     return { w, h, fitBBox };
-  }, [loaded]);
+  }, [loaded, maskDims]);
 
   // One-click: render Target ortho front view + reproject mask to vertices.
   const handleRenderAndReproject = useCallback(async () => {
@@ -201,6 +253,15 @@ export function SAM3Panel(props: SAM3PanelProps) {
         { projectionMode: 'through', splatRadiusPx: 1, maskDilatePx: 2 },
       );
       setReprojRegions(result.regions);
+      // 按 loaded.pack.regions 原顺序发出，带 regionIndex。这里保证了序号
+      // 与 Page1 SegPack 预览里的颜色序号一致，便于诊断反投影结果。
+      onReprojRegions?.(
+        loaded.pack.regions.map((r, regionIndex) => ({
+          regionIndex,
+          label: r.label,
+          vertices: Array.from(result.regions.get(r.label) ?? []),
+        })),
+      );
 
       // Persist completion fact for the V2 readiness panel.
       void updatePage3Session({
@@ -253,6 +314,17 @@ export function SAM3Panel(props: SAM3PanelProps) {
     onStatus?.('SAM3：已清除 Target 区域', 'info');
   }, [onAdoptRegion, updatePage3Session, onStatus]);
 
+  // Auto-render Target ortho + reproject mask once SegPack and tarMesh are
+  // both ready. 使用 (slot, dirName, vertex count) 作为唯一 key，避免在
+  // 同一组资源上重复触发。手动点击“运行”后不会被覆盖。
+  useEffect(() => {
+    if (!loaded || !tarMesh || !renderSize) return;
+    const key = `${slot}::${loaded.dirName}::${tarMesh.vertices.length}`;
+    if (autoRenderedKeyRef.current === key) return;
+    autoRenderedKeyRef.current = key;
+    void handleRenderAndReproject();
+  }, [loaded, tarMesh, renderSize, slot, handleRenderAndReproject]);
+
   if (!project) {
     return (
       <div style={panelEmpty}>请先在顶栏选择/创建工程</div>
@@ -261,19 +333,57 @@ export function SAM3Panel(props: SAM3PanelProps) {
   if (loadError) {
     return <div style={panelError}>SAM3 加载失败：{loadError}</div>;
   }
-  if (!loaded) {
+  if (loadingPack && !loaded) {
+    const slotLabel = slot === 'clothed' ? 'Clothed' : 'NoJacket';
     return (
-      <div style={panelEmpty}>
-        工程内未发现 SegPack（page3_assemble/01_segpack）。
-        请先在 Page3 V1 流程导出，或将 SegPack 拷贝至工程目录。
+      <div
+        style={{
+          ...panelEmpty,
+          color: 'var(--text-primary)',
+          background: 'rgba(127,191,255,0.08)',
+          border: '1px solid rgba(127,191,255,0.4)',
+        }}
+      >
+        🔄 正在加载 SegPack({slotLabel})…
+      </div>
+    );
+  }
+  if (!loaded) {
+    // PR-C: 严格不回退。缺少对应 slot 的 SegPack 时只提示用户去 Page1 重跑。
+    const slotLabel = slot === 'clothed' ? 'Clothed' : 'NoJacket';
+    return (
+      <div
+        style={{
+          ...panelEmpty,
+          color: '#ff7a7a',
+          background: 'rgba(255,80,80,0.08)',
+          border: '1px solid rgba(255,80,80,0.4)',
+        }}
+      >
+        ⚠️ 当前 Target ({slotLabel}) 缺少 SegPack。
+        <br />
+        请回 Page1 跑 <strong>SegPack({slotLabel})</strong> 节点生成。
       </div>
     );
   }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-      <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-        SegPack: <code>{loaded.dirName}</code> · {loaded.pack.regions.length} 个区域
+      <div style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span
+          style={{
+            display: 'inline-block',
+            padding: '1px 6px',
+            borderRadius: 3,
+            background: 'rgba(127,217,127,0.15)',
+            color: '#7fd97f',
+            fontWeight: 700,
+            fontSize: 10,
+          }}
+        >
+          ✓ 已加载
+        </span>
+        SegPack ({slot === 'clothed' ? 'Clothed' : 'NoJacket'}): <code>{loaded.dirName}</code> · {loaded.pack.regions.length} 个区域
       </div>
       <div style={{ display: 'flex', gap: 6 }}>
         <Button
@@ -296,19 +406,8 @@ export function SAM3Panel(props: SAM3PanelProps) {
         </Button>
       </div>
 
-      {orthoUrl && (
-        <img
-          src={orthoUrl}
-          alt="Target ortho front"
-          style={{
-            width: '100%',
-            background: '#222',
-            borderRadius: 4,
-            border: '1px solid var(--border-subtle)',
-            imageRendering: 'pixelated',
-          }}
-        />
-      )}
+      {/* ortho preview img 移除：反投影结果直接提升到中央 DualViewport 的 tarHighlight
+          里，不再在侧边重复显示一张黑白预览图。 */}
 
       {reprojRegions && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>

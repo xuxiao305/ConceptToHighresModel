@@ -222,16 +222,23 @@ export function renderOrthoFrontViewWithCamera(
   let camZ: number;
 
   if (fitToImageBBox) {
-    const sxWorldPerPx = meshWidth / fitToImageBBox.w;
-    const syWorldPerPx = meshHeight / fitToImageBBox.h;
-    const worldPerPx = Math.max(sxWorldPerPx, syWorldPerPx);
+    // 只用纵轴（身高）对齐：T-pose mesh 横向跨度=手臂展开（≈1.5×身高），
+    // 但 SAM3 SegPack 的 region bbox 通常只覆盖躯干，不含手臂。如果用
+    // max(sx, sy) 会让 X 轴主导，把 mesh 在 Y 方向压扁约 30%~40%，反投影
+    // 时所有区域会向上移位（头-脚跨度 < fitBBox 高度时纵向居中导致顶部留白）。
+    // 改为强制 worldPerPx = meshHeight / fitBBox.h，手臂在水平方向溢出 fit
+    // 区域无所谓（没有 region 落在手臂上），反投影逻辑只关心纵向对齐。
+    const worldPerPx = meshHeight / fitToImageBBox.h;
     halfWidth = (worldPerPx * width) / 2;
     halfHeight = (worldPerPx * height) / 2;
-    const fitCenterPxX = fitToImageBBox.x + fitToImageBBox.w / 2;
+    // X: do NOT use fitBBox X-center. SAM3 region bboxes can be skewed by
+    // asymmetric accessories (e.g. tool pouch on one hip extends the union
+    // bbox right by 20+px), but the TPose input image guarantees the body is
+    // centered in the canvas. So align mesh anatomical center → image center.
+    // Y: use fitBBox Y-center (vertical body span is what we want to fit).
     const fitCenterPxY = fitToImageBBox.y + fitToImageBBox.h / 2;
-    const dxPx = fitCenterPxX - width / 2;
     const dyPx = fitCenterPxY - height / 2;
-    camZ = meshCenterZ + dxPx * worldPerPx;
+    camZ = meshCenterZ;
     camY = meshCenterY + dyPx * worldPerPx;
   } else {
     const aspect = width / height;
@@ -328,19 +335,19 @@ export function renderOrthoFrontViewWithCamera(
       const silWorldW = sil.w * worldPerPx1;
       const silWorldH = sil.h * worldPerPx1;
 
-      // Pick the world-per-pixel that makes the silhouette fit inside
-      // the target bbox along its dominant axis.
-      const sxNew = silWorldW / fitToImageBBox.w;
+      // Pick the world-per-pixel that aligns the silhouette HEIGHT with the
+      // target bbox HEIGHT. We deliberately ignore horizontal alignment because
+      // the mesh silhouette includes outstretched arms (T-pose) while the SAM3
+      // region bbox typically only covers the torso. See pass-1 comment above.
       const syNew = silWorldH / fitToImageBBox.h;
-      const worldPerPx2 = Math.max(sxNew, syNew);
+      const worldPerPx2 = syNew;
       halfWidth = (worldPerPx2 * width) / 2;
       halfHeight = (worldPerPx2 * height) / 2;
 
-      const fitCenterPxX = fitToImageBBox.x + fitToImageBBox.w / 2;
       const fitCenterPxY = fitToImageBBox.y + fitToImageBBox.h / 2;
-      // Solve for camera so that silWorldZ → fitCenterPxX:
-      //   fitCenterPxX = W/2 + (camZ - silWorldZ) / worldPerPx2
-      camZ = silWorldZ + (fitCenterPxX - width / 2) * worldPerPx2;
+      // X: align mesh anatomical center → image center (see pass-1 comment).
+      // Y: use silhouette center (head-to-feet span) → fitBBox center.
+      camZ = meshCenterZ;
       camY = silWorldY + (fitCenterPxY - height / 2) * worldPerPx2;
 
       updateCamera();

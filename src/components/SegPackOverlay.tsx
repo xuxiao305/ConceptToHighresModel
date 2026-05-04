@@ -41,12 +41,25 @@ const containerStyle: CSSProperties = {
   overflow: 'hidden',
 };
 
-/** 按区域索引循环 HSL 色相，避免相邻区域同色。返回 [r,g,b] (0..255) */
+/** 区域色 —— 避开橙/红色相（与 Tripo/Trellis2 默认 mesh 色 #d9734a 冲突）。
+ *  顺序：magenta / cyan / lime / blue / purple / amber…循环。与 Page3 viewport 色序完全一致。 */
+const REGION_PALETTE_HSL: Array<[number, number, number]> = [
+  [320, 80, 60], // magenta
+  [180, 75, 50], // cyan
+  [130, 70, 50], // lime-green
+  [220, 80, 60], // blue
+  [270, 65, 60], // purple
+  [55, 90, 55],  // amber-yellow
+  [200, 70, 55], // sky
+  [340, 75, 55], // pink
+];
+
+/** 按区域索引返回 [r,g,b] (0..255)。 */
 function regionRgb(idx: number): [number, number, number] {
-  const hue = ((idx * 47) % 360) / 360;
-  // HSL → RGB（s=0.8, l=0.55，与 regionColorCss 对应）
-  const s = 0.8;
-  const l = 0.55;
+  const [hDeg, sPct, lPct] = REGION_PALETTE_HSL[idx % REGION_PALETTE_HSL.length];
+  const hue = hDeg / 360;
+  const s = sPct / 100;
+  const l = lPct / 100;
   const c = (1 - Math.abs(2 * l - 1)) * s;
   const x = c * (1 - Math.abs(((hue * 6) % 2) - 1));
   const m = l - c / 2;
@@ -68,6 +81,12 @@ function regionRgb(idx: number): [number, number, number] {
 function regionColorCss(idx: number): string {
   const [r, g, b] = regionRgb(idx);
   return `rgb(${r},${g},${b})`;
+}
+
+/** Page3 需要同样的 HSL 三元组（不走 RGB 折返）以便 three.js 上色。 */
+export function regionHslCss(idx: number): string {
+  const [h, s, l] = REGION_PALETTE_HSL[idx % REGION_PALETTE_HSL.length];
+  return `hsl(${h}, ${s}%, ${l}%)`;
 }
 
 /**

@@ -1,32 +1,34 @@
 /**
- * Page3 V2 — Highres Mesh Gallery panel.
+ * Page3 V2 — Target Mesh Gallery panel.
  *
- * Mirrors V1 ModelAssemble.tsx (line 2131-2480 + 3460-3550):
- *   - Lists all Page2 pipelines that currently expose a `modelFile`.
- *   - Renders a textured front-view thumbnail for each via
- *     loadGlb + renderTexturedFrontSnapshot (cached per item).
- *   - Single-click selects (preview); double-click loads into Source.
+ * 与 HighresGallery 对称（Source 一侧），但数据源是 Page1 的两个 3D 节点：
+ *   - page1.rough           → Clothed（带外套）
+ *   - page1.rough.nojacket  → NoJacket（去外套）
  *
- * V2 simplifications vs V1:
- *   - No "sourceGalleryBinding" auto-sync on pipeline updates. The user
- *     explicitly picks a version once; the version dropdown / Refresh
- *     button suffices for the V2 flow.
- *   - No `page2:pipelines-updated` event listener. V2 consumers can call
- *     the `refresh` prop after they know Page2 changed.
+ * 职责：
+ *   - 列出工程里所有 page1.rough / page1.rough.nojacket 历史 GLB；
+ *   - 单击预览（标记选中）；
+ *   - 双击触发 onPickTarget(item, kind) — kind 用来在 ModelAssemble 里：
+ *       1. 选对的 NODE_KEY 重新 loadGlbAsMesh
+ *       2. 自动 loadPage1SegPack(kind) 联动切割包
+ *
+ * 缩略图：复用 loadGlb + renderTexturedFrontSnapshot。
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '../../components/Button';
 import { useProject } from '../../contexts/ProjectContext';
 import { loadGlb, renderTexturedFrontSnapshot } from '../../three';
-import type { AssetVersion, PersistedPipeline } from '../../services/projectStore';
+import type { AssetVersion } from '../../services/projectStore';
 
-export interface HighresGalleryItem extends AssetVersion {
+export type TargetKind = 'clothed' | 'nojacket';
+
+export interface TargetGalleryItem extends AssetVersion {
+  /** 唯一 ID（kind:file），React key + 选中态用 */
   id: string;
-  pipelineKey: string;
-  pipelineIndex: number;
-  pipelineName: string;
-  pipelineMode: PersistedPipeline['mode'];
+  kind: TargetKind;
+  /** 对应 NODE_KEY，便于父组件直接调 loadByName */
+  nodeKey: 'page1.rough' | 'page1.rough.nojacket';
 }
 
 interface GallerySnapshot {
@@ -34,16 +36,33 @@ interface GallerySnapshot {
   dataUrl?: string;
 }
 
-interface HighresGalleryProps {
-  /** Called when the user double-clicks an item — load into Source. */
-  onPickSource: (item: HighresGalleryItem) => void;
-  /** Filename currently shown as Source mesh, used to mark the active card. */
-  currentSrcFile: string | null;
+interface TargetGalleryProps {
+  /** 双击后由父组件加载到 Target，并按 kind 自动联动 SegPack */
+  onPickTarget: (item: TargetGalleryItem) => void;
+  /**
+   * 当前 Target 显示的 (kind, file)，用来在卡片上挂 TGT 角标。
+   * 只用 file 比较会出歧义（clothed/nojacket 可能同名），所以两个都比。
+   */
+  currentTargetKind: TargetKind | null;
+  currentTargetFile: string | null;
 }
 
-export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryProps) {
-  const { project, listHistory, loadByName, loadPipelines } = useProject();
-  const [items, setItems] = useState<HighresGalleryItem[]>([]);
+const KIND_LABEL: Record<TargetKind, string> = {
+  clothed: 'Clothed',
+  nojacket: 'NoJacket',
+};
+const KIND_COLOR: Record<TargetKind, string> = {
+  clothed: '#7fbfff',
+  nojacket: '#ffb87f',
+};
+
+export function TargetGallery({
+  onPickTarget,
+  currentTargetKind,
+  currentTargetFile,
+}: TargetGalleryProps) {
+  const { project, listHistory, loadByName } = useProject();
+  const [items, setItems] = useState<TargetGalleryItem[]>([]);
   const [snapshots, setSnapshots] = useState<Record<string, GallerySnapshot>>({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -56,40 +75,29 @@ export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryP
     }
     setLoading(true);
     try {
-      const [pipelinesIndex, history] = await Promise.all([
-        loadPipelines(),
-        listHistory('page2.highres'),
+      const [clothed, nojacket] = await Promise.all([
+        listHistory('page1.rough'),
+        listHistory('page1.rough.nojacket'),
       ]);
-      // 用 history 补充 timestamp/note 元数据，但不要求 modelFile 必须存在于 history。
-      // 关键语义：以「pipeline 当前加载的 modelFile」为准（用户当前选择），不是 history 最新条目。
-      const historyByFile = new Map(history.map((v) => [v.file, v]));
-      const next = (pipelinesIndex?.pipelines ?? [])
-        .map((pipeline, pipelineIndex): HighresGalleryItem | null => {
-          if (!pipeline.modelFile) return null;
-          const version: AssetVersion = historyByFile.get(pipeline.modelFile)
-            ?? { file: pipeline.modelFile, timestamp: new Date(0).toISOString() };
-          const pipelineKey = pipeline.id ?? `index:${pipelineIndex}`;
-          return {
-            ...version,
-            id: `${pipelineKey}:${version.file}`,
-            pipelineKey,
-            pipelineIndex,
-            pipelineName: pipeline.name,
-            pipelineMode: pipeline.mode,
-          };
-        })
-        .filter((v): v is HighresGalleryItem => v !== null);
-      // Fallback：没有任何 pipeline 设置 modelFile 时，回退到 page2.highres 最新一条。
-      // 这样用户在 Page2 跑过 highres、但 pipeline 元数据为空的工程里也能看到当前模型。
-      if (next.length === 0 && history.length > 0) {
-        const latest = history[0];
+      // 只取每个 kind 最新一条（= Page1 当前选中的版本），避免把历史全部铺出来。
+      // listHistory 已经按时间倒序，索引 0 即最新。
+      const latestClothed = clothed[0];
+      const latestNojacket = nojacket[0];
+      const next: TargetGalleryItem[] = [];
+      if (latestClothed) {
         next.push({
-          ...latest,
-          id: `fallback:${latest.file}`,
-          pipelineKey: 'fallback',
-          pipelineIndex: -1,
-          pipelineName: '(latest highres)',
-          pipelineMode: 'highres' as PersistedPipeline['mode'],
+          ...latestClothed,
+          id: `clothed:${latestClothed.file}`,
+          kind: 'clothed',
+          nodeKey: 'page1.rough',
+        });
+      }
+      if (latestNojacket) {
+        next.push({
+          ...latestNojacket,
+          id: `nojacket:${latestNojacket.file}`,
+          kind: 'nojacket',
+          nodeKey: 'page1.rough.nojacket',
         });
       }
       setItems(next);
@@ -101,7 +109,7 @@ export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryP
     } finally {
       setLoading(false);
     }
-  }, [project, loadPipelines, listHistory, selectedId]);
+  }, [project, listHistory, selectedId]);
 
   useEffect(() => {
     void refresh();
@@ -112,16 +120,7 @@ export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryP
   const refreshRef = useRef(refresh);
   useEffect(() => { refreshRef.current = refresh; }, [refresh]);
 
-  // 仅响应 Page2 显式保存 pipelines 的事件，避免 focus/visibility 变化触发重刷导致卡顿。
-  useEffect(() => {
-    const handler = () => { void refreshRef.current(); };
-    window.addEventListener('page2:pipelines-updated', handler);
-    return () => {
-      window.removeEventListener('page2:pipelines-updated', handler);
-    };
-  }, []);
-
-  // Render textured snapshots in series (avoid GPU thrash from N parallel WebGL contexts).
+  // 缩略图渲染（串行，避免多 WebGL context 同时跑）
   useEffect(() => {
     let cancelled = false;
     if (!project || items.length === 0) {
@@ -133,7 +132,7 @@ export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryP
       for (const item of items) {
         let urlToRevoke: string | null = null;
         try {
-          const loaded = await loadByName('page2.highres', item.file);
+          const loaded = await loadByName(item.nodeKey, item.file);
           if (!loaded) throw new Error('未找到模型文件');
           urlToRevoke = loaded.url;
           const glb = await loadGlb(loaded.url);
@@ -148,7 +147,7 @@ export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryP
             setSnapshots((prev) => ({ ...prev, [item.id]: { status: 'ready', dataUrl } }));
           }
         } catch (err) {
-          console.warn('[Page3] gallery snapshot failed:', item.file, err);
+          console.warn('[Page3 TargetGallery] snapshot failed:', item.file, err);
           if (!cancelled) {
             setSnapshots((prev) => ({ ...prev, [item.id]: { status: 'error' } }));
           }
@@ -168,7 +167,7 @@ export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryP
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
       <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
         <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-          {items.length} 条 · 双击加载到 Source
+          {items.length} 条（每 kind 最新）· 双击加载到 Target
         </span>
         <span style={{ flex: 1 }} />
         <Button size="sm" onClick={() => void refresh()} loading={loading}>↻</Button>
@@ -176,7 +175,7 @@ export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryP
 
       {items.length === 0 ? (
         <div style={hintStyle}>
-          Page2 暂无 Pipeline 设置 modelFile。请先在 Page2 跑一次 highres。
+          Page1 暂无 3D Model（Clothed / NoJacket）。请先在 Page1 跑一次 3D Model 节点。
         </div>
       ) : (
         <div
@@ -191,14 +190,14 @@ export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryP
         >
           {items.map((v) => {
             const selected = selectedId === v.id;
-            const bound = currentSrcFile === v.file;
+            const bound = currentTargetKind === v.kind && currentTargetFile === v.file;
             const snap = snapshots[v.id];
             return (
               <button
                 key={v.id}
                 onClick={() => setSelectedId(v.id)}
-                onDoubleClick={() => onPickSource(v)}
-                title="单击预览，双击加载到 Source"
+                onDoubleClick={() => onPickTarget(v)}
+                title={`单击预览，双击加载到 Target（${KIND_LABEL[v.kind]}）`}
                 style={{
                   flex: '0 0 220px',
                   height: 92,
@@ -216,12 +215,14 @@ export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryP
                   alignItems: 'stretch',
                 }}
               >
-                {bound && (
-                  <div style={badgeStyle}>SRC</div>
-                )}
+                {bound && <div style={badgeStyle}>TGT</div>}
                 <div style={thumbBoxStyle}>
                   {snap?.status === 'ready' && snap.dataUrl ? (
-                    <img src={snap.dataUrl} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    <img
+                      src={snap.dataUrl}
+                      alt={v.file}
+                      style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                    />
                   ) : snap?.status === 'error' ? (
                     <span style={{ fontSize: 9, color: '#d9534f' }}>错</span>
                   ) : (
@@ -229,14 +230,31 @@ export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryP
                   )}
                 </div>
                 <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
-                  <div style={{ fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    {v.pipelineName}
+                  <div
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 700,
+                      color: KIND_COLOR[v.kind],
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                    }}
+                  >
+                    {KIND_LABEL[v.kind]}
                   </div>
-                  <div style={{ fontSize: 10, color: 'var(--text-muted)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  <div
+                    style={{
+                      fontSize: 10,
+                      color: 'var(--text-muted)',
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                    }}
+                  >
                     {v.file}
                   </div>
                   <div style={{ fontSize: 9, color: 'var(--text-muted)' }}>
-                    mode: {v.pipelineMode}
+                    {new Date(v.timestamp).toLocaleString()}
                   </div>
                 </div>
               </button>
@@ -260,7 +278,7 @@ const badgeStyle = {
   top: 4,
   right: 6,
   fontSize: 9,
-  color: '#7fd97f',
+  color: '#ffd57f',
   fontWeight: 700,
 };
 
