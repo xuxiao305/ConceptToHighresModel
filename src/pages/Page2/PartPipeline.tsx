@@ -1458,13 +1458,10 @@ function Model3DBody({
               borderRadius: 3,
             }}
           >
-            <option value="single">单独生成</option>
-            <option value="frontBack">前后图生成</option>
-            <option value="fourView">四视图生成</option>
+            <option value="single">Tripo-Single</option>
+            <option value="frontBack">Tripo-2View</option>
+            <option value="fourView">Tripo-4View</option>
           </select>
-        </div>
-        <div style={{ marginTop: 4, color: 'var(--text-muted)', lineHeight: 1.35 }}>
-          {MODEL_3D_MODE_DESC[mode]}
         </div>
         {glbFile && (
           <div style={{ marginTop: 4, color: 'var(--text-secondary)' }} title={glbFile}>

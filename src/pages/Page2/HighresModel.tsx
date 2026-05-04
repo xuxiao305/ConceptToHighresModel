@@ -139,10 +139,19 @@ export function HighresModel({ onStatusChange }: Props) {
   // Resizable split: left panel width as percentage
   const [splitPos, setSplitPos] = useState(58);
   const splitContainerRef = useRef<HTMLDivElement>(null);
+  const draggingRef = useRef(false);
+  const [isDragging, setIsDragging] = useState(false);
 
   // Track whether we've restored pipelines for the current open project.
   const loadedForProject = useRef<string | null>(null);
   const initialised = useRef(false);
+  // Gate auto-save until the initial restore from disk has completed (or has
+  // confirmed there's nothing to restore). Without this gate, the 500ms
+  // debounced auto-save can race with the async loadPipelines() call and
+  // overwrite a real pipelines.json on disk with the useState defaults
+  // (two "General Extract" placeholders), which then become "sticky" on
+  // subsequent mounts/HMR. See discussion 2026-05-04.
+  const restoredRef = useRef(false);
 
   // On project open/close: restore saved pipelines or reset to defaults.
   useEffect(() => {
@@ -151,9 +160,15 @@ export function HighresModel({ onStatusChange }: Props) {
     if (loadedForProject.current === key && initialised.current) return;
     loadedForProject.current = key;
     initialised.current = true;
+    // Block auto-save until we've finished restoring (or decided there's
+    // nothing to restore) for this project identity.
+    restoredRef.current = false;
 
     if (!project) {
       setParts([makePart(0, 'extraction'), makePart(1, 'extraction')]);
+      // No project → nothing to restore, and the auto-save effect early-returns
+      // when !project anyway, so it's safe to flip the gate immediately.
+      restoredRef.current = true;
       return;
     }
 
@@ -166,7 +181,15 @@ export function HighresModel({ onStatusChange }: Props) {
         onStatusChange(`已从工程恢复 ${idx.pipelines.length} 条 Pipeline`, 'info');
       }
       // If no pipelines saved yet, keep the defaults (already set by useState).
-    })();
+      // Open the auto-save gate only AFTER setParts has been issued, so the
+      // very next debounced save reflects the restored state, not the
+      // useState defaults.
+      restoredRef.current = true;
+    })().catch(() => {
+      // On error, still open the gate so the UI remains usable; we just
+      // won't have restored data.
+      if (!cancelled) restoredRef.current = true;
+    });
 
     return () => { cancelled = true; };
   }, [project]);
@@ -175,6 +198,10 @@ export function HighresModel({ onStatusChange }: Props) {
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (!project) return;
+    // Don't auto-save until initial restore has settled. Otherwise the
+    // useState-default pipelines ([General, General]) can overwrite a real
+    // pipelines.json before loadPipelines() resolves.
+    if (!restoredRef.current) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       void savePipelines(parts.map(toPersisted));
@@ -196,29 +223,33 @@ export function HighresModel({ onStatusChange }: Props) {
     return () => document.removeEventListener('mousedown', handler);
   }, [addDropdownOpen]);
 
-  // Drag-to-resize splitter
+  // Improved drag-to-resize splitter
   useEffect(() => {
     const container = splitContainerRef.current;
     if (!container) return;
 
-    let dragging = false;
-
     const onMouseDown = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
       if (!target.dataset.splitter) return;
-      dragging = true;
+      draggingRef.current = true;
+      setIsDragging(true);
+      document.body.style.userSelect = 'none';
       e.preventDefault();
     };
 
     const onMouseMove = (e: MouseEvent) => {
-      if (!dragging) return;
+      if (!draggingRef.current) return;
       const rect = container.getBoundingClientRect();
       const pct = ((e.clientX - rect.left) / rect.width) * 100;
       setSplitPos(Math.max(20, Math.min(85, pct)));
     };
 
     const onMouseUp = () => {
-      dragging = false;
+      if (draggingRef.current) {
+        draggingRef.current = false;
+        setIsDragging(false);
+        document.body.style.userSelect = '';
+      }
     };
 
     container.addEventListener('mousedown', onMouseDown);
@@ -228,6 +259,7 @@ export function HighresModel({ onStatusChange }: Props) {
       container.removeEventListener('mousedown', onMouseDown);
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
+      document.body.style.userSelect = '';
     };
   }, []);
 
@@ -505,18 +537,19 @@ export function HighresModel({ onStatusChange }: Props) {
           ))}
         </div>
 
-        {/* Draggable splitter */}
+        {/* Draggable splitter (wider hit area, highlight on drag) */}
         <div
           data-splitter="true"
           style={{
-            width: 6,
-            marginLeft: -3,
-            marginRight: -3,
+            width: 12,
+            marginLeft: -6,
+            marginRight: -6,
             zIndex: 10,
             cursor: 'col-resize',
-            background: 'transparent',
+            background: isDragging ? 'var(--border-default)' : 'transparent',
             flexShrink: 0,
             position: 'relative',
+            transition: 'background 0.15s',
           }}
           title="拖拽调整面板宽度"
         >
@@ -528,7 +561,8 @@ export function HighresModel({ onStatusChange }: Props) {
               left: '50%',
               width: 2,
               transform: 'translateX(-50%)',
-              background: 'var(--border-default)',
+              background: isDragging ? 'var(--accent-primary)' : 'var(--border-default)',
+              borderRadius: 2,
               transition: 'background 0.15s',
             }}
           />

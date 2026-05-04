@@ -1064,6 +1064,11 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     roughAbortRef.current = null;
   }, []);
 
+  const cancelRoughNojacket = useCallback(() => {
+    roughNojacketAbortRef.current?.abort();
+    roughNojacketAbortRef.current = null;
+  }, []);
+
   // ---- Extraction node (Banana Pro on Multi-View) -------------------------
   // 独立节点，不与上游链路绑定，输出会被 Page 2 的 PartPipeline 当作部件源图使用。
   const runExtraction = useCallback(async (): Promise<string | null> => {
@@ -1735,7 +1740,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                     {outputs.conceptFile.name}
                   </div>
                 )}
-                {node.id === 'rough' && roughBackend === 'trellis2' && (
+                {(node.id === 'rough' || node.id === 'roughNojacket') && roughBackend === 'trellis2' && (
                   <RoughBackendPanel
                     hideSelect
                     backend={roughBackend}
@@ -1816,6 +1821,16 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
               onRunSegpackClothed: runSegpackClothed,
               onRunSegpackNojacket: runSegpackNojacket,
               onRunRoughNojacket: runRoughNojacket,
+              onCancelRoughNojacket: cancelRoughNojacket,
+              onDownloadRoughNojacket: () => {
+                if (!outputs.roughNojacketUrl) return;
+                const a = document.createElement('a');
+                a.href = outputs.roughNojacketUrl;
+                a.download = outputs.roughNojacketFile ?? 'rough_model_nojacket.glb';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+              },
               conceptReady: !!outputs.conceptFile,
               tposeReady: !!outputs.tposeUrl,
               multiviewReady: !!outputs.multiviewUrl,
@@ -1840,7 +1855,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                 border: '1px solid var(--border-default)',
                 borderRadius: 3,
               };
-              if (node.id === 'rough') {
+              if (node.id === 'rough' || node.id === 'roughNojacket') {
                 return (
                   <div
                     style={{ display: 'flex', alignItems: 'center', gap: 6 }}
@@ -2074,6 +2089,8 @@ interface ActionHandlers {
   onRunSegpackClothed: () => void;
   onRunSegpackNojacket: () => void;
   onRunRoughNojacket: () => void;
+  onCancelRoughNojacket: () => void;
+  onDownloadRoughNojacket: () => void;
   conceptReady: boolean;
   tposeReady: boolean;
   multiviewReady: boolean;
@@ -2379,18 +2396,22 @@ function renderActions(
   if (node.id === 'roughNojacket') {
     return (
       <>
-        <Button size="sm" disabled={!h.roughNojacketReady} title="下载 GLB">下载 GLB</Button>
+        <Button size="sm" disabled={!h.roughNojacketReady} onClick={h.onDownloadRoughNojacket}>
+          下载 GLB
+        </Button>
         {isError ? (
           <Button variant="primary" size="sm" onClick={h.onRunRoughNojacket}>重试</Button>
         ) : isRunning ? (
-          <Button variant="danger" size="sm" disabled>生成中…</Button>
+          <Button variant="danger" size="sm" onClick={h.onCancelRoughNojacket}>
+            取消
+          </Button>
         ) : (
           <Button
             variant="primary"
             size="sm"
             disabled={!h.extractionReady}
             onClick={h.onRunRoughNojacket}
-            title="以 Remove Jacket 4 视图为输入生成去外套 GLB（mockup）"
+            title="以 Remove Jacket 4 视图为输入生成去外套 GLB"
           >
             {isComplete ? '重新生成' : '生成'}
           </Button>
