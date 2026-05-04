@@ -93,6 +93,8 @@ import {
   type ViewMode,
 } from '../../three';
 import { alignSourceMeshByLandmarks, type AlignmentResult } from '../../three/alignment';
+import { buildMeshAdjacency } from '../../three/meshAdjacency';
+import { runLimbStructure, runSurface } from '../../services/alignStrategies/runners';
 import {
   ALIGN_STRATEGIES,
   summarizeReadiness,
@@ -441,6 +443,58 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
     setCenterView('landmark');
   }, []);
 
+  // Stage 8/8: lazy adjacency for surface strategy. Only computed when
+  // both meshes are loaded; result is memoised on identity.
+  const srcAdjacency = useMemo(() => {
+    if (!srcMesh) return null;
+    return buildMeshAdjacency(srcMesh.vertices, srcMesh.faces);
+  }, [srcMesh]);
+  const tarAdjacency = useMemo(() => {
+    if (!tarMesh) return null;
+    return buildMeshAdjacency(tarMesh.vertices, tarMesh.faces);
+  }, [tarMesh]);
+
+  // Stage 8/8: limb-structure + surface auto runners.
+  // V2 does NOT yet wire SAM3 mask → tarConstraintVertices, so both runners
+  // execute unconstrained ("whole target mesh" mode). This matches V1
+  // behaviour when the user has not yet selected a target region.
+  const canRunAuto = srcMesh !== null && tarMesh !== null;
+  const handleRunAuto = useCallback(async (id: 'limb-structure' | 'surface') => {
+    if (!srcMesh || !tarMesh) {
+      setRunError('Source / target mesh 未加载');
+      return;
+    }
+    setRunError(null);
+    setAligning(true);
+    try {
+      let outcome;
+      if (id === 'limb-structure') {
+        outcome = runLimbStructure({ src: srcMesh, tar: tarMesh });
+      } else {
+        if (!srcAdjacency || !tarAdjacency) {
+          throw new Error('mesh adjacency 尚未就绪');
+        }
+        outcome = runSurface({
+          src: { vertices: srcMesh.vertices, adjacency: srcAdjacency },
+          tar: { vertices: tarMesh.vertices, adjacency: tarAdjacency },
+        });
+      }
+      setAlignResult(outcome.result);
+      setCenterView('result');
+      setResultView('overlay');
+      onStatusChange?.(
+        `${id} 对齐完成 RMSE=${outcome.result.rmse.toFixed(4)} (${outcome.method})`,
+        'success',
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setRunError(msg);
+      onStatusChange?.(`${id} 对齐失败：${msg}`, 'error');
+    } finally {
+      setAligning(false);
+    }
+  }, [srcMesh, tarMesh, srcAdjacency, tarAdjacency, onStatusChange]);
+
   return (
     <div
       style={{
@@ -477,7 +531,7 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
           BETA
         </span>
         <span>
-          Page3 V2（Stage 8/1）：DualViewport 已接通，picking/SAM3/run 仍在 V1。生产路径请使用默认路由。
+          Page3 V2（Stage 8/8）：manual + limb-structure + surface 可运行；pose-proxy 仍留在 V1（需 SAM3 面板移植）。
         </span>
       </div>
       <div
@@ -718,6 +772,36 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
                 ↶
               </Button>
             </div>
+          ) : selectedId === 'limb-structure' || selectedId === 'surface' ? (
+            <div style={{ display: 'flex', gap: 6 }}>
+              <Button
+                size="sm"
+                variant="primary"
+                style={{ flex: 1, justifyContent: 'center' }}
+                onClick={() => handleRunAuto(selectedId)}
+                disabled={!canRunAuto || aligning}
+                loading={aligning}
+                title={canRunAuto ? '' : '需两份 mesh 均已加载'}
+              >
+                ▶ 运行 {selectedStrategy.label}
+              </Button>
+              <Button
+                size="sm"
+                style={{ flex: 1, justifyContent: 'center' }}
+                onClick={handleAcceptAlign}
+                disabled={!alignResult}
+              >
+                ✓ 接受
+              </Button>
+              <Button
+                size="sm"
+                style={{ justifyContent: 'center' }}
+                onClick={handleResetAlign}
+                disabled={!alignResult && !runError}
+              >
+                ↶
+              </Button>
+            </div>
           ) : (
             <div
               style={{
@@ -729,7 +813,7 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
                 padding: 6,
               }}
             >
-              auto 策略运行仍在 V1：请在默认路由使用「{selectedStrategy.label}」。Manual 策略可在 V2 运行。
+              pose-proxy 仍需 V2 接入 SAM3/正交相机（Stage 9）。请在默认路由运行。
             </div>
           )}
         </div>
