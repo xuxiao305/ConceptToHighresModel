@@ -593,7 +593,7 @@ function makeDemoTarget(source: MeshData): MeshData {
 }
 
 export function ModelAssemble({ onStatusChange }: Props) {
-  const { project, listHistory, loadByName, loadLatest, loadPipelines } = useProject();
+  const { project, listHistory, loadByName, loadLatest, loadPipelines, savePage3SegPack } = useProject();
   const demoTarget = useMemo(() => makeDemoTarget(DEMO_SOURCE), []);
 
   const [srcMesh, setSrcMesh] = useState<MeshData>(DEMO_SOURCE);
@@ -1915,6 +1915,22 @@ export function ModelAssemble({ onStatusChange }: Props) {
         await handleLoadMaskImage(maskFile, imageSize);
       }
 
+      // Stage 7/3b: 持久化到工程（best-effort，不影响主流程）。
+      // 只在同时拿到 jsonFile + maskFile + 已打开工程时才存。V2 该存。
+      if (project && maskFile) {
+        try {
+          const jsonBlob = new Blob([text], { type: 'application/json' });
+          await savePage3SegPack(
+            jsonBlob,
+            maskFile,
+            pack.maskName,
+            pack.imageName,
+          );
+        } catch (saveErr) {
+          console.warn('[ModelAssemble] SegPack 持久化失败（仅警告）:', saveErr);
+        }
+      }
+
       const union = regionsUnionBBox(pack.regions);
       onStatusChange(
         `已加载 SAM3 分割包：${pack.regions.map((r) => r.label).join(' / ')}` +
@@ -1933,7 +1949,7 @@ export function ModelAssemble({ onStatusChange }: Props) {
         'error',
       );
     }
-  }, [handleLoadMaskImage, handleLoadRefImage, handleLoadSegJson, onStatusChange, refImageSize]);
+  }, [handleLoadMaskImage, handleLoadRefImage, handleLoadSegJson, onStatusChange, refImageSize, project, savePage3SegPack]);
 
   const onSegJsonFileChange = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
