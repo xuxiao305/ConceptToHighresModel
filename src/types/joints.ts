@@ -336,8 +336,6 @@ export interface JointSegment {
 
 /** Standard limb segments used for capsule construction. */
 export const LIMB_SEGMENTS: JointSegment[] = [
-  { label: 'left_arm', proximal: 'left_shoulder', distal: 'left_wrist' },
-  { label: 'right_arm', proximal: 'right_shoulder', distal: 'right_wrist' },
   { label: 'left_upper_arm', proximal: 'left_shoulder', distal: 'left_elbow' },
   { label: 'left_forearm', proximal: 'left_elbow', distal: 'left_wrist' },
   { label: 'right_upper_arm', proximal: 'right_shoulder', distal: 'right_elbow' },

@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef, type ReactNode } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef, type ReactNode } from 'react';
 import type { Model3DMode, NodeConfig, NodeState, PartPipelineState, PipelineMode } from '../../types';
 import { NodeCard } from '../../components/NodeCard';
 import { NodeConnector } from '../../components/NodeConnector';
@@ -19,7 +19,7 @@ import {
 } from '../../services/extraction';
 import { type AssetVersion } from '../../services/projectStore';
 import { splitMultiView, splitMultiViewWithMeta, smartCropAndEnlargeAutoWithMeta } from '../../services/multiviewSplit';
-import type { SmartCropTransformMeta, SplitTransformMeta } from '../../types/joints';
+import type { SmartCropTransformMeta, SplitTransformMeta, Page1JointsMeta } from '../../types/joints';
 import { runImageToModel, runMultiViewToModel, TripoServiceError, type MultiViewInputs } from '../../services/tripo';
 
 /**
@@ -1068,6 +1068,7 @@ export function PartPipeline({ pipeline, index, onUpdate, onDelete, onPreviewMod
                     error={extraction.error}
                     label={`${pipeline.name} · ${node.title}`}
                     mode={pipeline.mode}
+                    page1Joints={project?.meta?.page1?.joints}
                   />
                 ) : node.id === 'modify' ? (
                   <ModifyBody
@@ -1305,7 +1306,26 @@ interface ExtractionBodyProps {
   error?: string;
   label: string;
   mode: PipelineMode;
+  /** Page1 joints data for bone overlay verification */
+  page1Joints?: Page1JointsMeta;
 }
+
+// ── 骨架连接定义（DWPose 主关键点，与 MultiViewOverlay 一致）─────────
+const SKELETON: Array<[string, string]> = [
+  ['neck', 'right_shoulder'],
+  ['neck', 'left_shoulder'],
+  ['right_shoulder', 'right_elbow'],
+  ['right_elbow', 'right_wrist'],
+  ['left_shoulder', 'left_elbow'],
+  ['left_elbow', 'left_wrist'],
+  ['neck', 'right_hip'],
+  ['neck', 'left_hip'],
+  ['right_hip', 'left_hip'],
+  ['right_hip', 'right_knee'],
+  ['right_knee', 'right_ankle'],
+  ['left_hip', 'left_knee'],
+  ['left_knee', 'left_ankle'],
+];
 
 function ExtractionBody({
   state,
@@ -1315,21 +1335,112 @@ function ExtractionBody({
   error,
   label,
   mode,
+  page1Joints,
 }: ExtractionBodyProps) {
   // Pick the image to preview: result if present, otherwise the source.
   const previewUrl = resultUrl ?? sourceUrl;
+  const [showBones, setShowBones] = useState(false);
+
+  const hasJoints = !!(page1Joints && page1Joints.global.keypoints.length > 0);
+  const bonesOn = showBones && hasJoints && !!previewUrl;
+  const imgSize = page1Joints?.global.imageSize ?? null;
+
+  // keypoint lookup map
+  const keypointMap = useMemo(() => {
+    if (!page1Joints) return new Map<string, { x: number; y: number; confidence: number }>();
+    const m = new Map<string, { x: number; y: number; confidence: number }>();
+    for (const k of page1Joints.global.keypoints) m.set(k.name, k);
+    return m;
+  }, [page1Joints]);
+
+  const circleR = imgSize ? Math.ceil(5 * (imgSize.height / 140)) : 5;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-      <Placeholder
-        type="image"
-        // Force placeholder to render the image whenever we actually have one,
-        // regardless of node `state` (idle/ready both should still preview).
-        state={previewUrl && state !== 'running' && state !== 'error' ? 'complete' : state}
-        label={label}
-        imageUrl={previewUrl ?? undefined}
-        height={140}
-      />
+      <div style={{ position: 'relative' }}>
+        <Placeholder
+          type="image"
+          // Force placeholder to render the image whenever we actually have one,
+          // regardless of node `state` (idle/ready both should still preview).
+          state={previewUrl && state !== 'running' && state !== 'error' ? 'complete' : state}
+          label={label}
+          imageUrl={previewUrl ?? undefined}
+          height={140}
+        />
+        {bonesOn && imgSize && (
+          <svg
+            viewBox={`0 0 ${imgSize.width} ${imgSize.height}`}
+            preserveAspectRatio="xMidYMid meet"
+            style={{
+              position: 'absolute',
+              inset: 0,
+              width: '100%',
+              height: '100%',
+              pointerEvents: 'none',
+            }}
+          >
+            <g>
+              {SKELETON.map(([a, b], i) => {
+                const ka = keypointMap.get(a);
+                const kb = keypointMap.get(b);
+                if (!ka || !kb) return null;
+                return (
+                  <line
+                    key={i}
+                    x1={ka.x}
+                    y1={ka.y}
+                    x2={kb.x}
+                    y2={kb.y}
+                    stroke="#4a90e2"
+                    strokeWidth={2}
+                    opacity={0.9}
+                  />
+                );
+              })}
+              {page1Joints!.global.keypoints.map((k) => (
+                <circle
+                  key={k.name}
+                  cx={k.x}
+                  cy={k.y}
+                  r={circleR}
+                  fill="#4a90e2"
+                  stroke="#000"
+                  strokeWidth={1.5}
+                >
+                  <title>{`${k.name}  conf=${k.confidence.toFixed(2)}`}</title>
+                </circle>
+              ))}
+            </g>
+          </svg>
+        )}
+      </div>
+
+      {/* Bone overlay toggle */}
+      {hasJoints && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+          <button
+            type="button"
+            onClick={() => setShowBones((v) => !v)}
+            style={{
+              border: '1px solid var(--border-subtle)',
+              background: showBones ? 'var(--accent-blue)' : 'transparent',
+              color: showBones ? '#fff' : 'var(--text-secondary)',
+              fontSize: 11,
+              padding: '2px 8px',
+              borderRadius: 3,
+              cursor: 'pointer',
+              lineHeight: 1.2,
+            }}
+          >
+            骨骼
+          </button>
+          {showBones && (
+            <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>
+              青色圆点 = Page1 DWPose 关键点 (global 坐标)
+            </span>
+          )}
+        </div>
+      )}
 
       <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
         {mode === 'multiview'

@@ -195,7 +195,7 @@ export function buildProxies(input: BuildProxiesInput): BuildProxiesOutput {
   });
   const tarProxy = buildSkeletonProxy(tarVertices, tarJoints, tarCamera, {
     capsuleRadiusFraction: 0.08,
-  }, tarConstraintVertices);
+  });
 
   const poseAlign = computePoseAlignment(srcProxy, tarProxy, { svdMode });
 

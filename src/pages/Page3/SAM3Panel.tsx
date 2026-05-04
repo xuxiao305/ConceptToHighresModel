@@ -431,6 +431,42 @@ export function SAM3Panel(props: SAM3PanelProps) {
         pixelYRange: `[${legsPyMin}, ${legsPyMax}]`,
         maskValueHisto: Array.from(legsMaskHisto.entries()).sort((a, b) => b[1] - a[1]),
       });
+      // ── 鞋子/手部诊断:取 Y 最低 200 顶点(鞋)和 X 绝对值最大 200 顶点(手)
+      // 检查它们落在的像素以及该像素的 mask 值,区分:
+      //   (a) mask 本身覆盖了鞋/手 → SAM3 标注问题(无法在反投影端修复)
+      //   (b) mask=0 但被 dilate+splat 兜底吸走 → 调小 maskDilatePx/splat 即可
+      const sortedByY = tarMesh.vertices.map((v, i) => ({ i, y: v[1], x: v[0], z: v[2] }))
+        .sort((a, b) => a.y - b.y);
+      const FEET_N = 200;
+      const feetSample = sortedByY.slice(0, FEET_N);
+      const sortedByAbsX = tarMesh.vertices.map((v, i) => ({ i, x: v[0], y: v[1], z: v[2] }))
+        .sort((a, b) => Math.abs(b.x) - Math.abs(a.x));
+      const handsSample = sortedByAbsX.slice(0, FEET_N);
+      const sampleStats = (sample: typeof feetSample, name: string) => {
+        const labels: Record<string, number> = {};
+        const maskVals: Record<number, number> = {};
+        let inF = 0;
+        for (const s of sample) {
+          const v = tarMesh.vertices[s.i];
+          const { px, py } = projectVert(v);
+          const lab = vertLabel.get(s.i) ?? '<unassigned>';
+          labels[lab] = (labels[lab] ?? 0) + 1;
+          if (px >= 0 && px < W && py >= 0 && py < H) {
+            inF++;
+            const mv = mask.data[py * W + px];
+            maskVals[mv] = (maskVals[mv] ?? 0) + 1;
+          }
+        }
+        // eslint-disable-next-line no-console
+        console.log(`${name}:`, {
+          n: sample.length,
+          inFrame: inF,
+          assignedLabels: labels,
+          maskValuesAtProjectedPixels: maskVals,
+        });
+      };
+      sampleStats(feetSample, 'FEET sample (lowest 200 Y)');
+      sampleStats(handsSample, 'HANDS sample (largest |X| 200)');
       // eslint-disable-next-line no-console
       console.groupEnd();
       setReprojRegions(result.regions);

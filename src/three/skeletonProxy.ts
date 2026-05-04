@@ -207,6 +207,38 @@ function buildCapsule(
 // ── PCA on Capsule Vertices → ProxyAnchor ───────────────────────────────
 
 /**
+ * Build a ProxyAnchor directly from two seed points (proximal → distal).
+ * Used for torso segments where PCA on capsule vertices gives biased results
+ * due to non-uniform vertex density (e.g. hood/collar at the top).
+ */
+function seedMidpointAnchor(
+  kind: string,
+  sourceSegment: string,
+  proximalSeed: Vec3,
+  distalSeed: Vec3,
+  confidence: number,
+  capsuleRadius: number,
+): ProxyAnchor {
+  const mid = mul3(add3(proximalSeed, distalSeed), 0.5);
+  const dir = normalize3(sub3(distalSeed, proximalSeed));
+  const halfLen = len3(sub3(distalSeed, proximalSeed)) / 2;
+  return {
+    kind,
+    position: [...mid] as Vec3,
+    direction: [...dir] as Vec3,
+    secondaryDirection: [0, 0, 0],
+    confidence,
+    sourceSegment,
+    capsuleRadius,
+    vertexCount: 0,
+    extentMin: -halfLen,
+    extentMax: halfLen,
+    nearPosition: [...proximalSeed] as Vec3,
+    farPosition: [...distalSeed] as Vec3,
+  };
+}
+
+/**
  * Run PCA on a set of vertex positions and produce a ProxyAnchor.
  */
 function pcaProxyAnchor(
@@ -313,6 +345,29 @@ export function buildSkeletonProxy(
   // Step 1: Project joints → 3D seeds
   const seeds = jointsToSeeds3D(joints, positions, camera, restrictVertices, 3);
 
+  // Synthesize virtual midpoint joints that LIMB_SEGMENTS needs but DWPose doesn't output directly.
+  // shoulder_center = midpoint(left_shoulder, right_shoulder)
+  // hip_center      = midpoint(left_hip,      right_hip)
+  const syntheticConf = new Map<string, number>();
+  {
+    const ls = seeds.get('left_shoulder');
+    const rs = seeds.get('right_shoulder');
+    if (ls && rs) {
+      seeds.set('shoulder_center', mul3(add3(ls, rs), 0.5));
+      const ljS = findJoint(joints, 'left_shoulder');
+      const rjS = findJoint(joints, 'right_shoulder');
+      syntheticConf.set('shoulder_center', Math.min(ljS?.confidence ?? 0, rjS?.confidence ?? 0));
+    }
+    const lh = seeds.get('left_hip');
+    const rh = seeds.get('right_hip');
+    if (lh && rh) {
+      seeds.set('hip_center', mul3(add3(lh, rh), 0.5));
+      const ljH = findJoint(joints, 'left_hip');
+      const rjH = findJoint(joints, 'right_hip');
+      syntheticConf.set('hip_center', Math.min(ljH?.confidence ?? 0, rjH?.confidence ?? 0));
+    }
+  }
+
   // Step 2: Build capsules for each limb segment
   const capsules: CapsuleRegion3D[] = [];
   for (const seg of LIMB_SEGMENTS) {
@@ -322,8 +377,8 @@ export function buildSkeletonProxy(
 
     const jProx = findJoint(joints, seg.proximal);
     const jDist = findJoint(joints, seg.distal);
-    const confProx = jProx?.confidence ?? 0;
-    const confDist = jDist?.confidence ?? 0;
+    const confProx = jProx?.confidence ?? syntheticConf.get(seg.proximal) ?? 0;
+    const confDist = jDist?.confidence ?? syntheticConf.get(seg.distal) ?? 0;
     if (confProx < minJointConfidence || confDist < minJointConfidence) continue;
 
     const capsule = buildCapsule(
@@ -338,8 +393,28 @@ export function buildSkeletonProxy(
   }
 
   // Step 3: PCA on each capsule → ProxyAnchor
+  // Exception: torso/torso_neck use seed midpoints instead of PCA to avoid
+  // vertex density bias (e.g. hood geometry pulls centroid toward neck).
+  const TORSO_SEED_MIDPOINT_SEGMENTS: Record<string, [string, string]> = {
+    torso:      ['shoulder_center', 'hip_center'],
+    torso_neck: ['neck',            'hip_center'],
+  };
   const anchors: ProxyAnchor[] = [];
   for (const cap of capsules) {
+    const torsoSeeds = TORSO_SEED_MIDPOINT_SEGMENTS[cap.label];
+    if (torsoSeeds) {
+      const proxSeed = seeds.get(torsoSeeds[0]);
+      const distSeed = seeds.get(torsoSeeds[1]);
+      const confProxT = findJoint(joints, torsoSeeds[0])?.confidence ?? syntheticConf.get(torsoSeeds[0]) ?? 0;
+      const confDistT = findJoint(joints, torsoSeeds[1])?.confidence ?? syntheticConf.get(torsoSeeds[1]) ?? 0;
+      if (proxSeed && distSeed) {
+        anchors.push(seedMidpointAnchor(
+          cap.label, cap.label, proxSeed, distSeed,
+          Math.min(confProxT, confDistT), cap.radius,
+        ));
+      }
+      continue;
+    }
     const anchor = pcaProxyAnchor(
       positions, cap.vertices, cap.label, cap.label,
       cap.radius, cap.confidence,
@@ -379,39 +454,34 @@ export function buildSkeletonProxy(
     };
   }
 
-  // Torso axis
+  // Torso axis: use seed midpoints (same rationale as torso anchor above).
   let torsoAxis: ProxyAnchor | undefined;
-  const torsoCapsule = capsules.find((c) => c.label === 'torso');
-  if (torsoCapsule && torsoCapsule.vertexCount >= minCapsuleVertices) {
-    const ta = pcaProxyAnchor(
-      positions, torsoCapsule.vertices, 'torso_axis', 'torso',
-      capsuleRadius, torsoCapsule.confidence,
-    );
-    if (ta) torsoAxis = ta;
+  {
+    const scSeed = seeds.get('shoulder_center');
+    const hcSeed = seeds.get('hip_center');
+    const confSC = syntheticConf.get('shoulder_center') ?? 0;
+    const confHC = syntheticConf.get('hip_center') ?? 0;
+    const conf = Math.min(confSC, confHC);
+    // eslint-disable-next-line no-console
+    console.log('[skeletonProxy] torsoAxis diag', {
+      scSeed: scSeed?.map((v) => v.toFixed(3)),
+      hcSeed: hcSeed?.map((v) => v.toFixed(3)),
+      confSC: confSC.toFixed(2), confHC: confHC.toFixed(2), conf: conf.toFixed(2),
+      minJointConfidence,
+      willBuild: !!(scSeed && hcSeed && conf >= minJointConfidence),
+      midY: scSeed && hcSeed ? ((scSeed[1] + hcSeed[1]) / 2).toFixed(3) : 'N/A',
+    });
+    if (scSeed && hcSeed && conf >= minJointConfidence) {
+      torsoAxis = seedMidpointAnchor('torso_axis', 'torso', scSeed, hcSeed, conf, capsuleRadius);
+    }
   }
 
   // Sleeve near/far
-  const leftSleeveNear = findAnchorBySegment('left_upper_arm') ??
-    (capsules.find((c) => c.label === 'left_arm')
-      ? pcaProxyAnchor(
-          positions,
-          capsules.find((c) => c.label === 'left_arm')!.vertices,
-          'left_sleeve_near', 'left_arm', capsuleRadius,
-          capsules.find((c) => c.label === 'left_arm')!.confidence,
-        )
-      : undefined);
+  const leftSleeveNear = findAnchorBySegment('left_upper_arm');
 
   const leftSleeveFar = findAnchorBySegment('left_forearm') ?? leftSleeveNear;
 
-  const rightSleeveNear = findAnchorBySegment('right_upper_arm') ??
-    (capsules.find((c) => c.label === 'right_arm')
-      ? pcaProxyAnchor(
-          positions,
-          capsules.find((c) => c.label === 'right_arm')!.vertices,
-          'right_sleeve_near', 'right_arm', capsuleRadius,
-          capsules.find((c) => c.label === 'right_arm')!.confidence,
-        )
-      : undefined);
+  const rightSleeveNear = findAnchorBySegment('right_upper_arm');
 
   const rightSleeveFar = findAnchorBySegment('right_forearm') ?? rightSleeveNear;
 

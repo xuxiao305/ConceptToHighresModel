@@ -46,6 +46,7 @@ export interface AlignStrategyContext {
   hasSegPack: boolean;
   hasMaskReprojection: boolean;
   hasPoseProxyJoints: boolean;
+  hasPipelineJoints: boolean;
   hasOrthoCamera: boolean;
   hasBodyTorsoRegion: boolean;
   hasAdjacency: boolean;

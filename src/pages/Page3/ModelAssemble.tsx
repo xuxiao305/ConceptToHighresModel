@@ -106,6 +106,7 @@ import { TargetGallery, type TargetGalleryItem, type TargetKind } from './Target
 import { HighresGallery, type HighresGalleryItem } from './HighresGallery';
 import { regionHslCss } from '../../components/SegPackOverlay';
 import type { Joint2D } from '../../types/joints';
+import { transformJointsBySmartCrop } from '../../services/dwpose';
 import {
   ALIGN_STRATEGIES,
   summarizeReadiness,
@@ -166,7 +167,7 @@ interface MeshData {
 
 export function ModelAssemble(props: ModelAssembleProps) {
   const { onStatusChange } = props;
-  const { project, listHistory, loadLatest, loadByName, loadPage1SegPack, loadPage3Session, saveAsset, savePage3SegPack } = useProject();
+  const { project, listHistory, loadLatest, loadByName, loadPage1SegPack, loadPage3Session, saveAsset, savePage3SegPack, loadPipelines } = useProject();
   // Stage 7/4: 订阅全局 landmark store（V1/V2 共享）。
   const srcLandmarks = useLandmarkStore((s) => s.srcLandmarks);
   const tarLandmarks = useLandmarkStore((s) => s.tarLandmarks);
@@ -201,6 +202,11 @@ export function ModelAssemble(props: ModelAssembleProps) {
     svd: null,
     icp: null,
   });
+  // Marker visibility toggles for pose-proxy debug overlay.
+  const [showJointSeeds, setShowJointSeeds] = useState(true);
+  const [showCapsuleAnchors, setShowCapsuleAnchors] = useState(true);
+  const [showSpecialAnchors, setShowSpecialAnchors] = useState(true);
+
   // Stage 8/4: 中央视图模式 与 结果预览子模式。
   type CenterView = 'landmark' | 'result';
   type ResultView = 'overlay' | 'aligned' | 'target' | 'original';
@@ -239,6 +245,12 @@ export function ModelAssemble(props: ModelAssembleProps) {
   const [tarMesh, setTarMesh] = useState<MeshData | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('solid');
   const [meshLoadError, setMeshLoadError] = useState<string | null>(null);
+  /** Per-view jacket-only joints (SmartCrop-mapped from Page1 global joints).
+   *  null = not yet resolved / no pipeline info / fallback to full-body. */
+  const [pipelineJoints, setPipelineJoints] = useState<Record<string, Joint2D[]> | null>(null);
+  /** Image size of the Page2 split view that pipelineJoints are in.
+   *  Used to scale joints to match the srcCamera resolution. */
+  const [pipelineJointImageSize, setPipelineJointImageSize] = useState<{ width: number; height: number } | null>(null);
   // 跟踪当前活跃的 refresh 序号，防止 race condition（旧请求晚于新请求返回）。
   const refreshSeqRef = useRef(0);
   const [selectedId, setSelectedId] = useState<AlignStrategyId>('pose-proxy');
@@ -302,6 +314,8 @@ export function ModelAssemble(props: ModelAssembleProps) {
       setSrcMesh(null);
       setTarMesh(null);
       setMeshLoadError(null);
+      setPipelineJoints(null);
+      setPipelineJointImageSize(null);
       return;
     }
     const seq = ++refreshSeqRef.current;
@@ -366,12 +380,49 @@ export function ModelAssemble(props: ModelAssembleProps) {
         if (seq !== refreshSeqRef.current) return;
         setSrcMesh(s);
         setTarMesh(t);
+
+        // SmartCrop bone cropping: resolve pipeline joints for src mesh
+        if (s && project?.meta?.page1?.joints?.global) {
+          try {
+            const srcModelFile = srcChosenName ?? src[0]?.file;
+            if (srcModelFile) {
+              const pipelinesIdx = await loadPipelines();
+              const pipeline = pipelinesIdx?.pipelines.find(
+                (p) => p.modelFile === srcModelFile && p.smartCropMeta && p.splitMeta,
+              );
+              if (pipeline?.smartCropMeta && pipeline?.splitMeta) {
+                const cropped = transformJointsBySmartCrop(
+                  project.meta.page1.joints.global,
+                  pipeline.smartCropMeta,
+                  pipeline.splitMeta,
+                );
+                setPipelineJoints(cropped);
+                // Store Page2 split view size for coordinate-space alignment.
+                const frontView = pipeline.splitMeta.views.find((v) => v.view === 'front');
+                setPipelineJointImageSize(frontView ? { width: frontView.sliceSize.w, height: frontView.sliceSize.h } : null);
+              } else {
+                setPipelineJoints(null);
+                setPipelineJointImageSize(null);
+              }
+            } else {
+              setPipelineJoints(null);
+              setPipelineJointImageSize(null);
+            }
+          } catch (e) {
+            console.warn('[V2] pipeline joints 解析失败:', e);
+            setPipelineJoints(null);
+            setPipelineJointImageSize(null);
+          }
+        } else {
+          setPipelineJoints(null);
+          setPipelineJointImageSize(null);
+        }
       } catch (err) {
         if (seq !== refreshSeqRef.current) return;
         setMeshLoadError(err instanceof Error ? err.message : String(err));
       }
     });
-  }, [project, listHistory, loadLatest, loadByName, loadPage1SegPack, loadPage3Session, srcChosenName, tarChosenName, tarKind]);
+  }, [project, listHistory, loadLatest, loadByName, loadPage1SegPack, loadPage3Session, loadPipelines, srcChosenName, tarChosenName, tarKind]);
   // Effect 只在 project 变化时跑；在其他页面落盘后的新资产需手动 ↻ 按钮。
   useEffect(() => {
     refreshAssets();
@@ -384,6 +435,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
     const hasTarget = targetFileCount > 0;
     return {
       hasPoseProxyJoints: !!(front && front.length > 0),
+      hasPipelineJoints: !!(pipelineJoints?.front?.length),
       hasSource,
       hasTarget,
       hasSegPack: !!segPackDirName,
@@ -399,6 +451,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
     };
   }, [
     project?.meta.page1?.joints,
+    pipelineJoints,
     sourceFileCount,
     targetFileCount,
     segPackDirName,
@@ -823,42 +876,56 @@ export function ModelAssemble(props: ModelAssembleProps) {
       // 灰色小球：jointSeeds（2D joint → 最近 mesh 顶点平均位置）
       // 显示原始反投影位置，便于判断"塌缩"是发生在 seeds 阶段还是 PCA 阶段。
       // 不带 label 避免 13 个标签遮挡。
-      for (const [name, pos] of proxy.jointSeeds) {
-        list.push({
-          position: pos,
-          color: '#888888',
-          size: radius * 0.55,
-          label: undefined,
-          opacity: 0.85,
-        });
-        // 占位变量名引用以避免 lint
-        void name;
+      // Joint seeds: 带标签的彩色小球，方便诊断 DWPose 检测位置。
+      // 颜色按部位分组：头颈=白，肩=红，肘腕=橙，髋=青，膝踝=蓝。
+      const jointSeedColor = (name: string): string => {
+        if (name.includes('neck')) return '#ffffff';
+        if (name.includes('shoulder')) return '#ff7875';
+        if (name.includes('elbow') || name.includes('wrist')) return '#ffa940';
+        if (name.includes('hip')) return '#36cfc9';
+        if (name.includes('knee') || name.includes('ankle')) return '#597ef7';
+        return '#888888';
+      };
+      if (showJointSeeds) {
+        for (const [name, pos] of proxy.jointSeeds) {
+          list.push({
+            position: pos,
+            color: jointSeedColor(name),
+            size: radius * 0.6,
+            label: name,
+            opacity: 0.9,
+          });
+        }
       }
 
       // 主层：PCA capsule anchors（彩色 + 标签）
-      for (const a of proxy.anchors) {
-        list.push({
-          position: a.position,
-          color: colorForKind(a.kind),
-          size: radius,
-          label: a.kind,
-        });
+      if (showCapsuleAnchors) {
+        for (const a of proxy.anchors) {
+          list.push({
+            position: a.position,
+            color: colorForKind(a.kind),
+            size: radius,
+            label: a.kind,
+          });
+        }
       }
-      if (proxy.shoulderLine) {
-        list.push({
-          position: proxy.shoulderLine.position,
-          color: colorForKind('shoulder_line'),
-          size: radius * 1.2,
-          label: 'shoulder_line',
-        });
-      }
-      if (proxy.torsoAxis) {
-        list.push({
-          position: proxy.torsoAxis.position,
-          color: colorForKind('torso_axis'),
-          size: radius * 1.2,
-          label: 'torso_axis',
-        });
+      if (showSpecialAnchors) {
+        if (proxy.shoulderLine) {
+          list.push({
+            position: proxy.shoulderLine.position,
+            color: colorForKind('shoulder_line'),
+            size: radius * 1.2,
+            label: 'shoulder_line',
+          });
+        }
+        if (proxy.torsoAxis) {
+          list.push({
+            position: proxy.torsoAxis.position,
+            color: colorForKind('torso_axis'),
+            size: radius * 1.2,
+            label: 'torso_axis',
+          });
+        }
       }
       return list;
     };
@@ -867,7 +934,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
       src: buildSide(proxies.srcProxy, srcMesh),
       tar: buildSide(proxies.tarProxy, tarMesh),
     };
-  }, [poseProxyState.proxies, srcMesh, tarMesh]);
+  }, [poseProxyState.proxies, srcMesh, tarMesh, showJointSeeds, showCapsuleAnchors, showSpecialAnchors]);
 
   // Stage 8/8 + 9: limb-structure + surface + pose-proxy auto runners.
   // tarConstraintVertices comes from SAM3Panel (Stage 9). When the user
@@ -1106,6 +1173,23 @@ export function ModelAssemble(props: ModelAssembleProps) {
       const spread = maxPairwise(positions);
       const ratio = spread / diag;
       const lowConf = proxy.anchors.filter((a) => a.confidence < 0.3).length;
+      // ── Y 分布诊断:每个 anchor 在 mesh Y 范围内的相对位置(0=底,1=顶)
+      // 用于诊断"anchor 全挤在上半部分,没下到肘部/腕部"。
+      let mnY = Infinity, mxY = -Infinity;
+      for (const v of verts) { if (v[1] < mnY) mnY = v[1]; if (v[1] > mxY) mxY = v[1]; }
+      const yRange = mxY - mnY || 1;
+      const yPctList = proxy.anchors.map((a) => ({
+        kind: a.kind,
+        yPct: ((a.position[1] - mnY) / yRange * 100).toFixed(0) + '%',
+      }));
+      // eslint-disable-next-line no-console
+      console.log(`[buildProxies][${label}] meshY=[${mnY.toFixed(3)},${mxY.toFixed(3)}] anchors:`, yPctList);
+      // eslint-disable-next-line no-console
+      console.log(`[buildProxies][${label}] jointSeeds:`, Array.from(proxy.jointSeeds.entries()).map(([k, v]) => ({
+        joint: k,
+        yPct: ((v[1] - mnY) / yRange * 100).toFixed(0) + '%',
+        pos: v.map((c) => c.toFixed(3)),
+      })));
       const note = `${label}:${proxy.anchors.length}个anchor 散布${spread.toFixed(3)}/${diag.toFixed(3)}=${(ratio*100).toFixed(1)}% lowConf=${lowConf} shoulderLine=${proxy.shoulderLine?'✓':'✗'} torsoAxis=${proxy.torsoAxis?'✓':'✗'}`;
       if (proxy.anchors.length < 4) {
         issues.push(`${label}: anchor 数量过少 (${proxy.anchors.length})`);
@@ -1163,9 +1247,22 @@ export function ModelAssemble(props: ModelAssembleProps) {
     setRunError(null);
     setAligning(true);
     try {
+      // SmartCrop coordinate mapping: use jacket-space joints for src.
+      // pipelineJoints are in Page2 split-local coords; scale to Page1
+      // split-local so they match srcCamera (renders at page1Size).
+      let srcFrontJoints = pipelineJoints?.front ?? front.joints;
+      if (pipelineJoints?.front && pipelineJointImageSize && front.imageSize) {
+        const sx = front.imageSize.width / Math.max(1, pipelineJointImageSize.width);
+        const sy = front.imageSize.height / Math.max(1, pipelineJointImageSize.height);
+        srcFrontJoints = srcFrontJoints.map((j) => ({
+          ...j,
+          x: Math.round(j.x * sx),
+          y: Math.round(j.y * sy),
+        }));
+      }
       // Step 1: collectJoints
       const joints = collectJoints({
-        srcJointsRaw: front.joints,
+        srcJointsRaw: srcFrontJoints,
         tarJointsRaw: front.joints,
         tarCamera: tarOrthoCamera,
         page1Size: front.imageSize,
@@ -1231,7 +1328,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
     } finally {
       setAligning(false);
     }
-  }, [srcMesh, tarMesh, tarOrthoCamera, tarRegion, project, icpMaxIter, icpRejectMul, icpSampleCount, onStatusChange, pushTrace, validateCollectJoints, validateRenderSrcOrtho, validateBuildProxies]);
+  }, [srcMesh, tarMesh, tarOrthoCamera, tarRegion, project, pipelineJoints, pipelineJointImageSize, icpMaxIter, icpRejectMul, icpSampleCount, onStatusChange, pushTrace, validateCollectJoints, validateRenderSrcOrtho, validateBuildProxies]);
 
   // Phase A4: pose-proxy 单步重跑 — **只跑这一步**，清空下游槽位。
   // 重要：除非 stepIndex === 4 (ICP)，否则不会触碰 alignResult。
@@ -1269,10 +1366,21 @@ export function ModelAssemble(props: ModelAssembleProps) {
     // 同时清掉旧的 alignResult（旧结果跟当前步链已经不一致了）。
     setAlignResult(null);
     try {
+      // SmartCrop coordinate mapping: use jacket-space joints for src.
+      let srcFrontJoints = pipelineJoints?.front ?? front.joints;
+      if (pipelineJoints?.front && pipelineJointImageSize && front.imageSize) {
+        const sx = front.imageSize.width / Math.max(1, pipelineJointImageSize.width);
+        const sy = front.imageSize.height / Math.max(1, pipelineJointImageSize.height);
+        srcFrontJoints = srcFrontJoints.map((j) => ({
+          ...j,
+          x: Math.round(j.x * sx),
+          y: Math.round(j.y * sy),
+        }));
+      }
       switch (stepIndex) {
         case 0: {
           const joints = collectJoints({
-            srcJointsRaw: front.joints,
+            srcJointsRaw: srcFrontJoints,
             tarJointsRaw: front.joints,
             tarCamera: tarOrthoCamera,
             page1Size: front.imageSize,
@@ -1355,7 +1463,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
     } finally {
       setAligning(false);
     }
-  }, [srcMesh, tarMesh, tarOrthoCamera, tarRegion, project, poseProxyState, icpMaxIter, icpRejectMul, icpSampleCount, onStatusChange, pushTrace, validateCollectJoints, validateRenderSrcOrtho, validateBuildProxies]);
+  }, [srcMesh, tarMesh, tarOrthoCamera, tarRegion, project, poseProxyState, icpMaxIter, icpRejectMul, icpSampleCount, onStatusChange, pushTrace, validateCollectJoints, validateRenderSrcOrtho, validateBuildProxies, pipelineJoints, pipelineJointImageSize]);
 
   return (
     <div
@@ -1618,6 +1726,30 @@ export function ModelAssemble(props: ModelAssembleProps) {
               <Button size="sm" variant={resultView === 'aligned' ? 'primary' : 'secondary'} onClick={() => setResultView('aligned')}>Aligned</Button>
               <Button size="sm" variant={resultView === 'target' ? 'primary' : 'secondary'} onClick={() => setResultView('target')}>Target</Button>
               <Button size="sm" variant={resultView === 'original' ? 'primary' : 'secondary'} onClick={() => setResultView('original')}>Original</Button>
+            </>
+          )}
+          {poseProxyState.proxies && (
+            <>
+              <span style={{ width: 1, height: 16, background: 'var(--border-default)', margin: '0 4px' }} />
+              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>骨骼叠加:</span>
+              <Button
+                size="sm"
+                variant={showJointSeeds ? 'primary' : 'secondary'}
+                onClick={() => setShowJointSeeds((v) => !v)}
+                title="Joint Seeds — DWPose 检测到的各关节位置"
+              >Seeds</Button>
+              <Button
+                size="sm"
+                variant={showCapsuleAnchors ? 'primary' : 'secondary'}
+                onClick={() => setShowCapsuleAnchors((v) => !v)}
+                title="Capsule Anchors — PCA 算出的肢体代理锚点"
+              >Anchors</Button>
+              <Button
+                size="sm"
+                variant={showSpecialAnchors ? 'primary' : 'secondary'}
+                onClick={() => setShowSpecialAnchors((v) => !v)}
+                title="特殊锚点 — shoulder_line / torso_axis"
+              >Special</Button>
             </>
           )}
           <div style={{ flex: 1 }} />

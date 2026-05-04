@@ -13,7 +13,7 @@
  *   14:R_Eye  15:L_Eye  16:R_Ear  17:L_Ear
  */
 
-import type { Joint2D, GlobalJointsMeta, MultiViewLayout, ViewName, Page1SplitsMeta, Page1ViewJoints } from '../types/joints';
+import type { Joint2D, GlobalJointsMeta, MultiViewLayout, ViewName, Page1SplitsMeta, Page1ViewJoints, SmartCropTransformMeta, SplitTransformMeta } from '../types/joints';
 
 // ── Raw DWPose API types ────────────────────────────────────────────────
 
@@ -282,6 +282,103 @@ export function globalJointsToPage1Views(
   }
   return out as Record<ViewName, Page1ViewJoints>;
 }
+// ── SmartCrop Coordinate Mapping ────────────────────────────────────────
+//
+// Page2 (extraction) records the affine transform it applied to the image:
+//   SmartCropMeta:  bbox → paste+scale  (jacket crop → enlarged paste)
+//   SplitMeta:      processed 2×2 → per-view crop
+//
+// Page3 (alignment) applies this same affine chain to Page1's DWPose joints
+// so they land in the src mesh's coordinate space. This is pure math —
+// no filtering, no synthetic joints. Joints outside the crop bbox will get
+// frac values <0 or >1, mapping outside the paste area; that's intentional
+// and will naturally project to the nearest mesh vertex in 3D.
+
+/**
+ * Apply Page2's recorded SmartCrop + Split affine transform to Page1 joints,
+ * mapping them from global image coords into per-view split-local coords.
+ *
+ * This is the point-coordinate equivalent of what the image pipeline did:
+ *
+ *   joint → frac=(joint - bbox.tl)/bbox.size → processed=paste + frac×target
+ *         → splitLocal = processed - splitBbox.tl
+ *
+ * @returns Per-view joints in split-local pixel coords (no filtering)
+ */
+export function transformJointsBySmartCrop(
+  globalJoints: GlobalJointsMeta,
+  smartCropMeta: SmartCropTransformMeta,
+  splitMeta: SplitTransformMeta,
+): Record<ViewName, Joint2D[]> {
+  const { width: W, height: H } = globalJoints.imageSize;
+  const halfW = W / 2;
+  const halfH = H / 2;
+
+  // ── Quadrant → view mapping (same as Page1 split) ──
+  const viewForPixel = (x: number, y: number): ViewName => {
+    if (x < halfW && y < halfH) return 'front';
+    if (x >= halfW && y < halfH) return 'left';
+    if (x < halfW && y >= halfH) return 'right';
+    return 'back';
+  };
+
+  // ── Step 1: SmartCrop affine → processed 2×2 ──
+  const processedJoints = new Map<ViewName, Joint2D[]>();
+  for (const v of ['front', 'left', 'back', 'right'] as ViewName[]) {
+    processedJoints.set(v, []);
+  }
+
+  for (const obj of smartCropMeta.objects) {
+    const cx = (obj.paddedBbox.x0 + obj.paddedBbox.x1) / 2;
+    const cy = (obj.paddedBbox.y0 + obj.paddedBbox.y1) / 2;
+    const view = viewForPixel(cx, cy);
+
+    const srcJoints = globalJoints.views[view] ?? [];
+    const objW = obj.paddedBbox.x1 - obj.paddedBbox.x0;
+    const objH = obj.paddedBbox.y1 - obj.paddedBbox.y0;
+    if (objW <= 0 || objH <= 0 || obj.targetW <= 0 || obj.targetH <= 0) continue;
+
+    for (const j of srcJoints) {
+      // Pure affine: frac = (joint - bbox_tl) / bbox_size
+      // out = paste_tl + frac * target_size
+      // frac can be <0 or >1 for joints outside the crop — that's fine.
+      const fracX = (j.x - obj.paddedBbox.x0) / objW;
+      const fracY = (j.y - obj.paddedBbox.y0) / objH;
+      processedJoints.get(view)!.push({
+        name: j.name,
+        x: Math.round(obj.pasteX + fracX * obj.targetW),
+        y: Math.round(obj.pasteY + fracY * obj.targetH),
+        confidence: j.confidence,
+      });
+    }
+  }
+
+  // ── Step 2: Split offset → per-view split-local ──
+  const out: Record<ViewName, Joint2D[]> = {
+    front: [],
+    left: [],
+    back: [],
+    right: [],
+  };
+
+  for (const sv of splitMeta.views) {
+    const view = sv.view;
+    const candidates = processedJoints.get(view) ?? [];
+    const pb = sv.paddedBbox;
+
+    for (const j of candidates) {
+      out[view].push({
+        name: j.name,
+        x: j.x - pb.x0,
+        y: j.y - pb.y0,
+        confidence: j.confidence,
+      });
+    }
+  }
+
+  return out;
+}
+
 // ── Single-view COCO → Joint2D[] ───────────────────────────────────────
 
 /**
