@@ -68,6 +68,13 @@
  *     使用与 V1 同名的 store action transformSrcLandmarks。
  *   - QualityDrawer 接入真实 RMSE / meanError / maxError / scale。
  *
+ * Stage 8/4 切片（2026-05-04）：Result Preview overlay。
+ *   - 中央区增加 centerView 切换：landmark / result。Run 成功后自动跳到 result。
+ *   - result 子模式 overlay/aligned/target/original 完全复制 V1 ResultPreviewPanel
+ *     的语义（line 5310-5419）。overlay 同时显示对齐后的 src + target。
+ *   - Reset/Accept 同时切回 landmark 视图。
+ *   - 依然只在 manual 策略下可运行；auto 策略提示不变。
+ *
  * 边界：
  *   - 不重新实现任何对齐算法；auto 策略仍由现存 ModelAssemble 持有。
  */
@@ -78,6 +85,7 @@ import type { Page3Session } from '../../services/projectStore';
 import { parseSegmentationJson } from '../../services/segmentationPack';
 import {
   DualViewport,
+  MeshViewer,
   loadGlbAsMesh,
   useLandmarkStore,
   type Face3,
@@ -174,6 +182,11 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
   const [aligning, setAligning] = useState(false);
   const [alignResult, setAlignResult] = useState<AlignmentResult | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
+  // Stage 8/4: 中央视图模式 与 结果预览子模式。
+  type CenterView = 'landmark' | 'result';
+  type ResultView = 'overlay' | 'aligned' | 'target' | 'original';
+  const [centerView, setCenterView] = useState<CenterView>('landmark');
+  const [resultView, setResultView] = useState<ResultView>('overlay');
   // Stage 8/1: 中央视口需要的 mesh 数据。null = 尚未加载/工程内无文件。
   const [srcMesh, setSrcMesh] = useState<MeshData | null>(null);
   const [tarMesh, setTarMesh] = useState<MeshData | null>(null);
@@ -396,6 +409,8 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
         'similarity',
       );
       setAlignResult(result);
+      setCenterView('result');
+      setResultView('overlay');
       onStatusChange?.(`Manual SVD 对齐完成 RMSE=${result.rmse.toFixed(4)}`, 'success');
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -416,12 +431,14 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
     });
     transformSrcLandmarks(alignResult.matrix4x4);
     setAlignResult(null);
+    setCenterView('landmark');
     onStatusChange?.('已应用对齐变换到 Source mesh + landmarks', 'success');
   }, [alignResult, srcMesh, transformSrcLandmarks, onStatusChange]);
 
   const handleResetAlign = useCallback(() => {
     setAlignResult(null);
     setRunError(null);
+    setCenterView('landmark');
   }, []);
 
   return (
@@ -534,11 +551,32 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
             background: 'var(--bg-surface)',
           }}
         >
-          <span style={{ fontSize: 12, fontWeight: 600 }}>Result Overlay</span>
-          <Button size="sm" variant="primary">Overlay</Button>
-          <Button size="sm">Aligned</Button>
-          <Button size="sm">Target</Button>
-          <Button size="sm">Original</Button>
+          <span style={{ fontSize: 12, fontWeight: 600 }}>中央视图</span>
+          <Button
+            size="sm"
+            variant={centerView === 'landmark' ? 'primary' : 'secondary'}
+            onClick={() => setCenterView('landmark')}
+          >
+            Landmark
+          </Button>
+          <Button
+            size="sm"
+            variant={centerView === 'result' ? 'primary' : 'secondary'}
+            onClick={() => alignResult && setCenterView('result')}
+            disabled={!alignResult}
+            title={alignResult ? '' : '运行对齐后可查看'}
+          >
+            Result
+          </Button>
+          {centerView === 'result' && (
+            <>
+              <span style={{ width: 1, height: 16, background: 'var(--border-default)', margin: '0 4px' }} />
+              <Button size="sm" variant={resultView === 'overlay' ? 'primary' : 'secondary'} onClick={() => setResultView('overlay')}>Overlay</Button>
+              <Button size="sm" variant={resultView === 'aligned' ? 'primary' : 'secondary'} onClick={() => setResultView('aligned')}>Aligned</Button>
+              <Button size="sm" variant={resultView === 'target' ? 'primary' : 'secondary'} onClick={() => setResultView('target')}>Target</Button>
+              <Button size="sm" variant={resultView === 'original' ? 'primary' : 'secondary'} onClick={() => setResultView('original')}>Original</Button>
+            </>
+          )}
           <div style={{ flex: 1 }} />
           <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
             策略: {selectedStrategy.label}
@@ -546,7 +584,7 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
         </div>
 
         <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
-          {srcMesh && tarMesh ? (
+          {srcMesh && tarMesh && centerView === 'landmark' && (
             <DualViewport
               srcVertices={srcMesh.vertices}
               srcFaces={srcMesh.faces}
@@ -571,7 +609,17 @@ export function ModelAssembleV2(props: ModelAssembleV2Props) {
               showCameraSync
               height="100%"
             />
-          ) : (
+          )}
+          {srcMesh && tarMesh && centerView === 'result' && alignResult && (
+            <ResultPreviewV2
+              alignResult={alignResult}
+              srcFaces={srcMesh.faces}
+              originalSrcVertices={srcMesh.vertices}
+              targetMesh={tarMesh}
+              resultView={resultView}
+            />
+          )}
+          {(!srcMesh || !tarMesh) && (
             <div
               style={{
                 position: 'absolute',
@@ -855,6 +903,100 @@ function StepCardV2({ step }: { step: StrategyStep }) {
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Stage 8/4: V2 result preview overlay. Mirrors V1 ResultPreviewPanel
+ * (ModelAssemble.tsx line 5310-5419) — overlay/aligned/target/original
+ * 4 sub-modes via single MeshViewer with role/landmark color choices.
+ */
+function ResultPreviewV2({
+  alignResult,
+  srcFaces,
+  originalSrcVertices,
+  targetMesh,
+  resultView,
+}: {
+  alignResult: AlignmentResult;
+  srcFaces: Face3[];
+  originalSrcVertices: Vec3[];
+  targetMesh: { vertices: Vec3[]; faces: Face3[] };
+  resultView: 'overlay' | 'aligned' | 'target' | 'original';
+}) {
+  const srcLandmarkPoints = alignResult.alignedSrcLandmarks.map((pos, i) => ({
+    index: i + 1,
+    vertexIdx: -1,
+    position: pos,
+  }));
+  const tarLandmarkPoints = alignResult.targetLandmarks.map((pos, i) => ({
+    index: i + 1,
+    vertexIdx: -1,
+    position: pos,
+  }));
+  if (resultView === 'overlay') {
+    return (
+      <MeshViewer
+        role="result"
+        vertices={alignResult.transformedVertices}
+        faces={srcFaces}
+        color="#4a90d9"
+        viewMode="solid"
+        height="100%"
+        label="Overlay: Aligned Source (蓝) + Target (橙)"
+        landmarks={srcLandmarkPoints}
+        landmarkColor="#ff6b6b"
+        overlayVertices={targetMesh.vertices}
+        overlayFaces={targetMesh.faces}
+        overlayColor="#d9734a"
+        overlayLandmarks={tarLandmarkPoints}
+        showViewModeToggle={false}
+      />
+    );
+  }
+  if (resultView === 'aligned') {
+    return (
+      <MeshViewer
+        role="result"
+        vertices={alignResult.transformedVertices}
+        faces={srcFaces}
+        color="#4a90d9"
+        viewMode="solid"
+        height="100%"
+        label="Aligned Source"
+        landmarks={srcLandmarkPoints}
+        landmarkColor="#ff6b6b"
+        showViewModeToggle={false}
+      />
+    );
+  }
+  if (resultView === 'target') {
+    return (
+      <MeshViewer
+        role="target"
+        vertices={targetMesh.vertices}
+        faces={targetMesh.faces}
+        color="#d9734a"
+        viewMode="solid"
+        height="100%"
+        label="Target"
+        landmarks={tarLandmarkPoints}
+        landmarkColor="#a0d995"
+        showViewModeToggle={false}
+      />
+    );
+  }
+  return (
+    <MeshViewer
+      role="source"
+      vertices={originalSrcVertices}
+      faces={srcFaces}
+      color="#4a90d9"
+      viewMode="solid"
+      height="100%"
+      label="Original Source"
+      showViewModeToggle={false}
+    />
   );
 }
 
