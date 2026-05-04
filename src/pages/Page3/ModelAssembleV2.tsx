@@ -16,6 +16,12 @@
  * Stage 7/2 切片（2026-05-04）：
  *   - 接通 hasSource / hasTarget：通过 listHistory('page2.highres') 和
  *     listHistory('page1.rough') 检测工程内是否已有可加载的 GLB 文件。
+ *
+ * Stage 7/3c 切片（2026-05-04）：
+ *   - 接通 hasSegPack：通过 loadPage3SegPack() 读取工程内上次在 V1
+ *     保存的 SegPack（page3.segpack node）。仅检测存在性，不重建
+ *     运行时 segPack（那属于 SegPack 面板后续切片）。
+ *   - 进度：4/9。
  *   - 这里只判存在性，不实际 load blob（避免 URL.createObjectURL 泄漏，且接
  *     通 mesh 视口是更后面的切片）。
  *   - 进度：3/9。
@@ -44,19 +50,18 @@ interface ModelAssembleV2Props {
 /**
  * Stub 定义：记录哪些字段还不是真实数据。后续切片逐个拿掉。
  *
- * TODO 未接入字段 (6/9)：
- *   - hasTargetRegion               : 需 SAM3 region selector state
- *   - hasSegPack / hasMaskReprojection: 需 SegPack 加载 state
+ * TODO 未接入字段 (5/9)：
+ *   - hasTargetRegion               : 需 SAM3 region selector state（transient）
+ *   - hasMaskReprojection           : 需 反投影计算 state（transient）
  *   - hasOrthoCamera                : 需 正交相机装载 state
  *   - hasBodyTorsoRegion / hasAdjacency: 需 SegPack 推导
  *   - srcLandmarkCount / tarLandmarkCount: 需 manual landmark 收集 state
  */
 const STUB_FALLBACK: Omit<
   AlignStrategyContext,
-  'hasPoseProxyJoints' | 'hasSource' | 'hasTarget'
+  'hasPoseProxyJoints' | 'hasSource' | 'hasTarget' | 'hasSegPack'
 > = {
   hasTargetRegion: true,
-  hasSegPack: true,
   hasMaskReprojection: true,
   hasOrthoCamera: true,
   hasBodyTorsoRegion: false, // 故意 missing → limb-structure 显示 partial
@@ -65,13 +70,14 @@ const STUB_FALLBACK: Omit<
   tarLandmarkCount: 0,
 };
 
-/** Stage 7/1+7/2: 实时接通的字段名单，用于底部状态条显示进度。 */
+/** Stage 7/1+7/2+7/3c: 实时接通的字段名单。 */
 const REAL_FIELDS: ReadonlyArray<keyof AlignStrategyContext> = [
   'hasPoseProxyJoints',
   'hasSource',
   'hasTarget',
+  'hasSegPack',
 ];
-const TOTAL_FIELDS = 9; // AlignStrategyContext 总字段数
+const TOTAL_FIELDS = 9;
 
 
 const READINESS_COLOR: Record<StrategyReadiness, string> = {
@@ -91,7 +97,7 @@ const READINESS_LABEL: Record<StrategyReadiness, string> = {
 };
 
 export function ModelAssembleV2(_props: ModelAssembleV2Props) {
-  const { project, listHistory } = useProject();
+  const { project, listHistory, loadPage3SegPack } = useProject();
   const [selectedId, setSelectedId] = useState<AlignStrategyId>('pose-proxy');
   const [expandedReqs, setExpandedReqs] = useState<Set<AlignStrategyId>>(new Set());
   const [showLogs, setShowLogs] = useState(false);
@@ -103,26 +109,32 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
   // 命名沿用生产 ModelAssemble 的语义（src→tar 表示对齐方向）。
   const [sourceFileCount, setSourceFileCount] = useState(0);
   const [targetFileCount, setTargetFileCount] = useState(0);
+  // Stage 7/3c: SegPack 检测。仅记录“存在 + dirName”，不解析 / 不加载 mask，
+  // 避免为了一个 bool 乘载两块二进制。真正要用 segPack 的面板后续切片再 load。
+  const [segPackDirName, setSegPackDirName] = useState<string | null>(null);
   const refreshAssets = useCallback(() => {
     if (!project) {
       setSourceFileCount(0);
       setTargetFileCount(0);
+      setSegPackDirName(null);
       return;
     }
     void Promise.all([
       listHistory('page2.highres'),
       listHistory('page1.rough'),
-    ]).then(([src, tar]) => {
+      loadPage3SegPack(),
+    ]).then(([src, tar, segpack]) => {
       setSourceFileCount(src.length);
       setTargetFileCount(tar.length);
+      setSegPackDirName(segpack?.dirName ?? null);
     });
-  }, [project, listHistory]);
+  }, [project, listHistory, loadPage3SegPack]);
   // Effect 只在 project 变化时跑；在其他页面落盘后的新资产需手动 ↻ 按钮。
   useEffect(() => {
     refreshAssets();
   }, [refreshAssets]);
 
-  // Stage 7/1+7/2: hasPoseProxyJoints / hasSource / hasTarget 走真实数据，其余仍 stub。
+  // Stage 7/1+7/2+7/3c: 逐个接通。
   const ctx: AlignStrategyContext = useMemo(() => {
     const front = project?.meta.page1?.joints?.views.front?.joints;
     return {
@@ -130,8 +142,9 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
       hasPoseProxyJoints: !!(front && front.length > 0),
       hasSource: sourceFileCount > 0,
       hasTarget: targetFileCount > 0,
+      hasSegPack: !!segPackDirName,
     };
-  }, [project?.meta.page1?.joints, sourceFileCount, targetFileCount]);
+  }, [project?.meta.page1?.joints, sourceFileCount, targetFileCount, segPackDirName]);
 
   const selectedStrategy = useMemo(
     () => ALIGN_STRATEGIES.find((s) => s.id === selectedId) ?? ALIGN_STRATEGIES[0],
@@ -172,7 +185,11 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
         </PanelSection>
 
         <PanelSection title="🎯 目标区域 (必填)">
-          <Hint>SAM3 区域选择器待挂接（当前用 stub 上下文）</Hint>
+          <Hint>
+            SegPack: {segPackDirName ?? '未保存'}
+            {segPackDirName && '（V1 加载后自动持久化）'}
+          </Hint>
+          <Hint>SAM3 区域选择器待挂接（当前仅检测 SegPack 存在性）</Hint>
         </PanelSection>
 
         <PanelSection
