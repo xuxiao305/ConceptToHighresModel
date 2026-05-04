@@ -19,9 +19,15 @@
  *
  * Stage 7/3c 切片（2026-05-04）：
  *   - 接通 hasSegPack：通过 loadPage3SegPack() 读取工程内上次在 V1
- *     保存的 SegPack（page3.segpack node）。仅检测存在性，不重建
- *     运行时 segPack（那属于 SegPack 面板后续切片）。
- *   - 进度：4/9。
+ *     保存的 SegPack（page3.segpack node）。
+ *
+ * Stage 7/4 切片（2026-05-04）：
+ *   - srcLandmarkCount / tarLandmarkCount：订阅全局 useLandmarkStore（V1/V2 共享）。
+ *   - hasAdjacency：逻辑上等价于 hasSource && hasTarget（只要两份 mesh 能 load，
+ *     buildMeshAdjacency 就能跑），避免在 V2 重走 GLB 加载。
+ *   - 进度：7/9。剩下 2/9 是与交互强绑定的 transient state：
+ *     hasTargetRegion / hasMaskReprojection / hasOrthoCamera → 需用户在 V1
+ *     跳走 2D 定位流程后产生，本阶段保留 stub。
  *   - 这里只判存在性，不实际 load blob（避免 URL.createObjectURL 泄漏，且接
  *     通 mesh 视口是更后面的切片）。
  *   - 进度：3/9。
@@ -32,6 +38,7 @@
 import { useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react';
 import { Button } from '../../components/Button';
 import { useProject } from '../../contexts/ProjectContext';
+import { useLandmarkStore } from '../../three';
 import {
   ALIGN_STRATEGIES,
   summarizeReadiness,
@@ -50,32 +57,33 @@ interface ModelAssembleV2Props {
 /**
  * Stub 定义：记录哪些字段还不是真实数据。后续切片逐个拿掉。
  *
- * TODO 未接入字段 (5/9)：
+ * TODO 未接入字段 (2/9 需用户交互产生)：
  *   - hasTargetRegion               : 需 SAM3 region selector state（transient）
  *   - hasMaskReprojection           : 需 反投影计算 state（transient）
- *   - hasOrthoCamera                : 需 正交相机装载 state
- *   - hasBodyTorsoRegion / hasAdjacency: 需 SegPack 推导
- *   - srcLandmarkCount / tarLandmarkCount: 需 manual landmark 收集 state
+ *   - hasOrthoCamera                : 需 正交相机装载 state（transient）
+ *
+ * 1/9 可推导但未作（避免 V2 重走全量 SegPack 解析）：
+ *   - hasBodyTorsoRegion            : 需 SegPack regions 中 findMaskRegion(['body','torso'])
  */
-const STUB_FALLBACK: Omit<
+const STUB_FALLBACK: Pick<
   AlignStrategyContext,
-  'hasPoseProxyJoints' | 'hasSource' | 'hasTarget' | 'hasSegPack'
+  'hasTargetRegion' | 'hasMaskReprojection' | 'hasOrthoCamera' | 'hasBodyTorsoRegion'
 > = {
   hasTargetRegion: true,
   hasMaskReprojection: true,
   hasOrthoCamera: true,
   hasBodyTorsoRegion: false, // 故意 missing → limb-structure 显示 partial
-  hasAdjacency: true,
-  srcLandmarkCount: 0,
-  tarLandmarkCount: 0,
 };
 
-/** Stage 7/1+7/2+7/3c: 实时接通的字段名单。 */
+/** Stage 7/1、7/2、7/3c、7/4: 实时接通的字段名单。 */
 const REAL_FIELDS: ReadonlyArray<keyof AlignStrategyContext> = [
   'hasPoseProxyJoints',
   'hasSource',
   'hasTarget',
   'hasSegPack',
+  'hasAdjacency',
+  'srcLandmarkCount',
+  'tarLandmarkCount',
 ];
 const TOTAL_FIELDS = 9;
 
@@ -98,6 +106,9 @@ const READINESS_LABEL: Record<StrategyReadiness, string> = {
 
 export function ModelAssembleV2(_props: ModelAssembleV2Props) {
   const { project, listHistory, loadPage3SegPack } = useProject();
+  // Stage 7/4: 订阅全局 landmark store（V1/V2 共享）。
+  const srcLandmarkCount = useLandmarkStore((s) => s.srcLandmarks.length);
+  const tarLandmarkCount = useLandmarkStore((s) => s.tarLandmarks.length);
   const [selectedId, setSelectedId] = useState<AlignStrategyId>('pose-proxy');
   const [expandedReqs, setExpandedReqs] = useState<Set<AlignStrategyId>>(new Set());
   const [showLogs, setShowLogs] = useState(false);
@@ -134,17 +145,30 @@ export function ModelAssembleV2(_props: ModelAssembleV2Props) {
     refreshAssets();
   }, [refreshAssets]);
 
-  // Stage 7/1+7/2+7/3c: 逐个接通。
+  // Stage 7/1+7/2+7/3c+7/4: 逐个接通。
   const ctx: AlignStrategyContext = useMemo(() => {
     const front = project?.meta.page1?.joints?.views.front?.joints;
+    const hasSource = sourceFileCount > 0;
+    const hasTarget = targetFileCount > 0;
     return {
       ...STUB_FALLBACK,
       hasPoseProxyJoints: !!(front && front.length > 0),
-      hasSource: sourceFileCount > 0,
-      hasTarget: targetFileCount > 0,
+      hasSource,
+      hasTarget,
       hasSegPack: !!segPackDirName,
+      // hasAdjacency 逻辑等价于 两份 mesh 都能 load（buildMeshAdjacency 是纯函数）。
+      hasAdjacency: hasSource && hasTarget,
+      srcLandmarkCount,
+      tarLandmarkCount,
     };
-  }, [project?.meta.page1?.joints, sourceFileCount, targetFileCount, segPackDirName]);
+  }, [
+    project?.meta.page1?.joints,
+    sourceFileCount,
+    targetFileCount,
+    segPackDirName,
+    srcLandmarkCount,
+    tarLandmarkCount,
+  ]);
 
   const selectedStrategy = useMemo(
     () => ALIGN_STRATEGIES.find((s) => s.id === selectedId) ?? ALIGN_STRATEGIES[0],
