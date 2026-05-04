@@ -14,7 +14,7 @@
  * V1 stays untouched until Stage 9; these are net-new functions.
  */
 
-import type { Vec3, LandmarkCandidate } from '../../three';
+import type { Vec3, LandmarkCandidate, MeshAdjacency } from '../../three';
 import type { AlignmentMode, AlignmentResult } from '../../three/alignment';
 import type { IcpOptions, OrthoFrontCamera } from '../../three';
 import type { Joint2D } from '../../types/joints';
@@ -26,6 +26,7 @@ import {
   icpRefine,
   buildSkeletonProxy,
   matchLimbStructureToWhole,
+  matchPartialToWhole,
 } from '../../three';
 import { computePoseAlignment } from '../../three/poseAlignment';
 
@@ -361,6 +362,105 @@ export function runLimbStructure(
   if (!pm.matrix4x4 || pm.pairs.length < 3) {
     const reason = typeof pm.diagnostics?.reason === 'string' ? pm.diagnostics.reason : 'unknown';
     throw new LimbStructureMatchError(reason, pm.pairs.length);
+  }
+
+  return finalizeWithIcp(
+    input.src.vertices,
+    input.tar.vertices,
+    pm.pairs,
+    opts,
+    input.tarConstraintVertices,
+  );
+}
+
+// ── Strategy: Surface (partial-to-whole) ──────────────────────────
+
+/** V1 partial-match defaults (ModelAssemble L696–707). */
+export const DEFAULT_SURFACE: {
+  numSrcSamples: number;
+  numTarSamples: number;
+  topK: number;
+  iterations: number;
+  inlierThresholdPct: number;
+  descriptor: 'curvature' | 'fpfh';
+  seedWeight: number;
+  axialWeight: number;
+  macroSaliencyRings: number;
+} = {
+  numSrcSamples: 25,
+  numTarSamples: 80,
+  topK: 8,
+  iterations: 600,
+  inlierThresholdPct: 5,
+  descriptor: 'fpfh',
+  seedWeight: 5.0,
+  axialWeight: 5.0,
+  macroSaliencyRings: 6,
+};
+
+const PARTIAL_SAMPLE_POOL_MODE = 'robust' as const;
+const PARTIAL_RADIUS_FRACTIONS = [0.08, 0.16, 0.32];
+
+export interface RunSurfaceInput {
+  src: { vertices: Vec3[]; adjacency: MeshAdjacency };
+  tar: { vertices: Vec3[]; adjacency: MeshAdjacency };
+  /** Optional SAM3 region restricting target candidate pool + ICP search. */
+  tarConstraintVertices?: Set<number>;
+  /** Soft seed centroid (target-side bias). */
+  tarSeedCentroid?: Vec3;
+  /** Soft seed radius (used to scale the soft-seed penalty). */
+  tarSeedRadius?: number;
+}
+
+export interface RunSurfaceOptions extends RunnerOptions {
+  /** Per-call overrides on top of DEFAULT_SURFACE. */
+  surface?: Partial<typeof DEFAULT_SURFACE>;
+}
+
+export class SurfaceMatchError extends Error {
+  constructor(public bestInlierCount: number, public pairs: number) {
+    super(`runSurface: partial-match failed (inliers=${bestInlierCount}, pairs=${pairs})`);
+    this.name = 'SurfaceMatchError';
+  }
+}
+
+/**
+ * Surface strategy: FPFH/curvature descriptor matching + RANSAC, then
+ * finalize with ICP. Mirrors the surface (else) branch of V1
+ * handleAutoAlign (L3004–3029).
+ */
+export function runSurface(
+  input: RunSurfaceInput,
+  opts: RunSurfaceOptions = {},
+): RunnerOutcome {
+  const cfg = { ...DEFAULT_SURFACE, ...(opts.surface ?? {}) };
+  const hasRegion = !!input.tarConstraintVertices && input.tarConstraintVertices.size > 0;
+
+  const pm = matchPartialToWhole(
+    { vertices: input.src.vertices, adjacency: input.src.adjacency },
+    { vertices: input.tar.vertices, adjacency: input.tar.adjacency },
+    {
+      numSrcSamples: cfg.numSrcSamples,
+      numTarSamples: cfg.numTarSamples,
+      topK: cfg.topK,
+      iterations: cfg.iterations,
+      inlierThreshold: cfg.inlierThresholdPct / 100,
+      descriptor: cfg.descriptor,
+      samplePoolMode: PARTIAL_SAMPLE_POOL_MODE,
+      radiusFractions: PARTIAL_RADIUS_FRACTIONS,
+      macroSaliencyRings: cfg.macroSaliencyRings,
+      tarSeedCentroid: input.tarSeedCentroid,
+      tarSeedRadius: input.tarSeedRadius,
+      tarSeedWeight: hasRegion ? cfg.seedWeight : 0,
+      tarConstraintVertices: input.tarConstraintVertices,
+      tarConstraintUseSaliency: hasRegion,
+      axialWeight: cfg.axialWeight,
+      seed: opts.seed,
+    },
+  );
+
+  if (!pm.matrix4x4 || pm.pairs.length < 3) {
+    throw new SurfaceMatchError(pm.bestInlierCount, pm.pairs.length);
   }
 
   return finalizeWithIcp(
