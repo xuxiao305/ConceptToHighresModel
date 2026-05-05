@@ -25,9 +25,9 @@ import {
 } from '../../three/alignment';
 import {
   icpRefine,
-  buildSkeletonProxy,
+  jointsToSeeds3D,
+  bboxDiagonal,
 } from '../../three';
-import { computePoseAlignment } from '../../three/poseAlignment';
 import { renderOrthoFrontViewWithCamera } from '../../three/orthoFrontRender';
 
 // ── 共享类型 ──────────────────────────────────────────────────────────
@@ -135,34 +135,53 @@ export interface BuildProxiesInput {
 export interface BuildProxiesOutput {
   srcProxy: SkeletonProxyResult;
   tarProxy: SkeletonProxyResult;
-  /** SVD 姿态对齐结果（含 anchorErrors, jointSeeds 等） */
+  /** Stub — not computed in pure seed mode */
   poseAlign: PoseAlignmentResult;
-  /** 合并后的 anchor + direct joint pairs */
+  /** 配对后的关节种子候选项（所有同名关节） */
   pairs: LandmarkCandidate[];
 }
-
-const POSE_PROXY_DIRECT_JOINTS = [
-  'left_shoulder',
-  'right_shoulder',
-  'left_elbow',
-  'right_elbow',
-] as const;
 
 function findJointConfidence(joints: Joint2D[], name: string): number {
   return joints.find((j) => j.name === name)?.confidence ?? 0;
 }
 
-function buildDirectJointCandidates(
-  srcSeeds: Map<string, Vec3>,
-  tarSeeds: Map<string, Vec3>,
-  srcJoints: Joint2D[],
-  tarJoints: Joint2D[],
-): LandmarkCandidate[] {
+/**
+ * Step 3: 纯种子模式 — 直接将 2D 关节反投影为 3D 种子点，
+ * 按同名关节配对作为 LandmarkCandidate，跳过 capsule/PCA/anchor。
+ */
+export function buildProxies(input: BuildProxiesInput): BuildProxiesOutput {
+  const { srcVertices, tarVertices, srcJoints, tarJoints, srcCamera, tarCamera } = input;
+
+  // Per-mesh search radius (3% of bbox diagonal → stable midline centroid)
+  const srcDiag = bboxDiagonal(srcVertices);
+  const tarDiag = bboxDiagonal(tarVertices);
+  const searchRadiusFrac = 0.03;
+
+  // Direct joint → 3D seed projection (pure, no capsule/PCA)
+  const srcSeeds = jointsToSeeds3D(srcJoints, srcVertices, srcCamera, srcDiag * searchRadiusFrac);
+  const tarSeeds = jointsToSeeds3D(tarJoints, tarVertices, tarCamera, tarDiag * searchRadiusFrac);
+
+  // Minimal proxy shells — only jointSeeds are real
+  const srcProxy: SkeletonProxyResult = {
+    anchors: [],
+    jointSeeds: srcSeeds,
+    capsules: [],
+    totalCapsuleVertices: 0,
+    warnings: [],
+  };
+  const tarProxy: SkeletonProxyResult = {
+    anchors: [],
+    jointSeeds: tarSeeds,
+    capsules: [],
+    totalCapsuleVertices: 0,
+    warnings: [],
+  };
+
+  // Pair ALL matching joint name seeds as landmark candidates
   const pairs: LandmarkCandidate[] = [];
-  for (const name of POSE_PROXY_DIRECT_JOINTS) {
-    const srcPosition = srcSeeds.get(name);
-    const tarPosition = tarSeeds.get(name);
-    if (!srcPosition || !tarPosition) continue;
+  for (const [name, srcPos] of srcSeeds) {
+    const tarPos = tarSeeds.get(name);
+    if (!tarPos) continue;
     const confidence = Math.min(
       findJointConfidence(srcJoints, name),
       findJointConfidence(tarJoints, name),
@@ -170,61 +189,28 @@ function buildDirectJointCandidates(
     if (confidence <= 0) continue;
     pairs.push({
       srcVertex: -1,
-      srcPosition,
+      srcPosition: srcPos,
       tarVertex: -1,
-      tarPosition,
+      tarPosition: tarPos,
       confidence: Math.min(1, Math.max(0.45, confidence)),
       descriptorDist: 0,
       suggestAccept: confidence >= 0.35,
     });
   }
-  return pairs;
-}
 
-/**
- * Step 3: 构建 src/tar 骨架代理 + SVD 姿态对齐 + 收集 anchor pairs。
- * 整合了原 runPoseProxy 中的 buildSkeletonProxy × 2 +
- * computePoseAlignment + anchor pair 收集 + direct joint pairs。
- */
-export function buildProxies(input: BuildProxiesInput): BuildProxiesOutput {
-  const { srcVertices, tarVertices, srcJoints, tarJoints, srcCamera, tarCamera, tarConstraintVertices } = input;
-  const svdMode = 'similarity' as AlignmentMode;
+  // Stub pose alignment — not computed in pure seed mode
+  const poseAlign: PoseAlignmentResult = {
+    matrix4x4: [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+    svdRmse: 0,
+    anchorPairCount: 0,
+    anchorErrors: [],
+    scale: 1,
+    sourceProxy: srcProxy,
+    targetProxy: tarProxy,
+    warnings: [],
+    reliable: false,
+  };
 
-  const srcProxy = buildSkeletonProxy(srcVertices, srcJoints, srcCamera, {
-    capsuleRadiusFraction: 0.08,
-  });
-  const tarProxy = buildSkeletonProxy(tarVertices, tarJoints, tarCamera, {
-    capsuleRadiusFraction: 0.08,
-  });
-
-  const poseAlign = computePoseAlignment(srcProxy, tarProxy, { svdMode });
-
-  // Anchor pairs from PCA capsule anchors.
-  const anchorPairs: LandmarkCandidate[] = [];
-  for (const e of poseAlign.anchorErrors) {
-    const srcA = srcProxy.anchors.find((a) => a.kind === e.kind);
-    const tarA = tarProxy.anchors.find((a) => a.kind === e.kind);
-    if (!srcA || !tarA) continue;
-    anchorPairs.push({
-      srcVertex: -1,
-      srcPosition: srcA.position,
-      tarVertex: -1,
-      tarPosition: tarA.position,
-      confidence: e.confidence,
-      descriptorDist: 0,
-      suggestAccept: e.confidence > 0.5,
-    });
-  }
-
-  // Plus direct shoulder/elbow anchors.
-  const directJointPairs = buildDirectJointCandidates(
-    srcProxy.jointSeeds,
-    tarProxy.jointSeeds,
-    srcJoints,
-    tarJoints,
-  );
-
-  const pairs = [...anchorPairs, ...directJointPairs];
   return { srcProxy, tarProxy, poseAlign, pairs };
 }
 
@@ -240,6 +226,8 @@ export interface SolveSvdInput {
 export interface SolveSvdOutput {
   lmFitMatrix: number[][];
   lmFitRmse: number;
+  /** Full alignment result (transformed vertices etc.) for immediate preview. */
+  result: AlignmentResult;
 }
 
 /**
@@ -270,7 +258,7 @@ export function solveSvd(input: SolveSvdInput): SolveSvdOutput {
   }
   const lmFitRmse = Math.sqrt(s / pairs.length);
 
-  return { lmFitMatrix: lmFit.matrix4x4, lmFitRmse };
+  return { lmFitMatrix: lmFit.matrix4x4, lmFitRmse, result: lmFit };
 }
 
 // ── Step 5: solveIcp ────────────────────────────────────────────────

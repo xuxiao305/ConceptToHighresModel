@@ -96,34 +96,35 @@ function bboxDiagonal(positions: Vec3[]): number {
 // ── 2D Joint → 3D Seed Projection ──────────────────────────────────────
 
 /**
- * Project 2D view-local joints to approximate 3D seeds by finding
- * the nearest mesh vertices (in projected 2D space) and averaging
- * their 3D positions.
+ * Project 2D view-local joints to approximate 3D seeds.
+ *
+ * For each joint, collects ALL mesh vertices whose orthographic 2D
+ * projection falls within `searchRadiusWorld` (3D world units) and
+ * averages their 3D positions.  This produces a "body midline" seed
+ * that is stable against front/back sampling bias (unlike top-K).
  *
  * Returns a Map from joint name → 3D seed position, or undefined
- * if the joint is not found or has no nearby vertices.
+ * if the joint has confidence 0 or no vertices are in radius.
  */
 export function jointsToSeeds3D(
   joints: Joint2D[],
   positions: Vec3[],
   camera: OrthoFrontCamera,
+  searchRadiusWorld: number,
   restrictVertices?: Set<number>,
-  kNearest = 3,
 ): Map<string, Vec3> {
   const seeds = new Map<string, Vec3>();
 
   // Project all mesh vertices to 2D image space
   const proj = projectVerticesToImage(positions, camera);
+  const radiusPx = searchRadiusWorld / camera.worldPerPx;
+  const radiusSq = radiusPx * radiusPx;
 
   for (const joint of joints) {
     if (joint.confidence === 0) continue;
 
-    // Find K nearest projected vertices
-    interface Candidate {
-      idx: number;
-      distSq: number;
-    }
-    const candidates: Candidate[] = [];
+    // Collect all vertices within 2D projection radius
+    const inRadius: Vec3[] = [];
 
     for (let i = 0; i < positions.length; i++) {
       if (restrictVertices && !restrictVertices.has(i)) continue;
@@ -132,22 +133,15 @@ export function jointsToSeeds3D(
       if (!isFinite(ui) || !isFinite(vi)) continue;
       const du = ui - joint.x;
       const dv = vi - joint.y;
-      const distSq = du * du + dv * dv;
-
-      // Keep top-K
-      if (candidates.length < kNearest) {
-        candidates.push({ idx: i, distSq });
-        candidates.sort((a, b) => a.distSq - b.distSq);
-      } else if (distSq < candidates[candidates.length - 1].distSq) {
-        candidates[candidates.length - 1] = { idx: i, distSq };
-        candidates.sort((a, b) => a.distSq - b.distSq);
+      if (du * du + dv * dv <= radiusSq) {
+        inRadius.push(positions[i]);
       }
     }
 
-    if (candidates.length === 0) continue;
+    if (inRadius.length === 0) continue;
 
-    // Average the 3D positions of nearest vertices
-    const seedPos = centroid3(candidates.map((c) => positions[c.idx]));
+    // Average the 3D positions of all vertices in radius
+    const seedPos = centroid3(inRadius);
     seeds.set(joint.name, seedPos);
   }
 
@@ -343,7 +337,8 @@ export function buildSkeletonProxy(
   const capsuleRadius = meshDiag * capsuleRadiusFraction;
 
   // Step 1: Project joints → 3D seeds
-  const seeds = jointsToSeeds3D(joints, positions, camera, restrictVertices, 3);
+  const searchRadius = meshDiag * 0.03;  // radius-based collection: all front+back vertices in 2D radius → stable midline centroid
+  const seeds = jointsToSeeds3D(joints, positions, camera, searchRadius, restrictVertices);
 
   // Synthesize virtual midpoint joints that LIMB_SEGMENTS needs but DWPose doesn't output directly.
   // shoulder_center = midpoint(left_shoulder, right_shoulder)

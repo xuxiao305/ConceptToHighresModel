@@ -208,6 +208,10 @@ export function ModelAssemble(props: ModelAssembleProps) {
   const [showSpecialAnchors, setShowSpecialAnchors] = useState(true);
   /** Show pipeline joints (SmartCrop affine-mapped 2D→3D unprojected) on src side. */
   const [showPipelineJointsOverlay, setShowPipelineJointsOverlay] = useState(false);
+  /** Show SAM3 semantic segmentation reprojection overlay on target mesh. */
+  const [showTarSegOverlay, setShowTarSegOverlay] = useState(true);
+  /** World-X offset of the 2D→3D marker plane from meshFrontX (units). */
+  const [pipelineJointOffset, setPipelineJointOffset] = useState(2);
 
   // Stage 8/4: 中央视图模式 与 结果预览子模式。
   type CenterView = 'landmark' | 'result';
@@ -953,7 +957,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
     const cx = cam.width / 2;
     const cy = cam.height / 2;
     const wpp = cam.worldPerPx;
-    const worldX = cam.meshFrontX - 2;
+    const worldX = cam.meshFrontX - pipelineJointOffset;
 
     // Same color scheme as joint seeds for consistency
     const color = (name: string): string => {
@@ -981,7 +985,46 @@ export function ModelAssemble(props: ModelAssembleProps) {
       });
     }
     return markers;
-  }, [showPipelineJointsOverlay, poseProxyState.srcRender, pipelineJoints, srcMesh]);
+  }, [showPipelineJointsOverlay, poseProxyState.srcRender, pipelineJoints, srcMesh, pipelineJointOffset]);
+
+  // ── Pipeline Joints 2D→3D on tar side ────────────────────────────────
+  // Same unprojection logic as pipelineJoint3DMarkers, but through the
+  // SAM3 ortho camera and using the already-scaled tarJoints from step1.
+  const tarPipelineJoint3DMarkers = useMemo(() => {
+    if (!showPipelineJointsOverlay) return undefined;
+    const cam = tarOrthoCamera;
+    const joints = poseProxyState.joints?.tarJoints;
+    if (!cam || !joints || !tarMesh) return undefined;
+
+    const cx = cam.width / 2;
+    const cy = cam.height / 2;
+    const wpp = cam.worldPerPx;
+    const worldX = cam.meshFrontX + pipelineJointOffset;
+
+    const color = (name: string): string => {
+      if (name.includes('neck')) return '#ffffff';
+      if (name.includes('shoulder')) return '#ff7875';
+      if (name.includes('elbow') || name.includes('wrist')) return '#ffa940';
+      if (name.includes('hip')) return '#36cfc9';
+      if (name.includes('knee') || name.includes('ankle')) return '#597ef7';
+      return '#888888';
+    };
+
+    const markers: Array<{ position: Vec3; color: string; size: number; label: string; opacity: number }> = [];
+    for (const j of joints) {
+      if (j.confidence <= 0) continue;
+      const wz = cam.camZ - (j.x - cx) * wpp;
+      const wy = cam.camY + (cy - j.y) * wpp;
+      markers.push({
+        position: [worldX, wy, wz],
+        color: color(j.name),
+        size: 0.02,
+        label: `2D:${j.name}`,
+        opacity: 0.85,
+      });
+    }
+    return markers;
+  }, [showPipelineJointsOverlay, tarOrthoCamera, poseProxyState.joints, tarMesh, pipelineJointOffset]);
 
   // Stage 8/8 + 9: limb-structure + surface + pose-proxy auto runners.
   // tarConstraintVertices comes from SAM3Panel (Stage 9). When the user
@@ -1303,11 +1346,13 @@ export function ModelAssemble(props: ModelAssembleProps) {
         : front.imageSize;
       const srcFrontJoints = pipelineJoints?.front ?? front.joints;
       // Step 1: collectJoints
+      // page1Size must be front.imageSize because tarJointsRaw always
+      // lives in Page1 full-image coordinates (not pipeline split space).
       const joints = collectJoints({
         srcJointsRaw: srcFrontJoints,
         tarJointsRaw: front.joints,
         tarCamera: tarOrthoCamera,
-        page1Size: srcImageSize,
+        page1Size: front.imageSize,
       });
       setPoseProxyState((prev) => ({ ...prev, joints }));
       validateCollectJoints(joints, front, tarOrthoCamera);
@@ -1341,6 +1386,11 @@ export function ModelAssemble(props: ModelAssembleProps) {
         pairs: proxies.pairs,
       });
       setPoseProxyState((prev) => ({ ...prev, svd }));
+      // 立即预览 SVD 结果，方便诊断 SVD vs ICP 各自行为
+      setAlignResult(svd.result);
+      setCenterView('result');
+      setResultView('overlay');
+      pushTrace({ method: 'SVD', rmse: svd.lmFitRmse, meanError: svd.result.meanError, ok: true });
 
       // Step 5: solveIcp
       const icp = solveIcp({
@@ -1420,7 +1470,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
             srcJointsRaw: srcFrontJoints,
             tarJointsRaw: front.joints,
             tarCamera: tarOrthoCamera,
-            page1Size: srcImageSize,
+            page1Size: front.imageSize,
           });
           setPoseProxyState((prev) => ({ ...prev, joints }));
           validateCollectJoints(joints, front, tarOrthoCamera);
@@ -1463,6 +1513,10 @@ export function ModelAssemble(props: ModelAssembleProps) {
             pairs: proxies.pairs,
           });
           setPoseProxyState((prev) => ({ ...prev, svd }));
+          // 立即预览 SVD 结果
+          setAlignResult(svd.result);
+          setCenterView('result');
+          setResultView('overlay');
           onStatusChange?.(`pose-proxy step4 重跑完成 · landmark RMSE=${svd.lmFitRmse.toFixed(4)}`, 'success');
           break;
         }
@@ -1798,6 +1852,28 @@ export function ModelAssemble(props: ModelAssembleProps) {
                 onClick={() => setShowPipelineJointsOverlay((v) => !v)}
                 title="Pipeline Joints — SmartCrop 仿射变换后的 2D joints 反向投影到 3D 前方平面"
               >2D→3D</Button>
+              <input
+                type="range"
+                min={-5}
+                max={5}
+                step={0.2}
+                value={pipelineJointOffset}
+                onChange={(e) => setPipelineJointOffset(Number(e.target.value))}
+                style={{ width: 64, height: 12, cursor: 'pointer' }}
+                title={`2D→3D 偏移: ${pipelineJointOffset} 单位`}
+              />
+              <span style={{ fontSize: 10, color: 'var(--text-muted)', minWidth: 24 }}>{pipelineJointOffset}</span>
+            </>
+          )}
+          {tarReprojRegions && tarReprojRegions.length > 0 && (
+            <>
+              <span style={{ width: 1, height: 16, background: 'var(--border-default)', margin: '0 4px' }} />
+              <Button
+                size="sm"
+                variant={showTarSegOverlay ? 'primary' : 'secondary'}
+                onClick={() => setShowTarSegOverlay((v) => !v)}
+                title="Target 语义分割投影 — SAM3 各区域顶点着色"
+              >Seg</Button>
             </>
           )}
           <div style={{ flex: 1 }} />
@@ -1827,9 +1903,9 @@ export function ModelAssemble(props: ModelAssembleProps) {
               onDeleteTarLandmark={handleDeleteTar}
               onMoveSrcLandmark={handleMoveSrc}
               onMoveTarLandmark={handleMoveTar}
-              tarPointLayers={tarSegpackLayers}
+              tarPointLayers={showTarSegOverlay ? tarSegpackLayers : undefined}
               srcMarkers={[...(anchorMarkers.src ?? []), ...(pipelineJoint3DMarkers ?? [])]}
-              tarMarkers={anchorMarkers.tar}
+              tarMarkers={[...(anchorMarkers.tar ?? []), ...(tarPipelineJoint3DMarkers ?? [])]}
               srcLabel="Source (page2.highres)"
               tarLabel="Target (page1.rough)"
               showCameraSync
