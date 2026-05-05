@@ -53,6 +53,9 @@ export function LandmarkMarker({
   const frameCounter = useRef(0);
   const dragging = useRef(false);
   const controlsWereEnabled = useRef(true);
+  // Cache last camera state to skip occlusion re-test when camera is static.
+  const lastCamPos = useRef(new THREE.Vector3());
+  const lastWorldPos = useRef(new THREE.Vector3());
 
   // Lazy-create a fake mesh to use as the raycast target
   const fakeMesh = useRef<THREE.Mesh | null>(null);
@@ -168,8 +171,14 @@ export function LandmarkMarker({
     raycaster.current.far = distance + 0.001;
     raycaster.current.near = 0;
 
+    const t0 = performance.now();
     const intersects = raycaster.current.intersectObject(fakeMesh.current, false);
+    const rayTime = performance.now() - t0;
     const isOccluded = intersects.length > 0 && intersects[0].distance < distance - 0.001;
+
+    if (rayTime > 1) {
+      performance.mark('lm-occlude');
+    }
 
     if (isOccluded && visible) setVisible(false);
     else if (!isOccluded && !visible) setVisible(true);

@@ -39,9 +39,21 @@ interface HighresGalleryProps {
   onPickSource: (item: HighresGalleryItem) => void;
   /** Filename currently shown as Source mesh, used to mark the active card. */
   currentSrcFile: string | null;
+  /** Set of model IDs currently loaded in the viewport. */
+  loadedModelIds?: Set<string>;
+  /** Called when user clicks + to load a model into the viewport. */
+  onLoadModel?: (item: HighresGalleryItem) => void;
+  /** Called when user clicks − to unload a model from the viewport. */
+  onUnloadModel?: (itemId: string) => void;
 }
 
-export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryProps) {
+export function HighresGallery({
+  onPickSource,
+  currentSrcFile,
+  loadedModelIds,
+  onLoadModel,
+  onUnloadModel,
+}: HighresGalleryProps) {
   const { project, listHistory, loadByName, loadPipelines } = useProject();
   const [items, setItems] = useState<HighresGalleryItem[]>([]);
   const [snapshots, setSnapshots] = useState<Record<string, GallerySnapshot>>({});
@@ -192,19 +204,24 @@ export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryP
           {items.map((v) => {
             const selected = selectedId === v.id;
             const bound = currentSrcFile === v.file;
+            const isLoaded = loadedModelIds?.has(v.id) ?? false;
             const snap = snapshots[v.id];
             return (
               <button
                 key={v.id}
                 onClick={() => setSelectedId(v.id)}
                 onDoubleClick={() => onPickSource(v)}
-                title="单击预览，双击加载到 Source"
+                title={isLoaded ? '已加载到 Viewport · 双击替换 Source' : '单击预览，双击加载到 Source'}
                 style={{
                   flex: '0 0 220px',
                   height: 92,
                   textAlign: 'left',
                   background: selected ? 'var(--bg-elevated)' : 'var(--bg-app)',
-                  border: selected ? '1px solid var(--accent-blue)' : '1px solid var(--border-default)',
+                  border: isLoaded
+                    ? '1px solid var(--accent-green, #5cb85c)'
+                    : selected
+                      ? '1px solid var(--accent-blue)'
+                      : '1px solid var(--border-default)',
                   borderRadius: 4,
                   padding: '6px 8px',
                   color: 'var(--text-primary)',
@@ -219,6 +236,46 @@ export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryP
                 {bound && (
                   <div style={badgeStyle}>SRC</div>
                 )}
+                {/* Load / unload button */}
+                {onLoadModel && onUnloadModel && (
+                  <div style={{ position: 'absolute', top: 4, left: 4, zIndex: 2 }}>
+                    {isLoaded ? (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onUnloadModel(v.id);
+                        }}
+                        title="从 Viewport 卸载"
+                        style={loadBtnStyle}
+                        onMouseEnter={(e) => {
+                          (e.currentTarget as HTMLElement).style.background = 'rgba(255,77,79,0.7)';
+                        }}
+                        onMouseLeave={(e) => {
+                          (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.12)';
+                        }}
+                      >
+                        −
+                      </button>
+                    ) : (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onLoadModel(v);
+                        }}
+                        title="加载到 Viewport"
+                        style={loadBtnStyle}
+                        onMouseEnter={(e) => {
+                          (e.currentTarget as HTMLElement).style.background = 'rgba(92,184,92,0.7)';
+                        }}
+                        onMouseLeave={(e) => {
+                          (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.12)';
+                        }}
+                      >
+                        +
+                      </button>
+                    )}
+                  </div>
+                )}
                 <div style={thumbBoxStyle}>
                   {snap?.status === 'ready' && snap.dataUrl ? (
                     <img src={snap.dataUrl} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
@@ -231,6 +288,9 @@ export function HighresGallery({ onPickSource, currentSrcFile }: HighresGalleryP
                 <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
                   <div style={{ fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                     {v.pipelineName}
+                    {isLoaded && (
+                      <span style={{ fontSize: 9, color: 'var(--accent-green, #5cb85c)', marginLeft: 4 }}>已加载</span>
+                    )}
                   </div>
                   <div style={{ fontSize: 10, color: 'var(--text-muted)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                     {v.file}
@@ -277,4 +337,22 @@ const thumbBoxStyle = {
   overflow: 'hidden',
   color: 'var(--text-muted)',
   fontSize: 10,
+};
+
+const loadBtnStyle: React.CSSProperties = {
+  width: 22,
+  height: 22,
+  borderRadius: 3,
+  border: '1px solid rgba(255,255,255,0.18)',
+  background: 'rgba(255,255,255,0.12)',
+  color: '#ddd',
+  cursor: 'pointer',
+  fontSize: 14,
+  fontWeight: 700,
+  lineHeight: 1,
+  padding: 0,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  transition: 'background 0.15s',
 };

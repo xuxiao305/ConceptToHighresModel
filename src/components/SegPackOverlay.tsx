@@ -89,6 +89,20 @@ export function regionHslCss(idx: number): string {
   return `hsl(${h}, ${s}%, ${l}%)`;
 }
 
+/** 同上，但亮度提高 20%（上限 90%），用于 Page3 视口选中 Region 高亮。 */
+export function regionHslCssBright(idx: number): string {
+  const [h, s, l] = REGION_PALETTE_HSL[idx % REGION_PALETTE_HSL.length];
+  const lBright = Math.min(l + 20, 90);
+  return `hsl(${h}, ${s}%, ${lBright}%)`;
+}
+
+/** 同上，但亮度降低 15%，用于 Page3 视口未选中 Region 暗化。 */
+export function regionHslCssDim(idx: number): string {
+  const [h, s, l] = REGION_PALETTE_HSL[idx % REGION_PALETTE_HSL.length];
+  const lDim = Math.max(l - 15, 8);
+  return `hsl(${h}, ${s}%, ${lDim}%)`;
+}
+
 /**
  * 把 grayscale mask PNG 按 SegPack 的 mask_value → 颜色映射
  * 着色为 RGBA PNG，每个 region 一种颜色，背景透明。

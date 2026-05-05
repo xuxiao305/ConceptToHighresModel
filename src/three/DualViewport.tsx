@@ -6,9 +6,10 @@
  * (antd controls replaced by plain DOM buttons.)
  */
 
-import type { Vec3, Face3, ViewMode } from './types';
+import type { Vec3, Face3, ViewMode, LoadedModel } from './types';
 import type { LandmarkPoint } from './landmarkStore';
 import { MeshViewer } from './MeshViewer';
+import { MultiModelMeshViewer } from './MultiModelMeshViewer';
 import { useCameraSyncStore } from './cameraSyncStore';
 
 interface DualViewportProps {
@@ -18,6 +19,8 @@ interface DualViewportProps {
   tarFaces: Face3[];
   viewMode: ViewMode;
   onViewModeChange: (m: ViewMode) => void;
+  /** Multi-model mode: when provided, source side uses MultiModelMeshViewer. */
+  srcModels?: LoadedModel[];
   srcLandmarks?: LandmarkPoint[];
   tarLandmarks?: LandmarkPoint[];
   onSrcClick?: (
@@ -75,6 +78,7 @@ export function DualViewport({
   tarFaces,
   viewMode,
   onViewModeChange,
+  srcModels,
   srcLandmarks = [],
   tarLandmarks = [],
   onSrcClick,
@@ -150,33 +154,43 @@ export function DualViewport({
 
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
         <div style={{ flex: 1, minWidth: 0, borderRight: '1px solid var(--border-default)' }}>
-          <MeshViewer
-            role="source"
-            vertices={srcVertices}
-            faces={srcFaces}
-            color="#4a90d9"
-            viewMode={viewMode}
-            updatedVertices={srcUpdatedVertices}
-            landmarks={srcLandmarks}
-            landmarkColor="#ff4d4f"
-            selectedLandmarkIndex={selectedSrcLandmarkIndex}
-            onLandmarkSelect={onSelectSrcLandmark}
-            onLandmarkDelete={onDeleteSrcLandmark}
-            onLandmarkMove={onMoveSrcLandmark}
-            onMeshClick={onSrcClick}
-            pickingEnabled={srcPickingEnabled ?? pickingEnabled}
-            height="100%"
-            label={srcLabel}
-            cameraSyncId={cameraSyncEnabled ? 'source' : undefined}
-            landmarkScreenFraction={landmarkScreenFraction}
-            showViewModeToggle={false}
-            highlightVertices={srcHighlightVertices}
-            highlightColor={srcHighlightColor}
-            candidateVertices={srcCandidateVertices}
-            candidateColor={srcCandidateColor}
-            pointLayers={srcPointLayers}
-            markers={srcMarkers}
-          />
+          {srcModels && srcModels.length > 0 ? (
+            <MultiModelMeshViewer
+              models={srcModels}
+              viewMode={viewMode}
+              height="100%"
+              label={srcLabel}
+              onViewModeChange={onViewModeChange}
+            />
+          ) : (
+            <MeshViewer
+              role="source"
+              vertices={srcVertices}
+              faces={srcFaces}
+              color="#4a90d9"
+              viewMode={viewMode}
+              updatedVertices={srcUpdatedVertices}
+              landmarks={srcLandmarks}
+              landmarkColor="#ff4d4f"
+              selectedLandmarkIndex={selectedSrcLandmarkIndex}
+              onLandmarkSelect={onSelectSrcLandmark}
+              onLandmarkDelete={onDeleteSrcLandmark}
+              onLandmarkMove={onMoveSrcLandmark}
+              onMeshClick={onSrcClick}
+              pickingEnabled={srcPickingEnabled ?? pickingEnabled}
+              height="100%"
+              label={srcLabel}
+              cameraSyncId={cameraSyncEnabled ? 'source' : undefined}
+              landmarkScreenFraction={landmarkScreenFraction}
+              showViewModeToggle={false}
+              highlightVertices={srcHighlightVertices}
+              highlightColor={srcHighlightColor}
+              candidateVertices={srcCandidateVertices}
+              candidateColor={srcCandidateColor}
+              pointLayers={srcPointLayers}
+              markers={srcMarkers}
+            />
+          )}
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <MeshViewer

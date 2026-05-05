@@ -98,13 +98,15 @@ import {
   type ViewMode,
   type MeshRegion,
   type OrthoFrontCamera,
+  type LoadedModel,
 } from '../../three';
 import { alignSourceMeshByLandmarks, type AlignmentResult } from '../../three/alignment';
 import { runLimbStructure, runSurface, runPoseProxy } from '../../services/alignStrategies/runners';
 import { SAM3Panel } from './SAM3Panel';
 import { TargetGallery, type TargetGalleryItem, type TargetKind } from './TargetGallery';
 import { HighresGallery, type HighresGalleryItem } from './HighresGallery';
-import { regionHslCss } from '../../components/SegPackOverlay';
+import { LoadedModelList } from './LoadedModelList';
+import { regionHslCss, regionHslCssBright, regionHslCssDim } from '../../components/SegPackOverlay';
 import type { Joint2D } from '../../types/joints';
 import { transformJointsBySmartCrop } from '../../services/dwpose';
 import {
@@ -251,6 +253,10 @@ export function ModelAssemble(props: ModelAssembleProps) {
   const [tarMesh, setTarMesh] = useState<MeshData | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('solid');
   const [meshLoadError, setMeshLoadError] = useState<string | null>(null);
+  // Phase 1e: multi-model source viewport state
+  const [srcModels, setSrcModels] = useState<LoadedModel[]>([]);
+  const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
+  const loadedModelIds = useMemo(() => new Set(srcModels.map((m) => m.id)), [srcModels]);
   /** Per-view jacket-only joints (SmartCrop-mapped from Page1 global joints).
    *  null = not yet resolved / no pipeline info / fallback to full-body. */
   const [pipelineJoints, setPipelineJoints] = useState<Record<string, Joint2D[]> | null>(null);
@@ -553,6 +559,62 @@ export function ModelAssemble(props: ModelAssembleProps) {
     [project, saveAsset, onStatusChange, refreshAssets],
   );
 
+  // Phase 1e: multi-model load/unload/select handlers
+  const MODEL_COLORS = ['#4a90d9', '#d9734a', '#5cb85c', '#e8b740', '#b37feb', '#eb7f9a', '#36cfc9', '#ff85c0'];
+  const handleLoadModel = useCallback(
+    async (item: HighresGalleryItem) => {
+      if (!project) return;
+      try {
+        const loaded = await loadByName('page2.highres', item.file);
+        if (!loaded) { onStatusChange?.(`未找到模型文件: ${item.file}`, 'error'); return; }
+        const { vertices, faces } = await loadGlbAsMesh(loaded.url);
+        URL.revokeObjectURL(loaded.url);
+        const colorIdx = srcModels.length % MODEL_COLORS.length;
+        const newModel: LoadedModel = {
+          id: item.id,
+          label: `${item.pipelineName}`,
+          vertices,
+          faces,
+          color: MODEL_COLORS[colorIdx],
+          userTransform: { position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
+          selected: true,
+        };
+        setSrcModels((prev) => {
+          // Deselect all existing, select the new one
+          const deselected = prev.map((m) => ({ ...m, selected: false }));
+          return [...deselected, newModel];
+        });
+        setSelectedModelId(newModel.id);
+        onStatusChange?.(`已加载到 Viewport: ${item.pipelineName}`, 'success');
+      } catch (err) {
+        onStatusChange?.(`加载失败: ${err instanceof Error ? err.message : String(err)}`, 'error');
+      }
+    },
+    [project, loadByName, srcModels.length, onStatusChange],
+  );
+  const handleUnloadModel = useCallback(
+    (modelId: string) => {
+      setSrcModels((prev) => {
+        const next = prev.filter((m) => m.id !== modelId);
+        if (selectedModelId === modelId) {
+          setSelectedModelId(next.length > 0 ? next[0].id : null);
+        }
+        return next;
+      });
+    },
+    [selectedModelId],
+  );
+  const handleSelectModel = useCallback(
+    (modelId: string) => {
+      setSelectedModelId((prev) => (prev === modelId ? null : modelId));
+      // Update selected state on the models
+      setSrcModels((prev) =>
+        prev.map((m) => ({ ...m, selected: m.id === modelId && m.id !== selectedModelId })),
+      );
+    },
+    [selectedModelId],
+  );
+
   // Stage 11: manual SegPack file upload (json + mask + optional ref). Mirrors
   // V1 handleLoadSegPackFiles. Writes through savePage3SegPack so V2 reads it
   // identically to a SegFormer-produced pack.
@@ -832,18 +894,27 @@ export function ModelAssemble(props: ModelAssembleProps) {
 
   // SegPack 反投影区域 → DualViewport tar 分层点云，调用 Page1 SegPackOverlay 同一个
   // 调色板函数 regionHslCss，保证与 Page1 预览颜色逐个对应。
+  // 当 tarRegionLabel 选中某个区域时：该区域亮色高亮，其他区域亮度下调 50%。
   const tarSegpackLayers = useMemo(() => {
     if (!tarReprojRegions || tarReprojRegions.length === 0) return undefined;
+    const hasSelection = tarRegionLabel != null;
     const layers = tarReprojRegions
       .filter((r) => r.vertices.length > 0)
-      .map((r) => ({
-        indices: r.vertices,
-        color: regionHslCss(r.regionIndex),
-        size: 9,
-        opacity: 0.95,
-      }));
+      .map((r) => {
+        const isSelected = hasSelection && r.label === tarRegionLabel;
+        return {
+          indices: r.vertices,
+          color: isSelected
+            ? regionHslCssBright(r.regionIndex)
+            : hasSelection
+              ? regionHslCssDim(r.regionIndex)
+              : regionHslCss(r.regionIndex),
+          size: 9,
+          opacity: isSelected ? 1.0 : hasSelection ? 0.7 : 0.85,
+        };
+      });
     return layers.length > 0 ? layers : undefined;
-  }, [tarReprojRegions]);
+  }, [tarReprojRegions, tarRegionLabel]);
 
   // ── Pose-proxy step 3 可视化：anchor / shoulder_line / torso_axis ─────
   // 把 PCA 算出的代理 anchor 作为彩色小球叠加在 src/tar mesh 上，方便
@@ -1882,11 +1953,20 @@ export function ModelAssemble(props: ModelAssembleProps) {
           </span>
         </div>
 
-        <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
-          {srcMesh && tarMesh && centerView === 'landmark' && (
+        <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
+          {srcModels.length > 0 && (
+            <LoadedModelList
+              models={srcModels}
+              selectedModelId={selectedModelId}
+              onSelect={handleSelectModel}
+              onRemove={handleUnloadModel}
+            />
+          )}
+          <div style={{ flex: 1, minWidth: 0, position: 'relative' }}>
+          {(srcMesh || srcModels.length > 0) && tarMesh && centerView === 'landmark' && (
             <DualViewport
-              srcVertices={srcMesh.vertices}
-              srcFaces={srcMesh.faces}
+              srcVertices={srcMesh?.vertices ?? []}
+              srcFaces={srcMesh?.faces ?? []}
               tarVertices={tarMesh.vertices}
               tarFaces={tarMesh.faces}
               viewMode={viewMode}
@@ -1910,6 +1990,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
               tarLabel="Target (page1.rough)"
               showCameraSync
               height="100%"
+              srcModels={srcModels.length > 0 ? srcModels : undefined}
             />
           )}
           {srcMesh && tarMesh && centerView === 'result' && alignResult && (
@@ -1921,7 +2002,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
               resultView={resultView}
             />
           )}
-          {(!srcMesh || !tarMesh) && (
+          {((!srcMesh && srcModels.length === 0) || !tarMesh) && (
             <div
               style={{
                 position: 'absolute',
@@ -1950,6 +2031,7 @@ export function ModelAssemble(props: ModelAssembleProps) {
               </div>
             </div>
           )}
+          </div>
         </div>
       </main>
 
@@ -2211,6 +2293,9 @@ export function ModelAssemble(props: ModelAssembleProps) {
                 onStatusChange?.(`Mesh Gallery → Source: ${item.pipelineName} · ${item.file}`, 'info');
                 refreshAssets();
               }}
+              loadedModelIds={loadedModelIds}
+              onLoadModel={handleLoadModel}
+              onUnloadModel={handleUnloadModel}
             />
           </div>
           {/* Target 侧：Page1 Clothed / NoJacket。双击切换 tarKind + 联动 SegPack。 */}

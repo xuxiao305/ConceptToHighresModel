@@ -7,13 +7,15 @@
  * zustand) match D:/AI/Prototypes/WrapDeformation for parity.
  */
 
-export type { Vec3, Face3, ViewMode, MeshRole, MeshInfo, MeshAdjacency, MeshRegion, RegionGrowOptions, VertexDescriptor, LandmarkCandidate } from './types';
+export type { Vec3, Face3, ViewMode, MeshRole, MeshInfo, MeshAdjacency, MeshRegion, RegionGrowOptions, VertexDescriptor, LandmarkCandidate, UserTransform, LoadedModel } from './types';
 export type { LandmarkPoint } from './landmarkStore';
 export type { CameraState } from './cameraSyncStore';
 export type { LoadedMesh, LoadedGlb } from './glbLoader';
 
 export { MeshViewer } from './MeshViewer';
 export type { MeshViewerProps } from './MeshViewer';
+export { MultiModelMeshViewer } from './MultiModelMeshViewer';
+export type { MultiModelMeshViewerProps } from './MultiModelMeshViewer';
 export { DualViewport } from './DualViewport';
 export { LandmarkMarker } from './LandmarkMarker';
 export { TexturedSceneViewer } from './TexturedSceneViewer';

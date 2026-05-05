@@ -5,6 +5,8 @@
  * so future Fast_RNRR backend integration can land without type churn.
  */
 
+import type * as THREE from 'three';
+
 /** 3D vertex as [x, y, z] */
 export type Vec3 = [number, number, number];
 
@@ -12,10 +14,44 @@ export type Vec3 = [number, number, number];
 export type Face3 = [number, number, number];
 
 /** View modes for mesh rendering */
-export type ViewMode = 'solid' | 'wireframe' | 'solid+wireframe';
+export type ViewMode = 'solid' | 'wireframe' | 'solid+wireframe' | 'textured';
 
 /** Mesh role — affects dynamic vertex update behavior */
 export type MeshRole = 'source' | 'target' | 'result';
+
+/** Per-model user-applied transform (position / rotation / scale). */
+export interface UserTransform {
+  position: Vec3;
+  rotation: Vec3;   // Euler angles in radians [x, y, z]
+  scale: Vec3;
+}
+
+/**
+ * A single model loaded into the Source Viewport.
+ *
+ * Supports both geometry-mode (vertices + faces) and textured-mode
+ * (glbScene with original PBR materials).  userTransform is applied
+ * on top of any baked-in mesh transform.
+ */
+export interface LoadedModel {
+  /** Unique ID within the viewport (e.g. pipelineKey:file). */
+  id: string;
+  /** Display label shown in the model list. */
+  label: string;
+  /** Geometry data (always available — extracted from GLB). */
+  vertices: Vec3[];
+  faces: Face3[];
+  /** Mesh color in geometry mode (default per-model, e.g. from palette). */
+  color: string;
+  /** Original GLTF scene (with PBR materials/textures) — for textured mode. */
+  glbScene?: THREE.Object3D;
+  /** Bounding box of the original scene (for textured-mode camera fit). */
+  glbBbox?: { min: Vec3; max: Vec3 };
+  /** User-applied interactive transform. */
+  userTransform: UserTransform;
+  /** Whether this model is currently selected (highlighted). */
+  selected: boolean;
+}
 
 /** Bounding-box info parsed from GLB or computed from vertices */
 export interface MeshInfo {

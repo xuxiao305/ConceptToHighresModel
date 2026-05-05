@@ -54,6 +54,8 @@ interface MeshObjectProps {
   ) => void;
   /** Expose the BufferGeometry so LandmarkMarker can do occlusion tests. */
   onGeometryReady?: (geo: THREE.BufferGeometry) => void;
+  /** Lightweight mode: uses FrontSide BasicMaterial, no shadows. For overlay meshes. */
+  lightweight?: boolean;
 }
 
 function MeshObject({
@@ -65,6 +67,7 @@ function MeshObject({
   updatedVertices,
   onMeshClick,
   onGeometryReady,
+  lightweight = false,
 }: MeshObjectProps) {
   const meshRef = useRef<THREE.Mesh>(null);
   const downPos = useRef<{ x: number; y: number } | null>(null);
@@ -76,6 +79,7 @@ function MeshObject({
   } | null>(null);
 
   const geometry = useMemo(() => {
+    performance.mark('MeshObject:geometry:start');
     const geo = new THREE.BufferGeometry();
     const positions = new Float32Array(vertices.length * 3);
     for (let i = 0; i < vertices.length; i++) {
@@ -92,6 +96,8 @@ function MeshObject({
     geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geo.setIndex(new THREE.BufferAttribute(indices, 1));
     geo.computeVertexNormals();
+    performance.mark('MeshObject:geometry:end');
+    performance.measure('[perf] MeshObject:geometry', 'MeshObject:geometry:start', 'MeshObject:geometry:end');
     return geo;
   }, [vertices, faces]);
 
@@ -179,17 +185,27 @@ function MeshObject({
           geometry={geometry}
           onPointerDown={handlePointerDown}
           onPointerUp={handlePointerUp}
-          castShadow
-          receiveShadow
+          castShadow={!lightweight}
+          receiveShadow={!lightweight}
         >
-          <meshStandardMaterial
-            color={color}
-            side={THREE.DoubleSide}
-            transparent={viewMode === 'solid+wireframe'}
-            opacity={viewMode === 'solid+wireframe' ? 0.7 : 1}
-            roughness={0.5}
-            metalness={0.1}
-          />
+          {lightweight ? (
+            <meshBasicMaterial
+              color={color}
+              side={THREE.FrontSide}
+              transparent
+              opacity={0.85}
+              depthWrite={false}
+            />
+          ) : (
+            <meshStandardMaterial
+              color={color}
+              side={THREE.DoubleSide}
+              transparent={viewMode === 'solid+wireframe'}
+              opacity={viewMode === 'solid+wireframe' ? 0.7 : 1}
+              roughness={0.5}
+              metalness={0.1}
+            />
+          )}
         </mesh>
       )}
       {showWireframe && (
@@ -532,15 +548,23 @@ export function MeshViewer({
   // Compute ground-lift offset so the lowest point sits on y=0.
   // Recomputes when source vertices change; ignores per-frame updatedVertices
   // to avoid jittery shifts during streaming deformation.
-  const groundOffsetY = (() => {
-    if (!placeOnGround || vertices.length === 0) return 0;
+  const groundOffsetY = useMemo(() => {
+    performance.mark('groundOffsetY:start');
+    if (!placeOnGround || vertices.length === 0) {
+      performance.mark('groundOffsetY:end');
+      performance.measure('[perf] groundOffsetY', 'groundOffsetY:start', 'groundOffsetY:end');
+      return 0;
+    }
     let minY = Infinity;
     for (const v of vertices) if (v[1] < minY) minY = v[1];
     if (overlayVertices) {
       for (const v of overlayVertices) if (v[1] < minY) minY = v[1];
     }
-    return Number.isFinite(minY) ? -minY : 0;
-  })();
+    const result = Number.isFinite(minY) ? -minY : 0;
+    performance.mark('groundOffsetY:end');
+    performance.measure('[perf] groundOffsetY', 'groundOffsetY:start', 'groundOffsetY:end');
+    return result;
+  }, [placeOnGround, vertices, overlayVertices]);
 
   if (vertices.length === 0) {
     return (
@@ -614,6 +638,7 @@ export function MeshViewer({
               faces={overlayFaces}
               color={overlayColor}
               viewMode="solid"
+              lightweight
             />
           )}
 
@@ -768,11 +793,13 @@ function ViewModeButton({
     solid: 'wireframe',
     wireframe: 'solid+wireframe',
     'solid+wireframe': 'solid',
+    textured: 'solid',
   };
   const label: Record<ViewMode, string> = {
     solid: '实体',
     wireframe: '线框',
     'solid+wireframe': '实体+线框',
+    textured: '纹理',
   };
   return (
     <IconBtn

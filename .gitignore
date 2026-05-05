@@ -16,6 +16,13 @@ tripo_test_*.glb
 # 测试产物 / 临时图
 Data/trellis2_test/
 Data/multiview_test_*.png
+Data/segformer_test/
+Data/segformer_smoke/
+Data/segformer_test_screenshot_*/
+Data/Screenshot *.png
+
+# 根目录测试页面
+test_*.html
 
 
 # SAM3 / 反投影测试数据
@@ -26,6 +33,7 @@ scripts/_*.py
 scripts/dl_model.py
 scripts/fix_*.py
 scripts/test_*.py
+scripts/test_*.mjs
 scripts/*.ps1
 
 # 临时调试输出
