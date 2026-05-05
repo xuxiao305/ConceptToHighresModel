@@ -73,6 +73,17 @@ export default defineConfig(({ mode }) => {
   const DWPOSE_POSE_MODEL =
     env.VITE_DWPOSE_POSE_MODEL ?? 'D:\\AI\\Prototypes\\DWPose\\models\\dw-ll_ucoco_384.onnx';
 
+  // SkinTokens / TokenRig — 3D Model Rigging (D:\\AI\\Prototypes\\SkinTokens).
+  // Uses the SkinTokens project's own venv (Python 3.11 + torch + transformers)
+  // for GPU-accelerated autoregressive skeleton + skinning-weight generation.
+  const SKINTOKENS_PYTHON =
+    env.VITE_SKINTOKENS_PYTHON ?? 'D:\\AI\\Prototypes\\SkinTokens\\.venv\\Scripts\\python.exe';
+  const SKINTOKENS_WORKER =
+    env.VITE_SKINTOKENS_WORKER ?? 'D:\\AI\\Prototypes\\SkinTokens\\rig_worker.py';
+  const SKINTOKENS_CKPT =
+    env.VITE_SKINTOKENS_CKPT ??
+    'experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt';
+
   return {
     plugins: [
       react(),
@@ -89,6 +100,11 @@ export default defineConfig(({ mode }) => {
         worker: DWPOSE_WORKER,
         detectorModel: DWPOSE_DETECTOR,
         poseModel: DWPOSE_POSE_MODEL,
+      }),
+      skintokensPlugin({
+        python: SKINTOKENS_PYTHON,
+        worker: SKINTOKENS_WORKER,
+        modelCkpt: SKINTOKENS_CKPT,
       }),
     ],
     // Allow the test_align_e2e.html page to be served as a second entry.
@@ -167,6 +183,216 @@ export default defineConfig(({ mode }) => {
     },
   };
 });
+
+// ============================================================================
+// SkinTokens / TokenRig bridge plugin
+// ============================================================================
+//
+// Exposes a single dev-server endpoint:
+//
+//   POST /api/skintokens
+//     Content-Type: application/json
+//     Body: {
+//       glbBase64: "data:application/octet-stream;base64,...",
+//       params: {
+//         topK?: number,           // default 5
+//         topP?: number,           // default 0.95
+//         temperature?: number,    // default 1.0
+//         repetitionPenalty?: number,  // default 2.0
+//         numBeams?: number,       // default 10
+//         useSkeleton?: boolean,   // default false
+//         usePostprocess?: boolean,// default true
+//       }
+//     }
+//
+//     Spawns rig_worker.py in the SkinTokens project's own venv (CUDA GPU).
+//     The worker starts an internal bpy_server for mesh I/O, loads the
+//     TokenRig model, runs autoregressive skeleton + skinning inference,
+//     exports the rigged GLB, and prints a JSON result line to stdout.
+//
+//     Response shape:
+//       { ok: true,  glbBase64: "data:model/gltf-binary;base64,..." }
+//       { ok: false, error: <string> }
+//
+//     First invocation: ~3-5 min (model load + inference).
+//     Subsequent invocations: ~30-90s (model stays loaded in the worker).
+//
+interface SkintokensPluginOptions {
+  python: string;
+  worker: string;
+  modelCkpt: string;
+}
+
+function skintokensPlugin(opts: SkintokensPluginOptions): Plugin {
+  return {
+    name: 'skintokens-bridge',
+    apply: 'serve',
+    configureServer(server) {
+      server.middlewares.use('/api/skintokens', async (req, res, next) => {
+        if (req.method !== 'POST') return next();
+
+        const sendJson = (status: number, body: unknown) => {
+          res.statusCode = status;
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          res.end(JSON.stringify(body));
+        };
+
+        // ── 1. Parse JSON body ───────────────────────────────────────
+        let body = '';
+        try {
+          for await (const chunk of req) body += chunk;
+        } catch (err) {
+          return sendJson(400, { ok: false, error: `读取请求体失败：${(err as Error).message}` });
+        }
+
+        let parsed: {
+          glbBase64?: string;
+          params?: {
+            topK?: number;
+            topP?: number;
+            temperature?: number;
+            repetitionPenalty?: number;
+            numBeams?: number;
+            useSkeleton?: boolean;
+            usePostprocess?: boolean;
+          };
+        };
+        try {
+          parsed = JSON.parse(body);
+          if (!parsed.glbBase64) throw new Error('缺少 glbBase64 字段');
+        } catch (err) {
+          return sendJson(400, { ok: false, error: `请求体不合法：${(err as Error).message}` });
+        }
+
+        const m = /^data:[^;]+;base64,(.+)$/.exec(parsed.glbBase64!);
+        const pureB64 = m ? m[1] : parsed.glbBase64!;
+        const params = parsed.params ?? {};
+
+        // ── 2. Write input GLB to temp dir ────────────────────────────
+        const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'skintokens-bridge-'));
+        const inputPath = path.join(tmpDir, 'in.glb');
+        const outputPath = path.join(tmpDir, 'out.glb');
+
+        try {
+          await fs.writeFile(inputPath, Buffer.from(pureB64, 'base64'));
+
+          // ── 3. Spawn rig_worker.py ─────────────────────────────────
+          // The worker runs from the SkinTokens project root so that
+          // relative imports (from src.xxx) resolve correctly.
+          const workerDir = path.dirname(opts.worker);
+          const args = [
+            opts.worker,
+            '--input', inputPath,
+            '--output', outputPath,
+            '--model_ckpt', opts.modelCkpt,
+            '--top_k', String(params.topK ?? 5),
+            '--top_p', String(params.topP ?? 0.95),
+            '--temperature', String(params.temperature ?? 1.0),
+            '--repetition_penalty', String(params.repetitionPenalty ?? 2.0),
+            '--num_beams', String(params.numBeams ?? 10),
+          ];
+          if (params.useSkeleton) args.push('--use_skeleton');
+          if (params.usePostprocess !== false) args.push('--use_postprocess');
+
+          // eslint-disable-next-line no-console
+          console.log('[skintokens-bridge] spawn:', opts.python, args.join(' '));
+
+          const child = spawn(opts.python, args, {
+            cwd: workerDir,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+          });
+
+          let stderr = '';
+          let stdout = '';
+          child.stderr.on('data', (d) => {
+            const text = d.toString();
+            stderr += text;
+            process.stderr.write(`[skintokens-bridge] ${text}`);
+          });
+          child.stdout.on('data', (d) => {
+            const text = d.toString();
+            stdout += text;
+            process.stdout.write(`[skintokens-bridge] ${text}`);
+          });
+
+          // First run: model load (~2-3 min) + inference (~1 min).
+          // Set a generous 15-minute timeout.
+          const exitCode: number = await new Promise((resolve) => {
+            const timer = setTimeout(() => {
+              child.kill();
+              resolve(-2);
+            }, 900_000); // 15 min
+            child.on('exit', (code) => {
+              clearTimeout(timer);
+              resolve(code ?? -1);
+            });
+            child.on('error', () => {
+              clearTimeout(timer);
+              resolve(-1);
+            });
+          });
+
+          if (exitCode === -2) {
+            return sendJson(500, {
+              ok: false,
+              error: 'SkinTokens 进程超时（15 分钟无响应）',
+            });
+          }
+
+          if (exitCode !== 0) {
+            return sendJson(500, {
+              ok: false,
+              error: `SkinTokens 进程退出码 ${exitCode}\n${stderr.slice(-3000)}`,
+            });
+          }
+
+          // ── 4. Parse stdout for the JSON result line ───────────────
+          const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
+          const lastLine = lines[lines.length - 1];
+          let workerResult: { ok: boolean; output?: string; error?: string };
+          try {
+            workerResult = JSON.parse(lastLine);
+          } catch {
+            return sendJson(500, {
+              ok: false,
+              error: `无法解析 worker stdout：${lastLine.slice(-500)}`,
+            });
+          }
+
+          if (!workerResult.ok || !workerResult.output) {
+            return sendJson(500, {
+              ok: false,
+              error: workerResult.error ?? 'Worker 返回失败但未提供错误信息',
+            });
+          }
+
+          // ── 5. Read output GLB and return as base64 ────────────────
+          let outExists = true;
+          try { await fs.access(outputPath); } catch { outExists = false; }
+          if (!outExists) {
+            return sendJson(500, {
+              ok: false,
+              error: `SkinTokens 未产生输出文件：${outputPath}`,
+            });
+          }
+
+          const outBuf = await fs.readFile(outputPath);
+          const glbBase64 = `data:model/gltf-binary;base64,${outBuf.toString('base64')}`;
+
+          return sendJson(200, { ok: true, glbBase64 });
+        } catch (err) {
+          return sendJson(500, {
+            ok: false,
+            error: `SkinTokens 桥接异常：${(err as Error).message}`,
+          });
+        } finally {
+          fs.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
+        }
+      });
+    },
+  };
+}
 
 // ============================================================================
 // DWPose bridge plugin

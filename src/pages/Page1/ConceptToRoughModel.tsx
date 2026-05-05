@@ -28,6 +28,10 @@ import {
 import { splitMultiView } from '../../services/multiviewSplit';
 import { detectAndConvertToGlobalJoints, globalJointsToPage1Views } from '../../services/dwpose';
 import type { Page1JointsMeta, Page1SplitsMeta, ViewName } from '../../types/joints';
+import {
+  runSkinTokensRigging,
+  SKINTOKENS_DEFAULTS,
+} from '../../services/skintokens';
 import { extractWithPrompt, REMOVE_JACKET_PROMPT, type SAM3ExportJson } from '../../services/extraction';
 import { useProject } from '../../contexts/ProjectContext';
 import type { AssetVersion } from '../../services/projectStore';
@@ -146,6 +150,9 @@ interface NodeOutputs {
   /** 3D Model (NoJacket) — 去外套版 GLB blob URL */
   roughNojacketUrl: string | null;
   roughNojacketFile: string | null;
+  /** Rigging (SkinTokens) — 骨骼绑定 GLB blob URL */
+  riggingUrl: string | null;
+  riggingFile: string | null;
   errors: Record<number, string>;
 }
 
@@ -173,10 +180,13 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     segpackNojacketPack: null,
     roughNojacketUrl: null,
     roughNojacketFile: null,
+    riggingUrl: null,
+    riggingFile: null,
     errors: {},
   });
   const roughAbortRef = useRef<AbortController | null>(null);
   const roughNojacketAbortRef = useRef<AbortController | null>(null);
+  const riggingAbortRef = useRef<AbortController | null>(null);
 
   // 3D Model 后端选择 + 各后端参数（持久化到 localStorage）
   const [roughBackend, setRoughBackend] = useState<RoughBackend>(loadRoughBackend);
@@ -286,6 +296,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       const segpackClothed = await loadPage1SegPack('clothed');
       const segpackNojacket = await loadPage1SegPack('nojacket');
       const roughNojacket = await loadLatest('page1.rough.nojacket');
+      const rigging = await loadLatest('page1.rigging');
       if (cancelled) return;
 
       // SegPack 节点 source 缩略图：
@@ -351,6 +362,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         if (prev.segpackNojacketUrl) URL.revokeObjectURL(prev.segpackNojacketUrl);
         if (prev.segpackNojacketMaskUrl) URL.revokeObjectURL(prev.segpackNojacketMaskUrl);
         if (prev.roughNojacketUrl) URL.revokeObjectURL(prev.roughNojacketUrl);
+        if (prev.riggingUrl) URL.revokeObjectURL(prev.riggingUrl);
         return {
           conceptFile,
           conceptUrl: concept?.url ?? null,
@@ -370,6 +382,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           segpackNojacketPack: segpackNojacketPack,
           roughNojacketUrl: roughNojacket?.url ?? null,
           roughNojacketFile: roughNojacket?.version.file ?? null,
+          riggingUrl: rigging?.url ?? null,
+          riggingFile: rigging?.version.file ?? null,
           errors: {},
         };
       });
@@ -391,6 +405,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         else if (extraction) next[7] = 'ready';
         if (roughNojacket) next[8] = 'complete';
         else if (extraction) next[8] = 'ready';
+        if (rigging) next[4] = 'complete';
+        else if (rough) next[4] = 'ready';
         return next;
       });
 
@@ -403,6 +419,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (segpackClothed) loaded.push('SegPack(Clothed)');
       if (segpackNojacket) loaded.push('SegPack(NoJacket)');
       if (roughNojacket) loaded.push('3D Model(NoJacket)');
+      if (rigging) loaded.push('Rigging');
       onStatusChange(
         loaded.length
           ? `已从工程加载：${loaded.join(' / ')}`
@@ -420,6 +437,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (rough) sel[3] = rough.version.file;
       if (extraction) sel[6] = extraction.version.file;
       if (roughNojacket) sel[8] = roughNojacket.version.file;
+      if (rigging) sel[4] = rigging.version.file;
       setSelectedFiles(sel);
     })().catch((err) => {
       if (cancelled) return;
@@ -453,6 +471,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (prev.extractionUrl) URL.revokeObjectURL(prev.extractionUrl);
       if (prev.segpackClothedUrl) URL.revokeObjectURL(prev.segpackClothedUrl);
       if (prev.segpackClothedMaskUrl) URL.revokeObjectURL(prev.segpackClothedMaskUrl);
+      if (prev.riggingUrl) URL.revokeObjectURL(prev.riggingUrl);
       return {
         conceptFile: file,
         conceptUrl: URL.createObjectURL(file),
@@ -472,6 +491,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         segpackNojacketPack: null,
         roughNojacketUrl: null,
         roughNojacketFile: null,
+        riggingUrl: null,
+        riggingFile: null,
         errors: {},
       };
     });
@@ -512,6 +533,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (prev.segpackNojacketUrl) URL.revokeObjectURL(prev.segpackNojacketUrl);
       if (prev.segpackNojacketMaskUrl) URL.revokeObjectURL(prev.segpackNojacketMaskUrl);
       if (prev.roughNojacketUrl) URL.revokeObjectURL(prev.roughNojacketUrl);
+      if (prev.riggingUrl) URL.revokeObjectURL(prev.riggingUrl);
       return {
         conceptFile: null,
         conceptUrl: null,
@@ -531,6 +553,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         segpackNojacketPack: null,
         roughNojacketUrl: null,
         roughNojacketFile: null,
+        riggingUrl: null,
+        riggingFile: null,
         errors: {},
       };
     });
@@ -564,10 +588,12 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         for (let i = 3; i < next.length; i++) next[i] = 'idle';
         return next;
       });
-      // Also clear stale multi-view output
+      // Also clear stale outputs downstream
       setOutputs((prev) => {
         if (prev.multiviewUrl) URL.revokeObjectURL(prev.multiviewUrl);
-        return { ...prev, multiviewUrl: null };
+        if (prev.roughUrl) URL.revokeObjectURL(prev.roughUrl);
+        if (prev.riggingUrl) URL.revokeObjectURL(prev.riggingUrl);
+        return { ...prev, multiviewUrl: null, roughUrl: null, roughFile: null, riggingUrl: null, riggingFile: null };
       });
       onStatusChange('T Pose 生成完成', 'success');
 
@@ -1610,30 +1636,72 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
     }
   }, [onStatusChange, setNodeState, project, saveAsset, refreshHistory, loadLatestSegments, roughBackend, trellis2Mode, trellis2Params]);
 
-  // ---- Mock runner for nodes 3..4 (3D Model / Rigging) -----------------
-  const runMockNode = useCallback(
-    (idx: number): Promise<boolean> => {
-      setNodeState(idx, 'running');
-      onStatusChange(`正在运行：${NODES[idx].title}（mock）`, 'info');
-      return new Promise<boolean>((resolve) => {
-        window.setTimeout(() => {
-          setStates((prev) => {
-            const next = [...prev];
-            next[idx] = 'complete';
-            if (idx + 1 < next.length && next[idx + 1] === 'idle') {
-              next[idx + 1] = 'ready';
-            }
-            return next;
-          });
-          onStatusChange(`${NODES[idx].title} 已完成（mock）`, 'success');
-          resolve(true);
-        }, 2000);
+  // ---- Rigging node (SkinTokens / TokenRig via subprocess) -------------
+  const runRigging = useCallback(async (): Promise<boolean> => {
+    const roughUrl = outputsRef.current.roughUrl;
+    if (!roughUrl) {
+      onStatusChange('请先生成 3D Model', 'error');
+      return false;
+    }
+    const controller = new AbortController();
+    riggingAbortRef.current = controller;
+    setNodeState(4, 'running');
+    setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 4: '' } }));
+    onStatusChange('正在骨骼绑定…', 'info');
+    try {
+      const glbResp = await fetch(roughUrl, { signal: controller.signal });
+      if (!glbResp.ok) throw new Error(`获取 3D Model 失败：HTTP ${glbResp.status}`);
+      const glbBlob = await glbResp.blob();
+      const result = await runSkinTokensRigging(glbBlob, SKINTOKENS_DEFAULTS);
+      setOutputs((prev) => {
+        if (prev.riggingUrl) URL.revokeObjectURL(prev.riggingUrl);
+        return { ...prev, riggingUrl: result.glbUrl, riggingFile: 'rigged_model.glb' };
       });
-    },
-    [onStatusChange, setNodeState]
-  );
+      setStates((prev) => {
+        const next = [...prev];
+        next[4] = 'complete';
+        return next;
+      });
+      onStatusChange('骨骼绑定完成', 'success');
 
-  // ---- 链式运行：自动跑完前面所有未完成的节点 ----------------------------
+      // 持久化
+      if (project) {
+        try {
+          const v = await saveAsset('page1.rigging', result.blob, 'glb');
+          if (v) {
+            onStatusChange(`Rigging 已保存到工程：${v.file}`, 'success');
+            setSelectedFiles((prev) => ({ ...prev, 4: v.file }));
+            refreshHistory(4);
+          }
+        } catch (e) {
+          onStatusChange(
+            `Rigging 保存失败：${e instanceof Error ? e.message : String(e)}`,
+            'error',
+          );
+        }
+      }
+      return true;
+    } catch (err) {
+      if (controller.signal.aborted) {
+        onStatusChange('骨骼绑定已取消', 'info');
+        return false;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[Rigging] failed:', err);
+      setNodeState(4, 'error');
+      setOutputs((prev) => ({ ...prev, errors: { ...prev.errors, 4: msg } }));
+      onStatusChange(`骨骼绑定失败：${msg}`, 'error');
+      return false;
+    } finally {
+      riggingAbortRef.current = null;
+    }
+  }, [onStatusChange, setNodeState, project, saveAsset, refreshHistory]);
+
+  const cancelRigging = useCallback(() => {
+    riggingAbortRef.current?.abort();
+  }, []);
+
+  // ---- Chain runner ----------------------------------------------------
   const runUpToNode = useCallback(async (target: number) => {
     if (chainRunningRef.current) return;
     if (target <= 0) return;
@@ -1661,13 +1729,13 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         if (!ru) return;
       }
       if (target >= 4 && statesRef.current[4] !== 'complete') {
-        const ok = await runMockNode(4);
+        const ok = await runRigging();
         if (!ok) return;
       }
     } finally {
       chainRunningRef.current = false;
     }
-  }, [onStatusChange, runTPose, runMultiView, runRoughModel, runMockNode]);
+  }, [onStatusChange, runTPose, runMultiView, runRoughModel, runRigging]);
 
   // ---- 切换某节点的历史版本 ------------------------------------------------
   const handleSelectHistory = useCallback(async (idx: number, fileName: string) => {
@@ -1698,6 +1766,10 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
           if (prev.roughUrl) URL.revokeObjectURL(prev.roughUrl);
           next.roughUrl = r.url;
           next.roughFile = fileName;
+        } else if (idx === 4) {
+          if (prev.riggingUrl) URL.revokeObjectURL(prev.riggingUrl);
+          next.riggingUrl = r.url;
+          next.riggingFile = fileName;
         }
         next.errors = { ...prev.errors, [idx]: '' };
         return next;
@@ -1732,6 +1804,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
       if (prev.segpackNojacketUrl) URL.revokeObjectURL(prev.segpackNojacketUrl);
       if (prev.segpackNojacketMaskUrl) URL.revokeObjectURL(prev.segpackNojacketMaskUrl);
       if (prev.roughNojacketUrl) URL.revokeObjectURL(prev.roughNojacketUrl);
+      if (prev.riggingUrl) URL.revokeObjectURL(prev.riggingUrl);
       return {
         conceptFile: null,
         conceptUrl: null,
@@ -1751,6 +1824,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
         segpackNojacketPack: null,
         roughNojacketUrl: null,
         roughNojacketFile: null,
+        riggingUrl: null,
+        riggingFile: null,
         errors: {},
       };
     });
@@ -1810,6 +1885,8 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                   <GLBThumbnail url={outputs.roughUrl} height={160} />
                 ) : node.id === 'roughNojacket' && state === 'complete' && outputs.roughNojacketUrl ? (
                   <GLBThumbnail url={outputs.roughNojacketUrl} height={160} />
+                ) : node.id === 'rigging' && state === 'complete' && outputs.riggingUrl ? (
+                  <GLBThumbnail url={outputs.riggingUrl} height={160} />
                 ) : node.id === 'segpackClothed' && state === 'complete' && outputs.tposeUrl ? (
                   <SegPackOverlay
                     sourceUrl={outputs.tposeUrl}
@@ -1967,8 +2044,17 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                 a.click();
                 document.body.removeChild(a);
               },
-              onRunMock: runMockNode,
-              onCancelMock: () => setNodeState(idx, 'idle'),
+              onRunRigging: runRigging,
+              onCancelRigging: cancelRigging,
+              onDownloadRigging: () => {
+                if (!outputs.riggingUrl) return;
+                const a = document.createElement('a');
+                a.href = outputs.riggingUrl;
+                a.download = outputs.riggingFile ?? 'rigged_model.glb';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+              },
               onRunExtraction: runExtraction,
               onRunSegpackClothed: runSegpackClothed,
               onRunSegpackNojacket: runSegpackNojacket,
@@ -1987,6 +2073,7 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
               tposeReady: !!outputs.tposeUrl,
               multiviewReady: !!outputs.multiviewUrl,
               roughReady: !!outputs.roughUrl,
+              riggingReady: !!outputs.riggingUrl,
               extractionReady: !!outputs.extractionUrl,
               segpackClothedReady: !!outputs.segpackClothedUrl,
               segpackNojacketReady: !!outputs.segpackNojacketUrl,
@@ -2093,6 +2180,12 @@ export function ConceptToRoughModel({ onStatusChange }: Props) {
                         return () => {
                           setViewerUrl(outputs.roughUrl);
                           setViewerLabel(`${idx + 1}. ${node.title}${outputs.roughFile ? ' · ' + outputs.roughFile : ''}`);
+                        };
+                      }
+                      if (idx === 4 && outputs.riggingUrl) {
+                        return () => {
+                          setViewerUrl(outputs.riggingUrl);
+                          setViewerLabel(`${idx + 1}. ${node.title}${outputs.riggingFile ? ' · ' + outputs.riggingFile : ''}`);
                         };
                       }
                       if (idx === 8 && outputs.roughNojacketUrl) {
@@ -2235,8 +2328,9 @@ interface ActionHandlers {
   onRunRoughModel: () => void;
   onCancelRoughModel: () => void;
   onDownloadRough: () => void;
-  onRunMock: (idx: number) => void | Promise<boolean>;
-  onCancelMock: () => void;
+  onRunRigging: () => void;
+  onCancelRigging: () => void;
+  onDownloadRigging: () => void;
   onRunExtraction: () => void;
   onRunSegpackClothed: () => void;
   onRunSegpackNojacket: () => void;
@@ -2247,6 +2341,7 @@ interface ActionHandlers {
   tposeReady: boolean;
   multiviewReady: boolean;
   roughReady: boolean;
+  riggingReady: boolean;
   extractionReady: boolean;
   segpackClothedReady: boolean;
   segpackNojacketReady: boolean;
@@ -2377,7 +2472,7 @@ function MultiViewMoreMenu({
 function renderActions(
   node: NodeConfig,
   state: NodeState,
-  idx: number,
+  _idx: number,
   h: ActionHandlers
 ): ReactNode {
   const isRunning = state === 'running';
@@ -2468,6 +2563,32 @@ function renderActions(
             size="sm"
             disabled={!h.multiviewReady}
             onClick={h.onRunRoughModel}
+          >
+            {isComplete ? '重新生成' : '生成'}
+          </Button>
+        )}
+      </>
+    );
+  }
+
+  if (node.id === 'rigging') {
+    return (
+      <>
+        <Button size="sm" disabled={!h.riggingReady} onClick={h.onDownloadRigging}>
+          下载 GLB
+        </Button>
+        {isError ? (
+          <Button variant="primary" size="sm" onClick={h.onRunRigging}>重试</Button>
+        ) : isRunning ? (
+          <Button variant="danger" size="sm" onClick={h.onCancelRigging}>
+            取消
+          </Button>
+        ) : (
+          <Button
+            variant="primary"
+            size="sm"
+            disabled={!h.roughReady}
+            onClick={h.onRunRigging}
           >
             {isComplete ? '重新生成' : '生成'}
           </Button>
@@ -2572,23 +2693,13 @@ function renderActions(
     );
   }
 
+  // Fallback for unknown nodes — should not normally be hit
   return (
     <>
       <Button size="sm" disabled={!isComplete}>导出</Button>
-      {isError ? (
-        <Button variant="primary" size="sm" onClick={() => h.onRunMock(idx)}>重试</Button>
-      ) : isRunning ? (
-        <Button variant="danger" size="sm" onClick={h.onCancelMock}>取消</Button>
-      ) : (
-        <Button
-          variant="primary"
-          size="sm"
-          disabled={state === 'idle'}
-          onClick={() => h.onRunMock(idx)}
-        >
-          {isComplete ? '重新生成' : '生成'}
-        </Button>
-      )}
+      <Button variant="primary" size="sm" disabled>
+        未配置
+      </Button>
     </>
   );
 }
