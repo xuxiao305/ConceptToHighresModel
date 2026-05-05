@@ -154,14 +154,21 @@ export function LandmarkMarker({
     const worldRadius = screenHeightWorld * screenFraction;
     groupRef.current.scale.setScalar(worldRadius);
 
-    // ── Occlusion test (every 3 frames) ──
+    // ── Occlusion test (every 30 frames, skip if camera static) ──
     frameCounter.current++;
-    if (frameCounter.current % 3 !== 0) return;
+    if (frameCounter.current % 30 !== 0) return;
 
     if (!occlusionGeometry || !fakeMesh.current) {
       if (!visible) setVisible(true);
       return;
     }
+
+    // Skip occlusion test when camera and marker haven't moved since last test.
+    const camDelta = camera.position.distanceToSquared(lastCamPos.current);
+    const posDelta = worldPos.current.distanceToSquared(lastWorldPos.current);
+    if (camDelta < 0.0001 && posDelta < 0.0001) return;
+    lastCamPos.current.copy(camera.position);
+    lastWorldPos.current.copy(worldPos.current);
 
     syncFakeMeshTransform();
 
