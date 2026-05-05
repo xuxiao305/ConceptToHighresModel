@@ -73,16 +73,20 @@ export default defineConfig(({ mode }) => {
   const DWPOSE_POSE_MODEL =
     env.VITE_DWPOSE_POSE_MODEL ?? 'D:\\AI\\Prototypes\\DWPose\\models\\dw-ll_ucoco_384.onnx';
 
-  // SkinTokens / TokenRig — 3D Model Rigging (D:\\AI\\Prototypes\\SkinTokens).
-  // Uses the SkinTokens project's own venv (Python 3.11 + torch + transformers)
-  // for GPU-accelerated autoregressive skeleton + skinning-weight generation.
-  const SKINTOKENS_PYTHON =
-    env.VITE_SKINTOKENS_PYTHON ?? 'D:\\AI\\Prototypes\\SkinTokens\\.venv\\Scripts\\python.exe';
-  const SKINTOKENS_WORKER =
-    env.VITE_SKINTOKENS_WORKER ?? 'D:\\AI\\Prototypes\\SkinTokens\\rig_worker.py';
-  const SKINTOKENS_CKPT =
-    env.VITE_SKINTOKENS_CKPT ??
-    'experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt';
+  // SkinTokens / TokenRig — 3D Model Rigging.
+  // Routed to the remote rig service on DanLu (apps-sl.danlu.netease.com:8765).
+  // The SSH tunnel is auto-managed by the skintokensPlugin on Vite startup.
+  // Override via env vars:
+  //   VITE_SKINTOKENS_URL       – target URL (default http://localhost:8768)
+  //   VITE_SKINTOKENS_SSH_KEY   – path to SSH private key (Windows path)
+  //   VITE_SKINTOKENS_SSH_HOST  – SSH host (default apps-sl.danlu.netease.com)
+  //   VITE_SKINTOKENS_SSH_PORT  – SSH port (default 44304)
+  //   VITE_SKINTOKENS_SSH_USER  – SSH user (default root)
+  //   VITE_SKINTOKENS_TUNNEL_LOCAL_PORT – local tunnel port (default 8768)
+  //   VITE_SKINTOKENS_TUNNEL_REMOTE_PORT – remote service port (default 8765)
+  // Set VITE_SKINTOKENS_SSH_KEY to '' (empty) to disable auto-tunnel.
+  const SKINTOKENS_URL =
+    env.VITE_SKINTOKENS_URL ?? 'http://localhost:8768';
 
   return {
     plugins: [
@@ -102,9 +106,13 @@ export default defineConfig(({ mode }) => {
         poseModel: DWPOSE_POSE_MODEL,
       }),
       skintokensPlugin({
-        python: SKINTOKENS_PYTHON,
-        worker: SKINTOKENS_WORKER,
-        modelCkpt: SKINTOKENS_CKPT,
+        url: SKINTOKENS_URL,
+        sshKey: env.VITE_SKINTOKENS_SSH_KEY ?? 'D:\\AI\\PrivateKeys\\DanLu\\xuxiao02_rsa',
+        sshHost: env.VITE_SKINTOKENS_SSH_HOST ?? 'apps-sl.danlu.netease.com',
+        sshPort: parseInt(env.VITE_SKINTOKENS_SSH_PORT ?? '44304'),
+        sshUser: env.VITE_SKINTOKENS_SSH_USER ?? 'root',
+        tunnelLocalPort: parseInt(env.VITE_SKINTOKENS_TUNNEL_LOCAL_PORT ?? '8768'),
+        tunnelRemotePort: parseInt(env.VITE_SKINTOKENS_TUNNEL_REMOTE_PORT ?? '8765'),
       }),
     ],
     // Allow the test_align_e2e.html page to be served as a second entry.
@@ -188,46 +196,148 @@ export default defineConfig(({ mode }) => {
 // SkinTokens / TokenRig bridge plugin
 // ============================================================================
 //
-// Exposes a single dev-server endpoint:
+// Forwards POST /api/skintokens → the remote rig service (DanLu).
 //
 //   POST /api/skintokens
 //     Content-Type: application/json
-//     Body: {
-//       glbBase64: "data:application/octet-stream;base64,...",
-//       params: {
-//         topK?: number,           // default 5
-//         topP?: number,           // default 0.95
-//         temperature?: number,    // default 1.0
-//         repetitionPenalty?: number,  // default 2.0
-//         numBeams?: number,       // default 10
-//         useSkeleton?: boolean,   // default false
-//         usePostprocess?: boolean,// default true
-//       }
-//     }
+//     Body: { glbBase64, params }
 //
-//     Spawns rig_worker.py in the SkinTokens project's own venv (CUDA GPU).
-//     The worker starts an internal bpy_server for mesh I/O, loads the
-//     TokenRig model, runs autoregressive skeleton + skinning inference,
-//     exports the rigged GLB, and prints a JSON result line to stdout.
+//   → Forwarded to SKINTOKENS_URL/rig
 //
-//     Response shape:
-//       { ok: true,  glbBase64: "data:model/gltf-binary;base64,..." }
-//       { ok: false, error: <string> }
+//   Response shape (from rig service):
+//     { ok: true,  glbBase64: "data:model/gltf-binary;base64,...", timing_sec }
+//     { ok: false, error: <string> }
 //
-//     First invocation: ~3-5 min (model load + inference).
-//     Subsequent invocations: ~30-90s (model stays loaded in the worker).
+// Auto-managed SSH tunnel:
+//   The plugin auto-starts an SSH tunnel on Vite startup if:
+//     - SKINTOKENS_URL points to localhost/127.0.0.1
+//     - VITE_SKINTOKENS_SSH_KEY is set (or defaults to the DanLu key)
+//   If the local port is already listening (e.g. manual tunnel), it skips.
+//   The tunnel is automatically closed when Vite shuts down.
+//   Set VITE_SKINTOKENS_SSH_KEY to '' (empty string) to disable auto-tunnel.
 //
 interface SkintokensPluginOptions {
-  python: string;
-  worker: string;
-  modelCkpt: string;
+  url: string;
+  sshKey: string;
+  sshHost: string;
+  sshPort: number;
+  sshUser: string;
+  tunnelLocalPort: number;
+  tunnelRemotePort: number;
+}
+
+/**
+ * Check if a TCP port is already listening (so we skip redundant tunnels).
+ */
+async function isPortListening(port: number): Promise<boolean> {
+  const net = await import('node:net');
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    socket.setTimeout(500);
+    socket.on('connect', () => { socket.destroy(); resolve(true); });
+    socket.on('error', () => resolve(false));
+    socket.on('timeout', () => { socket.destroy(); resolve(false); });
+    socket.connect(port, '127.0.0.1');
+  });
 }
 
 function skintokensPlugin(opts: SkintokensPluginOptions): Plugin {
+  let tunnelProc: ReturnType<typeof spawn> | null = null;
+
+  /**
+   * Spawn the SSH tunnel using Windows native OpenSSH.
+   * Binds directly on Windows localhost — no WSL2 localhost-forwarding issues.
+   * Requires OpenSSH client (built into Windows 10/11, or install via Settings).
+   */
+  function startTunnel(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      // eslint-disable-next-line no-console
+      console.log(`[skintokens-bridge] Starting SSH tunnel: localhost:${opts.tunnelLocalPort} → ${opts.sshHost}:${opts.tunnelRemotePort}`);
+
+      tunnelProc = spawn('ssh', [
+        '-i', opts.sshKey,
+        '-L', `${opts.tunnelLocalPort}:localhost:${opts.tunnelRemotePort}`,
+        '-p', String(opts.sshPort),
+        '-o', 'StrictHostKeyChecking=no',
+        '-o', 'ServerAliveInterval=60',
+        '-N',
+        `${opts.sshUser}@${opts.sshHost}`,
+      ], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+
+      let settled = false;
+      tunnelProc.stdout?.on('data', () => { /* ssh -N has no stdout */ });
+      tunnelProc.stderr?.on('data', (data: Buffer) => {
+        const msg = data.toString();
+        // SSH prints banner / warnings to stderr — we just log them
+        // eslint-disable-next-line no-console
+        console.log(`[skintokens-tunnel] ${msg.trim()}`);
+        // First stderr output usually means SSH connected successfully
+        if (!settled) { settled = true; resolve(); }
+      });
+      tunnelProc.on('error', (err) => {
+        // eslint-disable-next-line no-console
+        console.error(`[skintokens-tunnel] spawn error: ${err.message}`);
+        if (!settled) { settled = true; reject(err); }
+      });
+      tunnelProc.on('exit', (code) => {
+        // eslint-disable-next-line no-console
+        console.log(`[skintokens-tunnel] exited with code ${code}`);
+        tunnelProc = null;
+        if (!settled) { settled = true; reject(new Error(`SSH tunnel exited with code ${code}`)); }
+      });
+
+      // Give SSH a few seconds to establish; if no stderr by then, assume success
+      // (ssh -N with ServerAliveInterval will print nothing if connection is clean)
+      setTimeout(() => { if (!settled) { settled = true; resolve(); } }, 3000);
+    });
+  }
+
   return {
     name: 'skintokens-bridge',
     apply: 'serve',
-    configureServer(server) {
+    async configureServer(server) {
+      // ── Auto-start SSH tunnel if needed ─────────────────────────
+      const url = new URL(opts.url);
+      const isLocalhost = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
+      const localPort = parseInt(url.port) || opts.tunnelLocalPort;
+      const sshKeyConfigured = opts.sshKey && opts.sshKey.length > 0;
+
+      if (isLocalhost && sshKeyConfigured) {
+        const alreadyListening = await isPortListening(localPort);
+        if (alreadyListening) {
+          // eslint-disable-next-line no-console
+          console.log(`[skintokens-bridge] Port ${localPort} already listening — skipping SSH tunnel`);
+        } else {
+          try {
+            await startTunnel();
+            // eslint-disable-next-line no-console
+            console.log(`[skintokens-bridge] ✅ SSH tunnel established on port ${localPort}`);
+          } catch (err) {
+            // eslint-disable-next-line no-console
+            console.error(`[skintokens-bridge] ⚠️ SSH tunnel failed: ${(err as Error).message}`);
+            // eslint-disable-next-line no-console
+            console.error(`[skintokens-bridge] Rig service will not be available. Start tunnel manually or set VITE_SKINTOKENS_SSH_KEY=''.`);
+          }
+        }
+      } else if (isLocalhost && !sshKeyConfigured) {
+        // eslint-disable-next-line no-console
+        console.log(`[skintokens-bridge] SSH key not configured (VITE_SKINTOKENS_SSH_KEY). Auto-tunnel disabled.`);
+      }
+
+      // ── Cleanup on Vite shutdown ────────────────────────────────
+      server.httpServer?.on('close', () => {
+        if (tunnelProc && !tunnelProc.killed) {
+          // eslint-disable-next-line no-console
+          console.log('[skintokens-bridge] Closing SSH tunnel...');
+          tunnelProc.kill();
+          tunnelProc = null;
+        }
+      });
+
+      // ── Request handler ─────────────────────────────────────────
       server.middlewares.use('/api/skintokens', async (req, res, next) => {
         if (req.method !== 'POST') return next();
 
@@ -237,7 +347,7 @@ function skintokensPlugin(opts: SkintokensPluginOptions): Plugin {
           res.end(JSON.stringify(body));
         };
 
-        // ── 1. Parse JSON body ───────────────────────────────────────
+        // ── 1. Read the full POST body ─────────────────────────────
         let body = '';
         try {
           for await (const chunk of req) body += chunk;
@@ -245,149 +355,61 @@ function skintokensPlugin(opts: SkintokensPluginOptions): Plugin {
           return sendJson(400, { ok: false, error: `读取请求体失败：${(err as Error).message}` });
         }
 
-        let parsed: {
-          glbBase64?: string;
-          params?: {
-            topK?: number;
-            topP?: number;
-            temperature?: number;
-            repetitionPenalty?: number;
-            numBeams?: number;
-            useSkeleton?: boolean;
-            usePostprocess?: boolean;
-          };
-        };
+        // Validate it's valid JSON with glbBase64
         try {
-          parsed = JSON.parse(body);
+          const parsed = JSON.parse(body);
           if (!parsed.glbBase64) throw new Error('缺少 glbBase64 字段');
         } catch (err) {
           return sendJson(400, { ok: false, error: `请求体不合法：${(err as Error).message}` });
         }
 
-        const m = /^data:[^;]+;base64,(.+)$/.exec(parsed.glbBase64!);
-        const pureB64 = m ? m[1] : parsed.glbBase64!;
-        const params = parsed.params ?? {};
-
-        // ── 2. Write input GLB to temp dir ────────────────────────────
-        const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'skintokens-bridge-'));
-        const inputPath = path.join(tmpDir, 'in.glb');
-        const outputPath = path.join(tmpDir, 'out.glb');
+        // ── 2. Forward to DanLu rig service ────────────────────────
+        const rigUrl = `${opts.url}/rig`;
+        // eslint-disable-next-line no-console
+        console.log(`[skintokens-bridge] POST → ${rigUrl} (${body.length} bytes)`);
 
         try {
-          await fs.writeFile(inputPath, Buffer.from(pureB64, 'base64'));
+          const rigRes = await fetch(rigUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body,
+            // Model load + inference on GPU: up to 10 min
+            signal: AbortSignal.timeout(600_000),
+          });
 
-          // ── 3. Spawn rig_worker.py ─────────────────────────────────
-          // The worker runs from the SkinTokens project root so that
-          // relative imports (from src.xxx) resolve correctly.
-          const workerDir = path.dirname(opts.worker);
-          const args = [
-            opts.worker,
-            '--input', inputPath,
-            '--output', outputPath,
-            '--model_ckpt', opts.modelCkpt,
-            '--top_k', String(params.topK ?? 5),
-            '--top_p', String(params.topP ?? 0.95),
-            '--temperature', String(params.temperature ?? 1.0),
-            '--repetition_penalty', String(params.repetitionPenalty ?? 2.0),
-            '--num_beams', String(params.numBeams ?? 10),
-          ];
-          if (params.useSkeleton) args.push('--use_skeleton');
-          if (params.usePostprocess !== false) args.push('--use_postprocess');
+          const result = (await rigRes.json()) as {
+            ok: boolean;
+            glbBase64?: string;
+            error?: string;
+            timing_sec?: number;
+          };
 
+          if (result.ok && result.glbBase64) {
+            // eslint-disable-next-line no-console
+            console.log(`[skintokens-bridge] ✅ ${result.timing_sec}s (${result.glbBase64.length} chars)`);
+            return sendJson(200, { ok: true, glbBase64: result.glbBase64 });
+          }
+
+          const errorMsg = result.error ?? `HTTP ${rigRes.status}`;
           // eslint-disable-next-line no-console
-          console.log('[skintokens-bridge] spawn:', opts.python, args.join(' '));
+          console.error(`[skintokens-bridge] ❌ ${errorMsg}`);
+          return sendJson(502, { ok: false, error: `Rig 服务返回错误：${errorMsg}` });
 
-          const child = spawn(opts.python, args, {
-            cwd: workerDir,
-            stdio: ['ignore', 'pipe', 'pipe'],
-            windowsHide: true,
-          });
-
-          let stderr = '';
-          let stdout = '';
-          child.stderr.on('data', (d) => {
-            const text = d.toString();
-            stderr += text;
-            process.stderr.write(`[skintokens-bridge] ${text}`);
-          });
-          child.stdout.on('data', (d) => {
-            const text = d.toString();
-            stdout += text;
-            process.stdout.write(`[skintokens-bridge] ${text}`);
-          });
-
-          // First run: model load (~2-3 min) + inference (~1 min).
-          // Set a generous 15-minute timeout.
-          const exitCode: number = await new Promise((resolve) => {
-            const timer = setTimeout(() => {
-              child.kill();
-              resolve(-2);
-            }, 900_000); // 15 min
-            child.on('exit', (code) => {
-              clearTimeout(timer);
-              resolve(code ?? -1);
-            });
-            child.on('error', () => {
-              clearTimeout(timer);
-              resolve(-1);
-            });
-          });
-
-          if (exitCode === -2) {
-            return sendJson(500, {
-              ok: false,
-              error: 'SkinTokens 进程超时（15 分钟无响应）',
-            });
-          }
-
-          if (exitCode !== 0) {
-            return sendJson(500, {
-              ok: false,
-              error: `SkinTokens 进程退出码 ${exitCode}\n${stderr.slice(-3000)}`,
-            });
-          }
-
-          // ── 4. Parse stdout for the JSON result line ───────────────
-          const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
-          const lastLine = lines[lines.length - 1];
-          let workerResult: { ok: boolean; output?: string; error?: string };
-          try {
-            workerResult = JSON.parse(lastLine);
-          } catch {
-            return sendJson(500, {
-              ok: false,
-              error: `无法解析 worker stdout：${lastLine.slice(-500)}`,
-            });
-          }
-
-          if (!workerResult.ok || !workerResult.output) {
-            return sendJson(500, {
-              ok: false,
-              error: workerResult.error ?? 'Worker 返回失败但未提供错误信息',
-            });
-          }
-
-          // ── 5. Read output GLB and return as base64 ────────────────
-          let outExists = true;
-          try { await fs.access(outputPath); } catch { outExists = false; }
-          if (!outExists) {
-            return sendJson(500, {
-              ok: false,
-              error: `SkinTokens 未产生输出文件：${outputPath}`,
-            });
-          }
-
-          const outBuf = await fs.readFile(outputPath);
-          const glbBase64 = `data:model/gltf-binary;base64,${outBuf.toString('base64')}`;
-
-          return sendJson(200, { ok: true, glbBase64 });
         } catch (err) {
-          return sendJson(500, {
-            ok: false,
-            error: `SkinTokens 桥接异常：${(err as Error).message}`,
-          });
-        } finally {
-          fs.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
+          const msg = (err as Error).message;
+          // eslint-disable-next-line no-console
+          console.error(`[skintokens-bridge] ❌ 连接失败: ${msg}`);
+
+          if (msg.includes('fetch') || msg.includes('ECONNREFUSED') || msg.includes('ENOTFOUND')) {
+            return sendJson(502, {
+              ok: false,
+              error: `无法连接丹炉 Rig 服务 (${opts.url})。自动隧道可能未就绪或 SSH 密钥未配置。\n` +
+                     '检查 Vite 终端中的 [skintokens-bridge] 日志，或手动建隧道：\n' +
+                     `ssh -L ${opts.tunnelLocalPort}:localhost:${opts.tunnelRemotePort} -p ${opts.sshPort} -i key -N ${opts.sshUser}@${opts.sshHost}`,
+            });
+          }
+
+          return sendJson(500, { ok: false, error: `Rig 桥接异常：${msg}` });
         }
       });
     },

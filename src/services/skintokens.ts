@@ -29,7 +29,7 @@ export interface SkinTokensParams {
   numBeams?: number;
   /** 是否使用已有骨架（默认 false —— 生成完整骨架+蒙皮） */
   useSkeleton?: boolean;
-  /** 后处理 voxel skin 平滑（默认 true） */
+  /** 后处理 voxel skin 平滑（默认 false） */
   usePostprocess?: boolean;
 }
 
@@ -40,7 +40,7 @@ export const SKINTOKENS_DEFAULTS: Required<SkinTokensParams> = {
   repetitionPenalty: 2.0,
   numBeams: 10,
   useSkeleton: false,
-  usePostprocess: true,
+  usePostprocess: false,
 };
 
 export interface SkinTokensResult {
